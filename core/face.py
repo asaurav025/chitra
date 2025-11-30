@@ -1,55 +1,75 @@
 from __future__ import annotations
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import List, Dict
+
 import numpy as np
-import insightface
-from insightface.app import FaceAnalysis
 
-# Cache model in memory
-_engine = None
+from core.extractor import load_image
+
+try:
+    from insightface.app import FaceAnalysis
+    _HAS_INSIGHTFACE = True
+except ImportError:
+    _HAS_INSIGHTFACE = False
+
+_app: FaceAnalysis | None = None
 
 
-def _get_engine():
+def _get_app() -> FaceAnalysis:
+    """Singleton InsightFace app instance."""
+    global _app
+    if _app is not None:
+        return _app
+
+    if not _HAS_INSIGHTFACE:
+        raise RuntimeError("insightface is not installed")
+
+    # CPU-only (ctx_id=-1). If you want GPU later, you can switch to 0.
+    app = FaceAnalysis(name="buffalo_l")
+    app.prepare(ctx_id=-1)
+    _app = app
+    return _app
+
+
+def face_encodings(path: str) -> List[Dict]:
     """
-    Initialize InsightFace model once.
+    Detect faces and return list of dicts:
+        {
+          "bbox": [x1, y1, x2, y2],
+          "embedding": [...],
+          "score": float,
+          "landmarks": [[x, y], ...] or None
+        }
+
+    Uses RAW-safe loader so ARW/CR2/NEF also work.
     """
-    global _engine
-    if _engine is None:
-        _engine = FaceAnalysis(
-            name="buffalo_l",
-            root="./.insightface",
-            providers=["CPUExecutionProvider"]
+    if not _HAS_INSIGHTFACE:
+        raise RuntimeError(
+            "insightface not available. Install with: pip install insightface onnxruntime"
         )
-        _engine.prepare(ctx_id=0, det_size=(640, 640))
-    return _engine
 
+    img_pil = load_image(Path(path))
+    # PIL gives RGB, InsightFace expects BGR
+    img = np.array(img_pil)[:, :, ::-1].copy()
 
-def face_encodings(image_path: str) -> List[Dict[str, Any]]:
-    """
-    Returns a list of detected faces with:
-    - bbox
-    - embedding
-    - score
-    - landmarks
-    """
-    engine = _get_engine()
+    app = _get_app()
+    faces = app.get(img)
 
-    try:
-        from core.raw_loader import load_image_any
-        img = load_image_any(image_path)
-        if img is None:
-            return []
-    except Exception:
-        return []
-
-    faces = engine.get(img)
-    result = []
-
+    out: List[Dict] = []
     for f in faces:
-        result.append({
-            "bbox": f.bbox.astype(float).tolist(),
-            "embedding": f.embedding.astype(np.float32).tolist(),
-            "score": float(f.det_score),
-            "landmarks": f.kps.astype(float).tolist(),
-        })
+        bbox = f.bbox.astype(int).tolist()
+        emb = f.embedding.astype("float32").tolist()
+        score = float(getattr(f, "det_score", 0.0))
+        kps = getattr(f, "kps", None)
+        landmarks = kps.tolist() if kps is not None else None
 
-    return result
+        out.append(
+            {
+                "bbox": bbox,
+                "embedding": emb,
+                "score": score,
+                "landmarks": landmarks,
+            }
+        )
+
+    return out

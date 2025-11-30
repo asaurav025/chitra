@@ -11,6 +11,16 @@ DEFAULT_LABELS = [
     "sports", "cricket", "football", "gym", "yoga", "concert", "stage", "museum",
 ]
 
+
 def auto_tags(embedder: ClipEmbedder, image_path: str, k: int = 6) -> List[Tuple[str, float]]:
-    ranked = embedder.rank_labels(image_path, DEFAULT_LABELS)
-    return ranked[:k]
+    """
+    Generate top-K text labels for an image using CLIP.
+    """
+    # 1. Get image embedding
+    embedding = embedder.image_embedding(image_path)
+
+    # 2. Rank labels (internally uses DEFAULT_LABELS)
+    ranked = embedder.rank_labels(embedding, top_k=k)
+
+    # 3. Return top-k (label, score)
+    return ranked

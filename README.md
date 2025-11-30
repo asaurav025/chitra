@@ -17,38 +17,37 @@ Chitra is a local, privacy-preserving CLI that scans your photo folders, extract
 ## Quickstart
 
 ```bash
-python -m venv .venv && source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+python3 -m venv .venv && source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 pip install -r requirements.txt
 
 # Initialize the database
-python -m cli.main init
+python3 -m cli.main init
 
 # Index your photos (no ML yet)
-python -m cli.main scan --path ~/Pictures
+python3 -m cli.main scan ~/Pictures
 
 # Analyze (embeddings + auto-tags)
-python -m cli.main analyze
+python3 -m cli.main analyze
 
 # Cluster visually similar photos
-python -m cli.main cluster --threshold 0.78
+python3 -m cli.main cluster --threshold 0.78
 
-# Detect faces (optional, requires face_recognition + dlib)
-python -m cli.main faces
+# Detect faces 
+python3 -m cli.main faces
 
 # Natural language search (FAISS-accelerated)
-python -m cli.main search "beach sunset 2019"
+python3 -m cli.main search "beach sunset 2019"
 
 # Find duplicate photos
-python -m cli.main duplicates --threshold 5
+python3 -m cli.main duplicates --threshold 5
 
 # Export a static HTML gallery to ./chitra
-python -m cli.main export gallery --output ./chitra
+python3 -m cli.main export gallery --output ./chitra
 
 # Launch the TUI
-python -m cli.main tui
+python3 -m cli.main tui
 ```
 
-> **Note on face clustering**: `face_recognition` depends on `dlib` which can be heavy to build. If you want this feature, install those two packages manually and Chitra will automatically enable face processing.
 
 ## Config
 - Default output folder: `./chitra`
