@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Chitra Gallery</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      display: flex;
+      height: 100vh;
+      color: #222;
+    }
+    .sidebar {
+      width: 260px;
+      border-right: 1px solid #ddd;
+      padding: 16px;
+      box-sizing: border-box;
+      overflow-y: auto;
+      background: #fafafa;
+    }
+    .sidebar h2 {
+      margin-top: 0;
+      font-size: 18px;
+    }
+    .sidebar-section {
+      margin-bottom: 20px;
+    }
+    .sidebar ul {
+      list-style: none;
+      padding-left: 0;
+      margin: 8px 0 0 0;
+    }
+    .sidebar li {
+      margin-bottom: 6px;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 6px;
+    }
+    .sidebar li.active {
+      background: #e91e63;
+      color: white;
+    }
+    .sidebar li:hover {
+      background: #f0f0f0;
+    }
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .topbar {
+      padding: 10px 16px;
+      border-bottom: 1px solid #ddd;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .topbar h1 {
+      font-size: 20px;
+      margin: 0;
+    }
+    .grid {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      box-sizing: border-box;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 12px;
+    }
+    .card {
+      border-radius: 10px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+      overflow: hidden;
+      background: white;
+      display: flex;
+      flex-direction: column;
+    }
+    .card img {
+      width: 100%;
+      height: 160px;
+      object-fit: cover;
+      display: block;
+    }
+    .card-body {
+      padding: 8px;
+      font-size: 12px;
+    }
+    .tags {
+      color: #666;
+      font-size: 11px;
+      margin-top: 4px;
+    }
+    .face-thumb {
+      width: 32px;
+      height: 32px;
+      border-radius: 999px;
+      object-fit: cover;
+      margin-right: 8px;
+      border: 1px solid #ddd;
+      background: #f5f5f5;
+    }
+    .sidebar-face-item {
+      display: flex;
+      align-items: center;
+    }
+    .sidebar-face-label {
+      font-size: 13px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 999px;
+      background: #eee;
+      font-size: 10px;
+      margin-left: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <h2>View</h2>
+      <ul id="view-list">
+        <li data-view="all" class="active">All photos</li>
+        <li data-view="faces">Faces</li>
+      </ul>
+    </div>
+    <div class="sidebar-section" id="faces-section" style="display:none;">
+      <h2>Faces</h2>
+      <ul id="faces-list">
+        <!-- filled by JS -->
+      </ul>
+    </div>
+  </div>
+  <div class="main">
+    <div class="topbar">
+      <h1 id="title">All photos</h1>
+      <div id="info"></div>
+    </div>
+    <div class="grid" id="grid">
+      <!-- cards injected by JS -->
+    </div>
+  </div>
+
+  <script>
+    const ITEMS = [{"file": "/home/saurav/Pictures/DSC02728.ARW", "thumb": "thumbnails/DSC02728.ARW.jpg", "tags": "landscape, travel, outdoors, city, sports"}, {"file": "/home/saurav/Pictures/DSC02751.ARW", "thumb": "thumbnails/DSC02751.ARW.jpg", "tags": "outdoors, travel, indoors, landscape, portrait"}, {"file": "/home/saurav/Pictures/DSC02794.ARW", "thumb": "thumbnails/DSC02794.ARW.jpg", "tags": "landscape, outdoors, travel, group photo, night"}, {"file": "/home/saurav/Pictures/DSC02706.ARW", "thumb": "thumbnails/DSC02706.ARW.jpg", "tags": "landscape, travel, outdoors, sports, night"}, {"file": "/home/saurav/Pictures/DSC02799.ARW", "thumb": "thumbnails/DSC02799.ARW.jpg", "tags": "landscape, portrait, night, sunset, travel"}, {"file": "/home/saurav/Pictures/DSC02847.ARW", "thumb": "thumbnails/DSC02847.ARW.jpg", "tags": "landscape, travel, group photo, family, outdoors"}, {"file": "/home/saurav/Pictures/DSC02804.ARW", "thumb": "thumbnails/DSC02804.ARW.jpg", "tags": "landscape, outdoors, travel, city, wedding"}, {"file": "/home/saurav/Pictures/DSC02814.ARW", "thumb": "thumbnails/DSC02814.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02836.ARW", "thumb": "thumbnails/DSC02836.ARW.jpg", "tags": "landscape, travel, outdoors, portrait, city"}, {"file": "/home/saurav/Pictures/DSC02754.ARW", "thumb": "thumbnails/DSC02754.ARW.jpg", "tags": "outdoors, landscape, travel, indoors, portrait"}, {"file": "/home/saurav/Pictures/DSC02717.ARW", "thumb": "thumbnails/DSC02717.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02722.ARW", "thumb": "thumbnails/DSC02722.ARW.jpg", "tags": "travel, landscape, outdoors, portrait, night"}, {"file": "/home/saurav/Pictures/DSC02704.ARW", "thumb": "thumbnails/DSC02704.ARW.jpg", "tags": "landscape, travel, sunset, night, outdoors"}, {"file": "/home/saurav/Pictures/DSC02816.ARW", "thumb": "thumbnails/DSC02816.ARW.jpg", "tags": "landscape, outdoors, travel, city, night"}, {"file": "/home/saurav/Pictures/DSC02862.ARW", "thumb": "thumbnails/DSC02862.ARW.jpg", "tags": "outdoors, travel, portrait, food, selfie"}, {"file": "/home/saurav/Pictures/DSC02780.ARW", "thumb": "thumbnails/DSC02780.ARW.jpg", "tags": "landscape, travel, outdoors, city, group photo"}, {"file": "/home/saurav/Pictures/DSC02850.ARW", "thumb": "thumbnails/DSC02850.ARW.jpg", "tags": "landscape, travel, group photo, family, friends"}, {"file": "/home/saurav/Pictures/DSC02869.ARW", "thumb": "thumbnails/DSC02869.ARW.jpg", "tags": "landscape, outdoors, travel, friends, food"}, {"file": "/home/saurav/Pictures/DSC02855.ARW", "thumb": "thumbnails/DSC02855.ARW.jpg", "tags": "travel, outdoors, landscape, family, friends"}, {"file": "/home/saurav/Pictures/DSC02827.ARW", "thumb": "thumbnails/DSC02827.ARW.jpg", "tags": "travel, landscape, portrait, night, friends"}, {"file": "/home/saurav/Pictures/DSC02852.ARW", "thumb": "thumbnails/DSC02852.ARW.jpg", "tags": "landscape, travel, group photo, friends, family"}, {"file": "/home/saurav/Pictures/DSC02808.ARW", "thumb": "thumbnails/DSC02808.ARW.jpg", "tags": "travel, portrait, food, group photo, friends"}, {"file": "/home/saurav/Pictures/DSC02757.ARW", "thumb": "thumbnails/DSC02757.ARW.jpg", "tags": "landscape, travel, outdoors, night, city"}, {"file": "/home/saurav/Pictures/DSC02750.ARW", "thumb": "thumbnails/DSC02750.ARW.jpg", "tags": "outdoors, landscape, travel, indoors, portrait"}, {"file": "/home/saurav/Pictures/DSC02866.ARW", "thumb": "thumbnails/DSC02866.ARW.jpg", "tags": "outdoors, travel, portrait, selfie, wedding"}, {"file": "/home/saurav/Pictures/DSC02787.ARW", "thumb": "thumbnails/DSC02787.ARW.jpg", "tags": "landscape, outdoors, travel, friends, food"}, {"file": "/home/saurav/Pictures/DSC02822.ARW", "thumb": "thumbnails/DSC02822.ARW.jpg", "tags": "landscape, outdoors, food, night, portrait"}, {"file": "/home/saurav/Pictures/DSC02840.ARW", "thumb": "thumbnails/DSC02840.ARW.jpg", "tags": "landscape, travel, outdoors, night, food"}, {"file": "/home/saurav/Pictures/DSC02768.ARW", "thumb": "thumbnails/DSC02768.ARW.jpg", "tags": "landscape, travel, outdoors, sports, city"}, {"file": "/home/saurav/Pictures/DSC02776.ARW", "thumb": "thumbnails/DSC02776.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02845.ARW", "thumb": "thumbnails/DSC02845.ARW.jpg", "tags": "landscape, outdoors, travel, sports, friends"}, {"file": "/home/saurav/Pictures/DSC02705.ARW", "thumb": "thumbnails/DSC02705.ARW.jpg", "tags": "landscape, travel, outdoors, wedding, party"}, {"file": "/home/saurav/Pictures/DSC02752.ARW", "thumb": "thumbnails/DSC02752.ARW.jpg", "tags": "outdoors, landscape, travel, indoors, portrait"}, {"file": "/home/saurav/Pictures/DSC02763.ARW", "thumb": "thumbnails/DSC02763.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02859.ARW", "thumb": "thumbnails/DSC02859.ARW.jpg", "tags": "group photo, family, friends, food, travel"}, {"file": "/home/saurav/Pictures/DSC02835.ARW", "thumb": "thumbnails/DSC02835.ARW.jpg", "tags": "landscape, travel, outdoors, sunset, night"}, {"file": "/home/saurav/Pictures/DSC02793.ARW", "thumb": "thumbnails/DSC02793.ARW.jpg", "tags": "outdoors, travel, landscape, city, night"}, {"file": "/home/saurav/Pictures/DSC02842.ARW", "thumb": "thumbnails/DSC02842.ARW.jpg", "tags": "landscape, friends, outdoors, travel, night"}, {"file": "/home/saurav/Pictures/DSC02797.ARW", "thumb": "thumbnails/DSC02797.ARW.jpg", "tags": "outdoors, travel, landscape, portrait, city"}, {"file": "/home/saurav/Pictures/DSC02774.ARW", "thumb": "thumbnails/DSC02774.ARW.jpg", "tags": "landscape, travel, outdoors, city, sports"}, {"file": "/home/saurav/Pictures/DSC02807.ARW", "thumb": "thumbnails/DSC02807.ARW.jpg", "tags": "travel, portrait, pets, food, friends"}, {"file": "/home/saurav/Pictures/DSC02772.ARW", "thumb": "thumbnails/DSC02772.ARW.jpg", "tags": "travel, landscape, wedding, night, outdoors"}, {"file": "/home/saurav/Pictures/DSC02839.ARW", "thumb": "thumbnails/DSC02839.ARW.jpg", "tags": "landscape, travel, outdoors, sunset, night"}, {"file": "/home/saurav/Pictures/DSC02871.ARW", "thumb": "thumbnails/DSC02871.ARW.jpg", "tags": "landscape, wedding, travel, outdoors, night"}, {"file": "/home/saurav/Pictures/DSC02856.ARW", "thumb": "thumbnails/DSC02856.ARW.jpg", "tags": "landscape, travel, outdoors, night, city"}, {"file": "/home/saurav/Pictures/DSC02739.ARW", "thumb": "thumbnails/DSC02739.ARW.jpg", "tags": "landscape, outdoors, indoors, travel, night"}, {"file": "/home/saurav/Pictures/DSC02806.ARW", "thumb": "thumbnails/DSC02806.ARW.jpg", "tags": "outdoors, travel, landscape, portrait, friends"}, {"file": "/home/saurav/Pictures/DSC02813.ARW", "thumb": "thumbnails/DSC02813.ARW.jpg", "tags": "travel, outdoors, selfie, friends, family"}, {"file": "/home/saurav/Pictures/DSC02872.ARW", "thumb": "thumbnails/DSC02872.ARW.jpg", "tags": "landscape, outdoors, travel, food, city"}, {"file": "/home/saurav/Pictures/DSC02703.ARW", "thumb": "thumbnails/DSC02703.ARW.jpg", "tags": "landscape, travel, outdoors, night, city"}, {"file": "/home/saurav/Pictures/DSC02874.ARW", "thumb": "thumbnails/DSC02874.ARW.jpg", "tags": "landscape, outdoors, food, travel, night"}, {"file": "/home/saurav/Pictures/DSC02788.ARW", "thumb": "thumbnails/DSC02788.ARW.jpg", "tags": "landscape, travel, night, portrait, friends"}, {"file": "/home/saurav/Pictures/DSC02773.ARW", "thumb": "thumbnails/DSC02773.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02709.ARW", "thumb": "thumbnails/DSC02709.ARW.jpg", "tags": "landscape, travel, city, outdoors, night"}, {"file": "/home/saurav/Pictures/DSC02713.ARW", "thumb": "thumbnails/DSC02713.ARW.jpg", "tags": "landscape, travel, outdoors, night, sunset"}, {"file": "/home/saurav/Pictures/DSC02841.ARW", "thumb": "thumbnails/DSC02841.ARW.jpg", "tags": "landscape, outdoors, travel, food, night"}, {"file": "/home/saurav/Pictures/DSC02784.ARW", "thumb": "thumbnails/DSC02784.ARW.jpg", "tags": "landscape, outdoors, travel, city, portrait"}, {"file": "/home/saurav/Pictures/DSC02767.ARW", "thumb": "thumbnails/DSC02767.ARW.jpg", "tags": "landscape, travel, outdoors, sports, portrait"}, {"file": "/home/saurav/Pictures/DSC02792.ARW", "thumb": "thumbnails/DSC02792.ARW.jpg", "tags": "outdoors, landscape, city, travel, pets"}, {"file": "/home/saurav/Pictures/DSC02753.ARW", "thumb": "thumbnails/DSC02753.ARW.jpg", "tags": "outdoors, travel, landscape, indoors, portrait"}, {"file": "/home/saurav/Pictures/DSC02796.ARW", "thumb": "thumbnails/DSC02796.ARW.jpg", "tags": "outdoors, portrait, travel, wedding, city"}, {"file": "/home/saurav/Pictures/DSC02878.ARW", "thumb": "thumbnails/DSC02878.ARW.jpg", "tags": "landscape, travel, outdoors, night, city"}, {"file": "/home/saurav/Pictures/DSC02736.ARW", "thumb": "thumbnails/DSC02736.ARW.jpg", "tags": "outdoors, portrait, wedding, travel, party"}, {"file": "/home/saurav/Pictures/DSC02735.ARW", "thumb": "thumbnails/DSC02735.ARW.jpg", "tags": "outdoors, portrait, travel, wedding, sunset"}, {"file": "/home/saurav/Pictures/DSC02749.ARW", "thumb": "thumbnails/DSC02749.ARW.jpg", "tags": "outdoors, landscape, travel, indoors, portrait"}, {"file": "/home/saurav/Pictures/DSC02848.ARW", "thumb": "thumbnails/DSC02848.ARW.jpg", "tags": "landscape, group photo, travel, family, friends"}, {"file": "/home/saurav/Pictures/DSC02828.ARW", "thumb": "thumbnails/DSC02828.ARW.jpg", "tags": "outdoors, landscape, city, night, travel"}, {"file": "/home/saurav/Pictures/DSC02803.ARW", "thumb": "thumbnails/DSC02803.ARW.jpg", "tags": "landscape, travel, outdoors, city, portrait"}, {"file": "/home/saurav/Pictures/DSC02864.ARW", "thumb": "thumbnails/DSC02864.ARW.jpg", "tags": "landscape, travel, outdoors, sports, night"}, {"file": "/home/saurav/Pictures/DSC02730.ARW", "thumb": "thumbnails/DSC02730.ARW.jpg", "tags": "outdoors, portrait, travel, wedding, selfie"}, {"file": "/home/saurav/Pictures/DSC02734.ARW", "thumb": "thumbnails/DSC02734.ARW.jpg", "tags": "outdoors, portrait, travel, wedding, selfie"}, {"file": "/home/saurav/Pictures/DSC02801.ARW", "thumb": "thumbnails/DSC02801.ARW.jpg", "tags": "outdoors, travel, landscape, city, night"}, {"file": "/home/saurav/Pictures/DSC02790.ARW", "thumb": "thumbnails/DSC02790.ARW.jpg", "tags": "landscape, travel, outdoors, night, sunset"}, {"file": "/home/saurav/Pictures/DSC02769.ARW", "thumb": "thumbnails/DSC02769.ARW.jpg", "tags": "travel, outdoors, portrait, wedding, selfie"}, {"file": "/home/saurav/Pictures/DSC02770.ARW", "thumb": "thumbnails/DSC02770.ARW.jpg", "tags": "travel, outdoors, landscape, portrait, selfie"}, {"file": "/home/saurav/Pictures/DSC02718.ARW", "thumb": "thumbnails/DSC02718.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02723.ARW", "thumb": "thumbnails/DSC02723.ARW.jpg", "tags": "travel, outdoors, landscape, portrait, city"}, {"file": "/home/saurav/Pictures/DSC02747.ARW", "thumb": "thumbnails/DSC02747.ARW.jpg", "tags": "outdoors, landscape, travel, indoors, portrait"}, {"file": "/home/saurav/Pictures/DSC02860.ARW", "thumb": "thumbnails/DSC02860.ARW.jpg", "tags": "outdoors, travel, sports, portrait, food"}, {"file": "/home/saurav/Pictures/DSC02791.ARW", "thumb": "thumbnails/DSC02791.ARW.jpg", "tags": "landscape, travel, outdoors, friends, group photo"}, {"file": "/home/saurav/Pictures/DSC02832.ARW", "thumb": "thumbnails/DSC02832.ARW.jpg", "tags": "travel, outdoors, landscape, wedding, portrait"}, {"file": "/home/saurav/Pictures/DSC02853.ARW", "thumb": "thumbnails/DSC02853.ARW.jpg", "tags": "landscape, travel, group photo, friends, outdoors"}, {"file": "/home/saurav/Pictures/DSC02715.ARW", "thumb": "thumbnails/DSC02715.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02729.ARW", "thumb": "thumbnails/DSC02729.ARW.jpg", "tags": "outdoors, landscape, night, travel, sunset"}, {"file": "/home/saurav/Pictures/DSC02746.ARW", "thumb": "thumbnails/DSC02746.ARW.jpg", "tags": "indoors, landscape, travel, outdoors, night"}, {"file": "/home/saurav/Pictures/DSC02820.ARW", "thumb": "thumbnails/DSC02820.ARW.jpg", "tags": "food, portrait, selfie, night, pets"}, {"file": "/home/saurav/Pictures/DSC02781.ARW", "thumb": "thumbnails/DSC02781.ARW.jpg", "tags": "landscape, travel, outdoors, city, group photo"}, {"file": "/home/saurav/Pictures/DSC02755.ARW", "thumb": "thumbnails/DSC02755.ARW.jpg", "tags": "outdoors, landscape, travel, indoors, portrait"}, {"file": "/home/saurav/Pictures/DSC02775.ARW", "thumb": "thumbnails/DSC02775.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02877.ARW", "thumb": "thumbnails/DSC02877.ARW.jpg", "tags": "landscape, outdoors, travel, wedding, night"}, {"file": "/home/saurav/Pictures/DSC02819.ARW", "thumb": "thumbnails/DSC02819.ARW.jpg", "tags": "portrait, landscape, outdoors, friends, travel"}, {"file": "/home/saurav/Pictures/DSC02756.ARW", "thumb": "thumbnails/DSC02756.ARW.jpg", "tags": "outdoors, landscape, indoors, travel, portrait"}, {"file": "/home/saurav/Pictures/DSC02817.ARW", "thumb": "thumbnails/DSC02817.ARW.jpg", "tags": "landscape, portrait, outdoors, travel, friends"}, {"file": "/home/saurav/Pictures/DSC02837.ARW", "thumb": "thumbnails/DSC02837.ARW.jpg", "tags": "landscape, outdoors, travel, night, city"}, {"file": "/home/saurav/Pictures/DSC02876.ARW", "thumb": "thumbnails/DSC02876.ARW.jpg", "tags": "landscape, outdoors, travel, wedding, portrait"}, {"file": "/home/saurav/Pictures/DSC02737.ARW", "thumb": "thumbnails/DSC02737.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02765.ARW", "thumb": "thumbnails/DSC02765.ARW.jpg", "tags": "landscape, travel, outdoors, sunset, night"}, {"file": "/home/saurav/Pictures/DSC02714.ARW", "thumb": "thumbnails/DSC02714.ARW.jpg", "tags": "outdoors, landscape, travel, sports, city"}, {"file": "/home/saurav/Pictures/DSC02865.ARW", "thumb": "thumbnails/DSC02865.ARW.jpg", "tags": "landscape, travel, outdoors, sports, night"}, {"file": "/home/saurav/Pictures/DSC02789.ARW", "thumb": "thumbnails/DSC02789.ARW.jpg", "tags": "landscape, portrait, night, travel, friends"}, {"file": "/home/saurav/Pictures/DSC02762.ARW", "thumb": "thumbnails/DSC02762.ARW.jpg", "tags": "landscape, outdoors, sunset, travel, night"}, {"file": "/home/saurav/Pictures/DSC02711.ARW", "thumb": "thumbnails/DSC02711.ARW.jpg", "tags": "landscape, travel, outdoors, sports, city"}, {"file": "/home/saurav/Pictures/DSC02726.ARW", "thumb": "thumbnails/DSC02726.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02745.ARW", "thumb": "thumbnails/DSC02745.ARW.jpg", "tags": "travel, landscape, city, indoors, night"}, {"file": "/home/saurav/Pictures/DSC02810.ARW", "thumb": "thumbnails/DSC02810.ARW.jpg", "tags": "landscape, travel, outdoors, city, sports"}, {"file": "/home/saurav/Pictures/DSC02782.ARW", "thumb": "thumbnails/DSC02782.ARW.jpg", "tags": "landscape, travel, city, outdoors, food"}, {"file": "/home/saurav/Pictures/DSC02778.ARW", "thumb": "thumbnails/DSC02778.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02849.ARW", "thumb": "thumbnails/DSC02849.ARW.jpg", "tags": "landscape, travel, group photo, family, friends"}, {"file": "/home/saurav/Pictures/DSC02760.ARW", "thumb": "thumbnails/DSC02760.ARW.jpg", "tags": "landscape, travel, outdoors, night, indoors"}, {"file": "/home/saurav/Pictures/DSC02759.ARW", "thumb": "thumbnails/DSC02759.ARW.jpg", "tags": "landscape, travel, outdoors, night, indoors"}, {"file": "/home/saurav/Pictures/DSC02844.ARW", "thumb": "thumbnails/DSC02844.ARW.jpg", "tags": "landscape, travel, outdoors, night, food"}, {"file": "/home/saurav/Pictures/DSC02702.ARW", "thumb": "thumbnails/DSC02702.ARW.jpg", "tags": "landscape, travel, outdoors, night, city"}, {"file": "/home/saurav/Pictures/DSC02809.ARW", "thumb": "thumbnails/DSC02809.ARW.jpg", "tags": "travel, portrait, pets, group photo, food"}, {"file": "/home/saurav/Pictures/DSC02719.ARW", "thumb": "thumbnails/DSC02719.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02720.ARW", "thumb": "thumbnails/DSC02720.ARW.jpg", "tags": "travel, landscape, outdoors, city, portrait"}, {"file": "/home/saurav/Pictures/DSC02721.ARW", "thumb": "thumbnails/DSC02721.ARW.jpg", "tags": "travel, outdoors, landscape, portrait, city"}, {"file": "/home/saurav/Pictures/DSC02826.ARW", "thumb": "thumbnails/DSC02826.ARW.jpg", "tags": "landscape, outdoors, travel, city, night"}, {"file": "/home/saurav/Pictures/DSC02731.ARW", "thumb": "thumbnails/DSC02731.ARW.jpg", "tags": "outdoors, wedding, selfie, portrait, travel"}, {"file": "/home/saurav/Pictures/DSC02795.ARW", "thumb": "thumbnails/DSC02795.ARW.jpg", "tags": "landscape, travel, outdoors, night, group photo"}, {"file": "/home/saurav/Pictures/DSC02732.ARW", "thumb": "thumbnails/DSC02732.ARW.jpg", "tags": "outdoors, travel, selfie, wedding, night"}, {"file": "/home/saurav/Pictures/DSC02857.ARW", "thumb": "thumbnails/DSC02857.ARW.jpg", "tags": "landscape, travel, portrait, food, selfie"}, {"file": "/home/saurav/Pictures/DSC02777.ARW", "thumb": "thumbnails/DSC02777.ARW.jpg", "tags": "landscape, outdoors, travel, portrait, city"}, {"file": "/home/saurav/Pictures/DSC02854.ARW", "thumb": "thumbnails/DSC02854.ARW.jpg", "tags": "landscape, outdoors, travel, sports, food"}, {"file": "/home/saurav/Pictures/DSC02830.ARW", "thumb": "thumbnails/DSC02830.ARW.jpg", "tags": "landscape, outdoors, travel, city, night"}, {"file": "/home/saurav/Pictures/DSC02743.ARW", "thumb": "thumbnails/DSC02743.ARW.jpg", "tags": "city, indoors, selfie, night, landscape"}, {"file": "/home/saurav/Pictures/DSC02846.ARW", "thumb": "thumbnails/DSC02846.ARW.jpg", "tags": "landscape, travel, outdoors, sports, food"}, {"file": "/home/saurav/Pictures/DSC02741.ARW", "thumb": "thumbnails/DSC02741.ARW.jpg", "tags": "indoors, party, city, outdoors, night"}, {"file": "/home/saurav/Pictures/DSC02812.ARW", "thumb": "thumbnails/DSC02812.ARW.jpg", "tags": "travel, selfie, outdoors, friends, family"}, {"file": "/home/saurav/Pictures/DSC02740.ARW", "thumb": "thumbnails/DSC02740.ARW.jpg", "tags": "indoors, outdoors, landscape, travel, city"}, {"file": "/home/saurav/Pictures/DSC02843.ARW", "thumb": "thumbnails/DSC02843.ARW.jpg", "tags": "friends, landscape, family, travel, outdoors"}, {"file": "/home/saurav/Pictures/DSC02868.ARW", "thumb": "thumbnails/DSC02868.ARW.jpg", "tags": "landscape, outdoors, travel, city, friends"}, {"file": "/home/saurav/Pictures/DSC02783.ARW", "thumb": "thumbnails/DSC02783.ARW.jpg", "tags": "landscape, travel, city, portrait, food"}, {"file": "/home/saurav/Pictures/DSC02716.ARW", "thumb": "thumbnails/DSC02716.ARW.jpg", "tags": "landscape, travel, city, sunset, night"}, {"file": "/home/saurav/Pictures/DSC02870.ARW", "thumb": "thumbnails/DSC02870.ARW.jpg", "tags": "landscape, outdoors, travel, portrait, city"}, {"file": "/home/saurav/Pictures/DSC02700.ARW", "thumb": "thumbnails/DSC02700.ARW.jpg", "tags": "landscape, indoors, travel, city, outdoors"}, {"file": "/home/saurav/Pictures/DSC02761.ARW", "thumb": "thumbnails/DSC02761.ARW.jpg", "tags": "landscape, outdoors, travel, night, city"}, {"file": "/home/saurav/Pictures/DSC02867.ARW", "thumb": "thumbnails/DSC02867.ARW.jpg", "tags": "outdoors, travel, wedding, selfie, pets"}, {"file": "/home/saurav/Pictures/DSC02831.ARW", "thumb": "thumbnails/DSC02831.ARW.jpg", "tags": "outdoors, travel, landscape, portrait, wedding"}, {"file": "/home/saurav/Pictures/DSC02712.ARW", "thumb": "thumbnails/DSC02712.ARW.jpg", "tags": "landscape, travel, outdoors, night, city"}, {"file": "/home/saurav/Pictures/DSC02771.ARW", "thumb": "thumbnails/DSC02771.ARW.jpg", "tags": "travel, landscape, outdoors, selfie, city"}, {"file": "/home/saurav/Pictures/DSC02786.ARW", "thumb": "thumbnails/DSC02786.ARW.jpg", "tags": "landscape, outdoors, travel, friends, group photo"}, {"file": "/home/saurav/Pictures/DSC02823.ARW", "thumb": "thumbnails/DSC02823.ARW.jpg", "tags": "landscape, outdoors, portrait, food, night"}, {"file": "/home/saurav/Pictures/DSC02701.ARW", "thumb": "thumbnails/DSC02701.ARW.jpg", "tags": "landscape, travel, outdoors, night, city"}, {"file": "/home/saurav/Pictures/DSC02824.ARW", "thumb": "thumbnails/DSC02824.ARW.jpg", "tags": "portrait, outdoors, food, sunset, landscape"}, {"file": "/home/saurav/Pictures/DSC02764.ARW", "thumb": "thumbnails/DSC02764.ARW.jpg", "tags": "landscape, travel, outdoors, night, group photo"}, {"file": "/home/saurav/Pictures/DSC02875.ARW", "thumb": "thumbnails/DSC02875.ARW.jpg", "tags": "landscape, travel, outdoors, food, night"}, {"file": "/home/saurav/Pictures/DSC02742.ARW", "thumb": "thumbnails/DSC02742.ARW.jpg", "tags": "indoors, city, party, night, pets"}, {"file": "/home/saurav/Pictures/DSC02710.ARW", "thumb": "thumbnails/DSC02710.ARW.jpg", "tags": "landscape, travel, outdoors, night, sunset"}, {"file": "/home/saurav/Pictures/DSC02833.ARW", "thumb": "thumbnails/DSC02833.ARW.jpg", "tags": "travel, outdoors, landscape, sports, city"}, {"file": "/home/saurav/Pictures/DSC02785.ARW", "thumb": "thumbnails/DSC02785.ARW.jpg", "tags": "landscape, outdoors, travel, night, friends"}, {"file": "/home/saurav/Pictures/DSC02834.ARW", "thumb": "thumbnails/DSC02834.ARW.jpg", "tags": "travel, outdoors, landscape, portrait, wedding"}, {"file": "/home/saurav/Pictures/DSC02863.ARW", "thumb": "thumbnails/DSC02863.ARW.jpg", "tags": "outdoors, travel, food, portrait, sports"}, {"file": "/home/saurav/Pictures/DSC02744.ARW", "thumb": "thumbnails/DSC02744.ARW.jpg", "tags": "indoors, city, night, selfie, travel"}, {"file": "/home/saurav/Pictures/DSC02829.ARW", "thumb": "thumbnails/DSC02829.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02873.ARW", "thumb": "thumbnails/DSC02873.ARW.jpg", "tags": "landscape, outdoors, travel, night, friends"}, {"file": "/home/saurav/Pictures/DSC02818.ARW", "thumb": "thumbnails/DSC02818.ARW.jpg", "tags": "landscape, outdoors, portrait, travel, friends"}, {"file": "/home/saurav/Pictures/DSC02802.ARW", "thumb": "thumbnails/DSC02802.ARW.jpg", "tags": "landscape, travel, outdoors, city, sports"}, {"file": "/home/saurav/Pictures/DSC02708.ARW", "thumb": "thumbnails/DSC02708.ARW.jpg", "tags": "landscape, travel, city, outdoors, night"}, {"file": "/home/saurav/Pictures/DSC02811.ARW", "thumb": "thumbnails/DSC02811.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02800.ARW", "thumb": "thumbnails/DSC02800.ARW.jpg", "tags": "landscape, outdoors, travel, portrait, city"}, {"file": "/home/saurav/Pictures/DSC02727.ARW", "thumb": "thumbnails/DSC02727.ARW.jpg", "tags": "landscape, travel, outdoors, city, sunset"}, {"file": "/home/saurav/Pictures/DSC02758.ARW", "thumb": "thumbnails/DSC02758.ARW.jpg", "tags": "landscape, outdoors, travel, city, night"}, {"file": "/home/saurav/Pictures/DSC02815.ARW", "thumb": "thumbnails/DSC02815.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02858.ARW", "thumb": "thumbnails/DSC02858.ARW.jpg", "tags": "portrait, food, selfie, travel, landscape"}, {"file": "/home/saurav/Pictures/DSC02724.ARW", "thumb": "thumbnails/DSC02724.ARW.jpg", "tags": "landscape, travel, outdoors, city, night"}, {"file": "/home/saurav/Pictures/DSC02779.ARW", "thumb": "thumbnails/DSC02779.ARW.jpg", "tags": "landscape, travel, outdoors, city, food"}, {"file": "/home/saurav/Pictures/DSC02825.ARW", "thumb": "thumbnails/DSC02825.ARW.jpg", "tags": "landscape, outdoors, group photo, travel, friends"}, {"file": "/home/saurav/Pictures/DSC02861.ARW", "thumb": "thumbnails/DSC02861.ARW.jpg", "tags": "outdoors, travel, selfie, portrait, food"}, {"file": "/home/saurav/Pictures/DSC02766.ARW", "thumb": "thumbnails/DSC02766.ARW.jpg", "tags": "landscape, travel, outdoors, city, indoors"}, {"file": "/home/saurav/Pictures/DSC02838.ARW", "thumb": "thumbnails/DSC02838.ARW.jpg", "tags": "landscape, travel, outdoors, food, night"}, {"file": "/home/saurav/Pictures/DSC02733.ARW", "thumb": "thumbnails/DSC02733.ARW.jpg", "tags": "outdoors, portrait, travel, wedding, selfie"}, {"file": "/home/saurav/Pictures/DSC02748.ARW", "thumb": "thumbnails/DSC02748.ARW.jpg", "tags": "outdoors, landscape, travel, indoors, city"}, {"file": "/home/saurav/Pictures/DSC02725.ARW", "thumb": "thumbnails/DSC02725.ARW.jpg", "tags": "landscape, travel, outdoors, sunset, night"}, {"file": "/home/saurav/Pictures/DSC02851.ARW", "thumb": "thumbnails/DSC02851.ARW.jpg", "tags": "landscape, travel, group photo, friends, family"}, {"file": "/home/saurav/Pictures/DSC02707.ARW", "thumb": "thumbnails/DSC02707.ARW.jpg", "tags": "landscape, outdoors, sports, city, travel"}, {"file": "/home/saurav/Pictures/DSC02821.ARW", "thumb": "thumbnails/DSC02821.ARW.jpg", "tags": "food, portrait, friends, pets, selfie"}, {"file": "/home/saurav/Pictures/DSC02798.ARW", "thumb": "thumbnails/DSC02798.ARW.jpg", "tags": "outdoors, travel, landscape, portrait, selfie"}, {"file": "/home/saurav/Pictures/DSC02805.ARW", "thumb": "thumbnails/DSC02805.ARW.jpg", "tags": "outdoors, landscape, travel, portrait, city"}, {"file": "/home/saurav/Pictures/DSC02738.ARW", "thumb": "thumbnails/DSC02738.ARW.jpg", "tags": "landscape, outdoors, indoors, travel, night"}];
+    const FACES = [{"face_id": 1, "photo_id": 2, "photo_path": "/home/saurav/Pictures/DSC02751.ARW", "thumb": "faces/face_1.jpg", "person_id": 1, "person_name": "Person 1"}, {"face_id": 2, "photo_id": 10, "photo_path": "/home/saurav/Pictures/DSC02754.ARW", "thumb": "faces/face_2.jpg", "person_id": 1, "person_name": "Person 1"}, {"face_id": 3, "photo_id": 12, "photo_path": "/home/saurav/Pictures/DSC02722.ARW", "thumb": "faces/face_3.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 4, "photo_id": 15, "photo_path": "/home/saurav/Pictures/DSC02862.ARW", "thumb": "faces/face_4.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 5, "photo_id": 19, "photo_path": "/home/saurav/Pictures/DSC02855.ARW", "thumb": "faces/face_5.jpg", "person_id": 3, "person_name": "Person 3"}, {"face_id": 6, "photo_id": 19, "photo_path": "/home/saurav/Pictures/DSC02855.ARW", "thumb": "faces/face_6.jpg", "person_id": 4, "person_name": "Person 4"}, {"face_id": 7, "photo_id": 19, "photo_path": "/home/saurav/Pictures/DSC02855.ARW", "thumb": "faces/face_7.jpg", "person_id": 5, "person_name": "Person 5"}, {"face_id": 8, "photo_id": 24, "photo_path": "/home/saurav/Pictures/DSC02750.ARW", "thumb": "faces/face_8.jpg", "person_id": 6, "person_name": "Person 6"}, {"face_id": 9, "photo_id": 25, "photo_path": "/home/saurav/Pictures/DSC02866.ARW", "thumb": "faces/face_9.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 10, "photo_id": 33, "photo_path": "/home/saurav/Pictures/DSC02752.ARW", "thumb": "faces/face_10.jpg", "person_id": 1, "person_name": "Person 1"}, {"face_id": 11, "photo_id": 35, "photo_path": "/home/saurav/Pictures/DSC02859.ARW", "thumb": "faces/face_11.jpg", "person_id": 7, "person_name": "Person 7"}, {"face_id": 12, "photo_id": 38, "photo_path": "/home/saurav/Pictures/DSC02842.ARW", "thumb": "faces/face_12.jpg", "person_id": 8, "person_name": "Person 8"}, {"face_id": 13, "photo_id": 39, "photo_path": "/home/saurav/Pictures/DSC02797.ARW", "thumb": "faces/face_13.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 14, "photo_id": 48, "photo_path": "/home/saurav/Pictures/DSC02813.ARW", "thumb": "faces/face_14.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 15, "photo_id": 48, "photo_path": "/home/saurav/Pictures/DSC02813.ARW", "thumb": "faces/face_15.jpg", "person_id": 9, "person_name": "Person 9"}, {"face_id": 16, "photo_id": 60, "photo_path": "/home/saurav/Pictures/DSC02753.ARW", "thumb": "faces/face_16.jpg", "person_id": 1, "person_name": "Person 1"}, {"face_id": 17, "photo_id": 61, "photo_path": "/home/saurav/Pictures/DSC02796.ARW", "thumb": "faces/face_17.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 18, "photo_id": 63, "photo_path": "/home/saurav/Pictures/DSC02736.ARW", "thumb": "faces/face_18.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 19, "photo_id": 64, "photo_path": "/home/saurav/Pictures/DSC02735.ARW", "thumb": "faces/face_19.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 20, "photo_id": 65, "photo_path": "/home/saurav/Pictures/DSC02749.ARW", "thumb": "faces/face_20.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 21, "photo_id": 70, "photo_path": "/home/saurav/Pictures/DSC02730.ARW", "thumb": "faces/face_21.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 22, "photo_id": 71, "photo_path": "/home/saurav/Pictures/DSC02734.ARW", "thumb": "faces/face_22.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 23, "photo_id": 74, "photo_path": "/home/saurav/Pictures/DSC02769.ARW", "thumb": "faces/face_23.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 24, "photo_id": 75, "photo_path": "/home/saurav/Pictures/DSC02770.ARW", "thumb": "faces/face_24.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 25, "photo_id": 77, "photo_path": "/home/saurav/Pictures/DSC02723.ARW", "thumb": "faces/face_25.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 26, "photo_id": 78, "photo_path": "/home/saurav/Pictures/DSC02747.ARW", "thumb": "faces/face_26.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 27, "photo_id": 79, "photo_path": "/home/saurav/Pictures/DSC02860.ARW", "thumb": "faces/face_27.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 28, "photo_id": 88, "photo_path": "/home/saurav/Pictures/DSC02755.ARW", "thumb": "faces/face_28.jpg", "person_id": 1, "person_name": "Person 1"}, {"face_id": 29, "photo_id": 92, "photo_path": "/home/saurav/Pictures/DSC02756.ARW", "thumb": "faces/face_29.jpg", "person_id": 1, "person_name": "Person 1"}, {"face_id": 30, "photo_id": 115, "photo_path": "/home/saurav/Pictures/DSC02720.ARW", "thumb": "faces/face_30.jpg", "person_id": 10, "person_name": "Person 10"}, {"face_id": 31, "photo_id": 116, "photo_path": "/home/saurav/Pictures/DSC02721.ARW", "thumb": "faces/face_31.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 32, "photo_id": 118, "photo_path": "/home/saurav/Pictures/DSC02731.ARW", "thumb": "faces/face_32.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 33, "photo_id": 120, "photo_path": "/home/saurav/Pictures/DSC02732.ARW", "thumb": "faces/face_33.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 34, "photo_id": 128, "photo_path": "/home/saurav/Pictures/DSC02812.ARW", "thumb": "faces/face_34.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 35, "photo_id": 128, "photo_path": "/home/saurav/Pictures/DSC02812.ARW", "thumb": "faces/face_35.jpg", "person_id": 1, "person_name": "Person 1"}, {"face_id": 36, "photo_id": 140, "photo_path": "/home/saurav/Pictures/DSC02771.ARW", "thumb": "faces/face_36.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 37, "photo_id": 152, "photo_path": "/home/saurav/Pictures/DSC02863.ARW", "thumb": "faces/face_37.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 38, "photo_id": 168, "photo_path": "/home/saurav/Pictures/DSC02861.ARW", "thumb": "faces/face_38.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 39, "photo_id": 171, "photo_path": "/home/saurav/Pictures/DSC02733.ARW", "thumb": "faces/face_39.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 40, "photo_id": 172, "photo_path": "/home/saurav/Pictures/DSC02748.ARW", "thumb": "faces/face_40.jpg", "person_id": 2, "person_name": "Person 2"}, {"face_id": 41, "photo_id": 177, "photo_path": "/home/saurav/Pictures/DSC02798.ARW", "thumb": "faces/face_41.jpg", "person_id": 2, "person_name": "Person 2"}];
+
+    let currentView = "all";
+    let currentPerson = null;
+
+    function renderAllPhotos() {
+      const grid = document.getElementById("grid");
+      grid.innerHTML = "";
+      document.getElementById("title").innerText = "All photos";
+      document.getElementById("info").innerText = ITEMS.length + " photos";
+
+      ITEMS.forEach(it => {
+        const card = document.createElement("div");
+        card.className = "card";
+        const img = document.createElement("img");
+        img.src = it.thumb;
+        img.alt = it.file;
+        const body = document.createElement("div");
+        body.className = "card-body";
+        const p = document.createElement("div");
+        p.textContent = it.file;
+        const tags = document.createElement("div");
+        tags.className = "tags";
+        tags.textContent = it.tags || "";
+        body.appendChild(p);
+        body.appendChild(tags);
+        card.appendChild(img);
+        card.appendChild(body);
+        grid.appendChild(card);
+      });
+    }
+
+    function buildFacesSidebar() {
+      const section = document.getElementById("faces-section");
+      const list = document.getElementById("faces-list");
+      list.innerHTML = "";
+
+      if (!FACES.length) {
+        section.style.display = "none";
+        return;
+      }
+      section.style.display = "block";
+
+      // Group by person_name
+      const groups = {};
+      for (const f of FACES) {
+        const key = f.person_name || "Unknown";
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(f);
+      }
+
+      Object.keys(groups).sort().forEach(name => {
+        const faces = groups[name];
+        const li = document.createElement("li");
+        li.className = "sidebar-face-item";
+        li.dataset.person = name;
+
+        const btn = document.createElement("div");
+        btn.style.display = "flex";
+        btn.style.alignItems = "center";
+        btn.style.width = "100%";
+
+        const img = document.createElement("img");
+        img.className = "face-thumb";
+        img.src = faces[0].thumb || faces[0].photo_path;  // fallback
+
+        const label = document.createElement("div");
+        label.className = "sidebar-face-label";
+        label.innerHTML = name + '<span class="pill">' + faces.length + '</span>';
+
+        btn.appendChild(img);
+        btn.appendChild(label);
+        li.appendChild(btn);
+
+        li.addEventListener("click", () => {
+          currentView = "faces";
+          currentPerson = name;
+          Array.from(document.querySelectorAll("#faces-list li")).forEach(x => x.classList.remove("active"));
+          li.classList.add("active");
+          renderFacesForPerson(name);
+          // also set sidebar main view:
+          document.querySelector('#view-list li[data-view="faces"]').classList.add("active");
+          document.querySelector('#view-list li[data-view="all"]').classList.remove("active");
+        });
+
+        list.appendChild(li);
+      });
+    }
+
+    function renderFacesForPerson(name) {
+      const grid = document.getElementById("grid");
+      grid.innerHTML = "";
+
+      let subset = FACES;
+      if (name) {
+        subset = FACES.filter(f => (f.person_name || "Unknown") === name);
+      }
+
+      document.getElementById("title").innerText = "Faces: " + (name || "All");
+      document.getElementById("info").innerText = subset.length + " faces";
+
+      subset.forEach(f => {
+        const card = document.createElement("div");
+        card.className = "card";
+        const img = document.createElement("img");
+        img.src = f.thumb || f.photo_path;
+        img.alt = f.photo_path;
+        const body = document.createElement("div");
+        body.className = "card-body";
+        const p = document.createElement("div");
+        p.textContent = f.photo_path;
+        const tags = document.createElement("div");
+        tags.className = "tags";
+        tags.textContent = f.person_name || "Unknown face";
+        body.appendChild(p);
+        body.appendChild(tags);
+        card.appendChild(img);
+        card.appendChild(body);
+        grid.appendChild(card);
+      });
+    }
+
+    function setupViewSwitch() {
+      const list = document.getElementById("view-list");
+      Array.from(list.querySelectorAll("li")).forEach(li => {
+        li.addEventListener("click", () => {
+          Array.from(list.querySelectorAll("li")).forEach(x => x.classList.remove("active"));
+          li.classList.add("active");
+          const view = li.dataset.view;
+          currentView = view;
+
+          if (view === "all") {
+            currentPerson = null;
+            renderAllPhotos();
+          } else if (view === "faces") {
+            currentPerson = null;
+            renderFacesForPerson(null);
+          }
+        });
+      });
+    }
+
+    // Init
+    renderAllPhotos();
+    buildFacesSidebar();
+    setupViewSwitch();
+  </script>
+</body>
+</html>

@@ -6,70 +6,68 @@ import numpy as np
 
 from core.extractor import load_image
 
-try:
-    from insightface.app import FaceAnalysis
-    _HAS_INSIGHTFACE = True
-except ImportError:
-    _HAS_INSIGHTFACE = False
-
-_app: FaceAnalysis | None = None
+HAS_INSIGHTFACE = False
+_FACE_APP = None
 
 
-def _get_app() -> FaceAnalysis:
-    """Singleton InsightFace app instance."""
-    global _app
-    if _app is not None:
-        return _app
+def _lazy_init_insightface():
+    global HAS_INSIGHTFACE, _FACE_APP
+    if _FACE_APP is not None:
+        return _FACE_APP
 
-    if not _HAS_INSIGHTFACE:
-        raise RuntimeError("insightface is not installed")
+    try:
+        from insightface.app import FaceAnalysis
+        import onnxruntime  # noqa: F401
 
-    # CPU-only (ctx_id=-1). If you want GPU later, you can switch to 0.
-    app = FaceAnalysis(name="buffalo_l")
-    app.prepare(ctx_id=-1)
-    _app = app
-    return _app
+        # Use CPU by default; you can tweak providers later.
+        _FACE_APP = FaceAnalysis(name="buffalo_l")
+        # ctx_id=-1 => CPU only
+        _FACE_APP.prepare(ctx_id=-1, det_size=(640, 640))
+        HAS_INSIGHTFACE = True
+    except Exception as e:
+        print(f"[yellow]InsightFace not available:[/yellow] {e}")
+        HAS_INSIGHTFACE = False
+        _FACE_APP = None
+
+    return _FACE_APP
 
 
-def face_encodings(path: str) -> List[Dict]:
+def face_encodings(file_path: str) -> List[Dict]:
     """
-    Detect faces and return list of dicts:
-        {
-          "bbox": [x1, y1, x2, y2],
-          "embedding": [...],
-          "score": float,
-          "landmarks": [[x, y], ...] or None
-        }
+    Return a list of faces for the given image.
 
-    Uses RAW-safe loader so ARW/CR2/NEF also work.
+    Each item is:
+      {
+        "bbox": (x, y, w, h),
+        "embedding": np.ndarray (float32),
+        "score": float,
+      }
     """
-    if not _HAS_INSIGHTFACE:
-        raise RuntimeError(
-            "insightface not available. Install with: pip install insightface onnxruntime"
-        )
+    app = _lazy_init_insightface()
+    if not HAS_INSIGHTFACE or app is None:
+        return []
 
-    img_pil = load_image(Path(path))
-    # PIL gives RGB, InsightFace expects BGR
-    img = np.array(img_pil)[:, :, ::-1].copy()
+    img = load_image(Path(file_path))
+    # InsightFace expects numpy array in BGR or RGB; PIL -> numpy in RGB
+    img_np = np.array(img)
 
-    app = _get_app()
-    faces = app.get(img)
+    faces = app.get(img_np)
+    results: List[Dict] = []
 
-    out: List[Dict] = []
     for f in faces:
-        bbox = f.bbox.astype(int).tolist()
-        emb = f.embedding.astype("float32").tolist()
-        score = float(getattr(f, "det_score", 0.0))
-        kps = getattr(f, "kps", None)
-        landmarks = kps.tolist() if kps is not None else None
+        # f.bbox: [x1, y1, x2, y2]
+        x1, y1, x2, y2 = f.bbox.astype(int).tolist()
+        w = x2 - x1
+        h = y2 - y1
 
-        out.append(
+        emb = f.normed_embedding.astype("float32")
+
+        results.append(
             {
-                "bbox": bbox,
+                "bbox": (int(x1), int(y1), int(w), int(h)),
                 "embedding": emb,
-                "score": score,
-                "landmarks": landmarks,
+                "score": float(getattr(f, "det_score", 1.0)),
             }
         )
 
-    return out
+    return results
