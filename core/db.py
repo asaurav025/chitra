@@ -292,6 +292,14 @@ def get_or_create_person(conn: sqlite3.Connection, name: str) -> int:
     return cur.lastrowid
 
 
+def create_person(conn: sqlite3.Connection, name: str) -> int:
+    """Create a new person. Raises error if name already exists."""
+    cur = conn.cursor()
+    cur.execute("INSERT INTO persons (name) VALUES (?)", (name,))
+    conn.commit()
+    return cur.lastrowid
+
+
 def rename_person(conn: sqlite3.Connection, person_id: int, new_name: str):
     conn.execute("UPDATE persons SET name=? WHERE id=?", (new_name, person_id))
     conn.commit()
@@ -359,3 +367,43 @@ def get_face_thumbs(conn: sqlite3.Connection):
         """
     )
     return cur.fetchall()
+
+def get_face_thumbs_for_person(conn: sqlite3.Connection, person_id: int):
+    """Get face thumbnails for a specific person by person_id."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT f.id as face_id,
+               f.photo_id,
+               ph.file_path,
+               ft.thumb_path,
+               f.person_id,
+               p.name as person_name
+        FROM faces f
+        JOIN photos ph ON ph.id = f.photo_id
+        LEFT JOIN face_thumbs ft ON ft.face_id = f.id
+        LEFT JOIN persons p ON p.id = f.person_id
+        WHERE f.person_id = ?
+        ORDER BY f.id ASC
+        LIMIT 10
+        """,
+        (person_id,),
+    )
+    return cur.fetchall()
+
+
+def merge_persons(conn: sqlite3.Connection, source_person_id: int, target_person_id: int):
+    """Merge source person into target person. All faces assigned to source will be reassigned to target."""
+    if source_person_id == target_person_id:
+        raise ValueError("Cannot merge a person with itself")
+    
+    # Update all faces from source person to target person
+    conn.execute(
+        "UPDATE faces SET person_id=? WHERE person_id=?",
+        (target_person_id, source_person_id)
+    )
+    
+    # Delete the source person
+    conn.execute("DELETE FROM persons WHERE id=?", (source_person_id,))
+    
+    conn.commit()
