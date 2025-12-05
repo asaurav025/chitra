@@ -1,4 +1,4 @@
-.PHONY: venv install init run
+.PHONY: venv install init run api ftp
 
 venv:
 	python -m venv .venv
@@ -11,3 +11,9 @@ init:
 
 run:
 	. .venv/bin/activate && python -m cli.main tui
+
+api:
+	. .venv/bin/activate && python app.py
+
+ftp:
+	. .venv/bin/activate && python ftp_server.py
