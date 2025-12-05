@@ -11,24 +11,37 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
 from core import db
-from core.extractor import collect_metadata, load_image, iter_images
+from core.extractor import collect_metadata, load_image, iter_images, RAW_EXTS
+from core.ftp_client import FTPStorageClient
+from PIL import Image
+# Register HEIC/HEIF support
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass  # pillow-heif not installed, HEIC support will be limited
 from core.embedder import ClipEmbedder
 from core.gallery import ensure_thumb
 from core.face import face_encodings
 from core.tagger import auto_tags
+import tempfile
 
 
 # -----------------------------------------------------------------------------
 # CONFIG
 # -----------------------------------------------------------------------------
 DB_PATH = os.environ.get("CHITRA_DB_PATH", db.DB_DEFAULT_PATH)
-PHOTO_ROOT = Path(os.environ.get("CHITRA_PHOTO_ROOT", "photos")).resolve()
-THUMB_ROOT = PHOTO_ROOT / ".thumbs"
-FACE_THUMB_ROOT = PHOTO_ROOT / ".faces"
 
-PHOTO_ROOT.mkdir(parents=True, exist_ok=True)
-THUMB_ROOT.mkdir(parents=True, exist_ok=True)
-FACE_THUMB_ROOT.mkdir(parents=True, exist_ok=True)
+# FTP storage is mandatory - no local storage fallback
+FTP_STORAGE_HOST = os.environ.get("FTP_STORAGE_HOST")
+if not FTP_STORAGE_HOST:
+    raise ValueError(
+        "FTP_STORAGE_HOST environment variable is required. "
+        "Please configure FTP storage: export FTP_STORAGE_HOST=ftp.example.com"
+    )
+
+# Initialize FTP storage client
+FTP_CLIENT = FTPStorageClient()
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -64,11 +77,33 @@ def row_to_photo_dto(row) -> Dict[str, Any]:
     }
 
 
-def ensure_photo_thumb(file_path: str, photo_id: int) -> Path:
-    thumb_path = THUMB_ROOT / f"{photo_id}.jpg"
-    if not thumb_path.exists():
-        thumb_path.parent.mkdir(parents=True, exist_ok=True)
-        ensure_thumb(file_path, str(thumb_path))
+def ensure_photo_thumb(file_path: str, photo_id: int) -> str:
+    """
+    Ensure thumbnail exists on FTP server. Returns FTP path.
+    """
+    thumb_path = FTP_CLIENT.generate_thumbnail_path(photo_id, "photo")
+    # Check if thumbnail exists on FTP
+    if not FTP_CLIENT.file_exists(thumb_path):
+        # Download original, generate thumb, upload
+        try:
+            file_data = FTP_CLIENT.download_file(file_path)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
+                tmp.write(file_data)
+                tmp_path = tmp.name
+            
+            # Generate thumbnail
+            ensure_thumb(tmp_path, str(Path(tmp_path).with_suffix('.jpg')))
+            
+            # Read thumbnail and upload
+            with open(str(Path(tmp_path).with_suffix('.jpg')), 'rb') as f:
+                thumb_data = f.read()
+            FTP_CLIENT.upload_file(thumb_data, thumb_path)
+            
+            # Cleanup
+            os.unlink(tmp_path)
+            os.unlink(str(Path(tmp_path).with_suffix('.jpg')))
+        except Exception as e:
+            raise Exception(f"Failed to create thumbnail: {str(e)}")
     return thumb_path
 
 
@@ -87,7 +122,29 @@ def init_db_once():
 # -----------------------------------------------------------------------------
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "db_path": str(DB_PATH), "photo_root": str(PHOTO_ROOT)})
+    conn = get_conn()
+    try:
+        db.init_db(DB_PATH)
+    except:
+        pass
+    
+    health_info = {
+        "status": "ok",
+        "db_path": str(DB_PATH),
+        "storage_type": "ftp",
+        "ftp_host": FTP_CLIENT.host,
+        "ftp_base_path": FTP_CLIENT.base_path,
+    }
+    
+    # Test FTP connection
+    try:
+        FTP_CLIENT._connect()
+        health_info["ftp_status"] = "connected"
+        FTP_CLIENT._disconnect()
+    except Exception as e:
+        health_info["ftp_status"] = f"error: {str(e)}"
+    
+    return jsonify(health_info)
 
 
 # -----------------------------------------------------------------------------
@@ -140,13 +197,46 @@ def get_photo_image(photo_id: int):
         return jsonify({"error": "photo_not_found"}), 404
 
     file_path = row["file_path"]
-    if not os.path.isabs(file_path):
-        file_path = str(PHOTO_ROOT / file_path)
-
-    if not os.path.exists(file_path):
-        return jsonify({"error": "file_missing_on_disk"}), 404
-
-    return send_file(file_path)
+    
+    # Download from FTP
+    try:
+        file_data = FTP_CLIENT.download_file(file_path)
+    except FileNotFoundError:
+        return jsonify({"error": "file_not_found_on_ftp"}), 404
+    except Exception as e:
+        return jsonify({"error": f"ftp_error: {str(e)}"}), 500
+    
+    # Check if file needs conversion (RAW or HEIC/HEIF)
+    file_ext = Path(file_path).suffix.lower()
+    heic_exts = {".heic", ".heif"}
+    
+    if file_ext in RAW_EXTS or file_ext in heic_exts:
+        # Process in temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+            tmp.write(file_data)
+            tmp_path = tmp.name
+        
+        try:
+            img = load_image(Path(tmp_path))
+            # Convert PIL Image to JPEG bytes
+            img_io = io.BytesIO()
+            img.save(img_io, format='JPEG', quality=95)
+            img_io.seek(0)
+            return send_file(img_io, mimetype='image/jpeg')
+        except Exception as e:
+            return jsonify({"error": f"failed_to_convert: {str(e)}"}), 500
+        finally:
+            os.unlink(tmp_path)
+    
+    # Serve directly
+    ext = Path(file_path).suffix.lower()
+    mimetype = {
+        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.png': 'image/png', '.gif': 'image/gif',
+        '.webp': 'image/webp',
+    }.get(ext, 'application/octet-stream')
+    
+    return send_file(io.BytesIO(file_data), mimetype=mimetype)
 
 
 @app.get("/api/photos/<int:photo_id>/thumbnail")
@@ -161,14 +251,18 @@ def get_photo_thumbnail(photo_id: int):
         return jsonify({"error": "photo_not_found"}), 404
 
     file_path = row["file_path"]
-    if not os.path.isabs(file_path):
-        file_path = str(PHOTO_ROOT / file_path)
-
-    if not os.path.exists(file_path):
-        return jsonify({"error": "file_missing_on_disk"}), 404
-
+    
+    # Ensure thumbnail exists and get path
     thumb_path = ensure_photo_thumb(file_path, photo_id)
-    return send_file(str(thumb_path))
+    
+    # Download from FTP
+    try:
+        thumb_data = FTP_CLIENT.download_file(thumb_path)
+        return send_file(io.BytesIO(thumb_data), mimetype='image/jpeg')
+    except FileNotFoundError:
+        return jsonify({"error": "thumbnail_not_found_on_ftp"}), 404
+    except Exception as e:
+        return jsonify({"error": f"ftp_error: {str(e)}"}), 500
 
 
 # -----------------------------------------------------------------------------
@@ -185,7 +279,6 @@ def upload_photos():
     files.extend(request.files.getlist("files"))
 
     saved = []
-
     conn = get_conn()
 
     for storage in files:
@@ -193,50 +286,69 @@ def upload_photos():
         if not filename:
             continue
 
-        # Normalize path: store under PHOTO_ROOT using filename (or unique name)
-        dest = PHOTO_ROOT / filename
-        dest.parent.mkdir(parents=True, exist_ok=True)
-
-        # Avoid overwriting: add suffix if exists
-        base = dest.stem
-        ext = dest.suffix
+        # Read file data (no local storage - all files go to FTP)
+        file_data = storage.read()
+        
+        # Upload to FTP storage
+        remote_path = FTP_CLIENT.generate_photo_path(filename)
+        
+        # Ensure uniqueness
         counter = 1
-        while dest.exists():
-            dest = dest.with_name(f"{base}_{counter}{ext}")
+        base_path = remote_path
+        while FTP_CLIENT.file_exists(remote_path):
+            path_obj = Path(base_path)
+            ext = path_obj.suffix
+            name = path_obj.stem
+            remote_path = f"{path_obj.parent}/{name}_{counter}{ext}"
             counter += 1
-
-        storage.save(dest)
-
-        # Collect metadata + DB upsert
-        meta = collect_metadata(dest)
-        db.upsert_photo(conn, **meta)
-
-        # Fetch photo id
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM photos WHERE file_path=?", (str(dest),))
-        row = cur.fetchone()
-        if not row:
-            continue
-        photo_id = row["id"]
-
-        # Thumbnail
-        thumb_path = ensure_photo_thumb(str(dest), photo_id)
-
-        # Auto-process: embeddings and faces (if enabled)
-        auto_process = request.args.get("auto_process", "true").lower() == "true"
-        if auto_process:
-            # Process embedding and auto-tags
-            process_photo_embedding(photo_id, str(dest), conn)
-            # Process faces
-            process_photo_faces(photo_id, str(dest), conn)
-
-        saved.append(
-            {
+        
+        # Upload to FTP
+        try:
+            stored_path = FTP_CLIENT.upload_file(file_data, remote_path)
+        except Exception as e:
+            return jsonify({"error": f"ftp_upload_failed: {str(e)}"}), 500
+        
+        # Process metadata using temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix) as tmp:
+            tmp.write(file_data)
+            tmp_path = tmp.name
+        
+        try:
+            # Collect metadata
+            meta = collect_metadata(Path(tmp_path))
+            # Store FTP path
+            meta['file_path'] = stored_path
+            db.upsert_photo(conn, **meta)
+            
+            # Get photo ID
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM photos WHERE file_path=?", (stored_path,))
+            row = cur.fetchone()
+            if not row:
+                continue
+            photo_id = row["id"]
+            
+            # Generate thumbnail
+            thumb_path = ensure_photo_thumb(stored_path, photo_id)
+            
+            # Auto-process: embeddings and faces (if enabled)
+            auto_process = request.args.get("auto_process", "true").lower() == "true"
+            if auto_process:
+                # Process embedding and auto-tags
+                process_photo_embedding(photo_id, stored_path, conn)
+                # Process faces
+                process_photo_faces(photo_id, stored_path, conn)
+            
+            saved.append({
                 "id": photo_id,
-                "file_path": str(dest),
-                "thumbnail": str(thumb_path),
-            }
-        )
+                "file_path": stored_path,
+                "storage_url": f"/api/storage/{stored_path}",
+                "thumbnail": thumb_path,
+                "thumbnail_url": f"/api/storage/{thumb_path}",
+            })
+        finally:
+            # Clean up temporary file
+            os.unlink(tmp_path)
 
     conn.close()
     return jsonify({"saved": saved})
@@ -321,17 +433,25 @@ def add_photo_tags(photo_id: int):
 def process_photo_embedding(photo_id: int, file_path: str, conn):
     """Process a single photo: generate embedding and auto-tags."""
     try:
-        em = get_embedder()
-        img_vec = em.image_embedding(file_path)
-        vec_bytes = img_vec.tobytes()
-        dim = img_vec.shape[0]
-        db.put_embedding(conn, photo_id, vec_bytes, dim)
-        
-        # Auto tags
-        atags = auto_tags(em, file_path, k=6)
-        for tag, score in atags:
-            db.add_tag(conn, photo_id, tag, float(score))
-        return True
+        # Download from FTP to temporary file
+        file_data = FTP_CLIENT.download_file(file_path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
+            tmp.write(file_data)
+            tmp_path = tmp.name
+        try:
+            em = get_embedder()
+            img_vec = em.image_embedding(tmp_path)
+            vec_bytes = img_vec.tobytes()
+            dim = img_vec.shape[0]
+            db.put_embedding(conn, photo_id, vec_bytes, dim)
+            
+            # Auto tags
+            atags = auto_tags(em, tmp_path, k=6)
+            for tag, score in atags:
+                db.add_tag(conn, photo_id, tag, float(score))
+            return True
+        finally:
+            os.unlink(tmp_path)
     except Exception as e:
         print(f"Error processing embedding for photo {photo_id}: {e}")
         return False
@@ -340,53 +460,71 @@ def process_photo_embedding(photo_id: int, file_path: str, conn):
 def process_photo_faces(photo_id: int, file_path: str, conn, min_score=0.5, thumb_size=160):
     """Process a single photo: detect faces and generate thumbnails."""
     try:
-        faces = face_encodings(file_path)
-        if not faces:
-            return 0
-        
-        img = load_image(Path(file_path))
-        face_count = 0
-        
-        for idx_face, f in enumerate(faces):
-            if f.get("score", 1.0) < min_score:
-                continue
+        # Download from FTP to temporary file
+        file_data = FTP_CLIENT.download_file(file_path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
+            tmp.write(file_data)
+            tmp_path = tmp.name
+        try:
+            faces = face_encodings(tmp_path)
+            if not faces:
+                return 0
             
-            bbox = f["bbox"]
-            x, y, w, h = bbox
-            emb = f["embedding"]
-            emb_bytes = emb.astype("float32").tobytes()
+            img = load_image(Path(tmp_path))
+            face_count = 0
             
-            db.add_face(
-                conn,
-                photo_id=photo_id,
-                face_index=idx_face,
-                embedding_bytes=emb_bytes,
-                bbox_x=float(x),
-                bbox_y=float(y),
-                bbox_w=float(w),
-                bbox_h=float(h),
-            )
-            
-            # Get face_id
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id FROM faces WHERE photo_id=? AND face_index=?",
-                (photo_id, idx_face),
-            )
-            row = cur.fetchone()
-            if row:
-                face_id = row["id"]
+            for idx_face, f in enumerate(faces):
+                if f.get("score", 1.0) < min_score:
+                    continue
                 
-                # Thumbnail
-                crop = img.crop((x, y, x + w, y + h))
-                crop = crop.resize((thumb_size, thumb_size))
-                FACE_THUMB_ROOT.mkdir(parents=True, exist_ok=True)
-                face_thumb_path = FACE_THUMB_ROOT / f"face_{face_id}.jpg"
-                crop.save(face_thumb_path, "JPEG", quality=90)
-                db.set_face_thumb(conn, face_id, str(face_thumb_path))
-                face_count += 1
-        
-        return face_count
+                bbox = f["bbox"]
+                x, y, w, h = bbox
+                emb = f["embedding"]
+                emb_bytes = emb.astype("float32").tobytes()
+                
+                db.add_face(
+                    conn,
+                    photo_id=photo_id,
+                    face_index=idx_face,
+                    embedding_bytes=emb_bytes,
+                    bbox_x=float(x),
+                    bbox_y=float(y),
+                    bbox_w=float(w),
+                    bbox_h=float(h),
+                )
+                
+                # Get face_id
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id FROM faces WHERE photo_id=? AND face_index=?",
+                    (photo_id, idx_face),
+                )
+                row = cur.fetchone()
+                if row:
+                    face_id = row["id"]
+                    
+                    # Generate thumbnail
+                    crop = img.crop((x, y, x + w, y + h))
+                    crop = crop.resize((thumb_size, thumb_size))
+                    
+                    # Save to temporary file, then upload to FTP
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as thumb_tmp:
+                        crop.save(thumb_tmp.name, "JPEG", quality=90)
+                        with open(thumb_tmp.name, 'rb') as f:
+                            thumb_data = f.read()
+                    
+                    # Upload to FTP
+                    face_thumb_path = FTP_CLIENT.generate_thumbnail_path(face_id, "face")
+                    FTP_CLIENT.upload_file(thumb_data, face_thumb_path)
+                    db.set_face_thumb(conn, face_id, face_thumb_path)
+                    
+                    # Cleanup
+                    os.unlink(thumb_tmp.name)
+                    face_count += 1
+            
+            return face_count
+        finally:
+            os.unlink(tmp_path)
     except Exception as e:
         print(f"Error processing faces for photo {photo_id}: {e}")
         return 0
@@ -423,20 +561,26 @@ def index_embeddings():
         pid = r["id"]
         file_path = r["file_path"]
         try:
-            img_vec = em.image_embedding(file_path)
+            # Download from FTP to temporary file
+            file_data = FTP_CLIENT.download_file(file_path)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
+                tmp.write(file_data)
+                tmp_path = tmp.name
+            try:
+                img_vec = em.image_embedding(tmp_path)
+                vec_bytes = img_vec.tobytes()
+                dim = img_vec.shape[0]
+                db.put_embedding(conn, pid, vec_bytes, dim)
+                
+                # auto tags
+                atags = auto_tags(em, tmp_path, k=6)
+                for tag, score in atags:
+                    db.add_tag(conn, pid, tag, float(score))
+                indexed += 1
+            finally:
+                os.unlink(tmp_path)
         except Exception:
             continue
-
-        vec_bytes = img_vec.tobytes()
-        dim = img_vec.shape[0]
-        db.put_embedding(conn, pid, vec_bytes, dim)
-
-        # auto tags
-        atags = auto_tags(em, file_path, k=6)
-        for tag, score in atags:
-            db.add_tag(conn, pid, tag, float(score))
-
-        indexed += 1
 
     conn.close()
     return jsonify({"indexed": indexed})
@@ -521,50 +665,72 @@ def index_faces():
         pid = r["id"]
         file_path = r["file_path"]
 
-        faces = face_encodings(file_path)
-        if not faces:
+        # Download from FTP to temporary file
+        try:
+            file_data = FTP_CLIENT.download_file(file_path)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
+                tmp.write(file_data)
+                tmp_path = tmp.name
+        except Exception:
             continue
-
-        img = load_image(Path(file_path))
-
-        for idx_face, f in enumerate(faces):
-            if f.get("score", 1.0) < min_score:
+        
+        try:
+            faces = face_encodings(tmp_path)
+            if not faces:
                 continue
-
-            bbox = f["bbox"]
-            x, y, w, h = bbox
-            emb = f["embedding"]
-            emb_bytes = emb.astype("float32").tobytes()
-
-            db.add_face(
-                conn,
-                photo_id=pid,
-                face_index=idx_face,
-                embedding_bytes=emb_bytes,
-                bbox_x=float(x),
-                bbox_y=float(y),
-                bbox_w=float(w),
-                bbox_h=float(h),
-            )
-
-            # Get face_id
-            cur2 = conn.cursor()
-            cur2.execute(
-                "SELECT id FROM faces WHERE photo_id=? AND face_index=?",
-                (pid, idx_face),
-            )
-            row = cur2.fetchone()
-            if not row:
-                continue
-            face_id = row["id"]
-
-            # Thumbnail
-            crop = img.crop((x, y, x + w, y + h))
-            crop = crop.resize((thumb_size, thumb_size))
-            FACE_THUMB_ROOT.mkdir(parents=True, exist_ok=True)
-            face_thumb_path = FACE_THUMB_ROOT / f"face_{face_id}.jpg"
-            crop.save(face_thumb_path, "JPEG", quality=90)
-            db.set_face_thumb(conn, face_id, str(face_thumb_path))
+            
+            img = load_image(Path(tmp_path))
+            
+            for idx_face, f in enumerate(faces):
+                if f.get("score", 1.0) < min_score:
+                    continue
+                
+                bbox = f["bbox"]
+                x, y, w, h = bbox
+                emb = f["embedding"]
+                emb_bytes = emb.astype("float32").tobytes()
+                
+                db.add_face(
+                    conn,
+                    photo_id=pid,
+                    face_index=idx_face,
+                    embedding_bytes=emb_bytes,
+                    bbox_x=float(x),
+                    bbox_y=float(y),
+                    bbox_w=float(w),
+                    bbox_h=float(h),
+                )
+                
+                # Get face_id
+                cur2 = conn.cursor()
+                cur2.execute(
+                    "SELECT id FROM faces WHERE photo_id=? AND face_index=?",
+                    (pid, idx_face),
+                )
+                row = cur2.fetchone()
+                if not row:
+                    continue
+                face_id = row["id"]
+                
+                # Generate thumbnail
+                crop = img.crop((x, y, x + w, y + h))
+                crop = crop.resize((thumb_size, thumb_size))
+                
+                # Save to temporary file, then upload to FTP
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as thumb_tmp:
+                    crop.save(thumb_tmp.name, "JPEG", quality=90)
+                    with open(thumb_tmp.name, 'rb') as f:
+                        thumb_data = f.read()
+                
+                # Upload to FTP
+                face_thumb_path = FTP_CLIENT.generate_thumbnail_path(face_id, "face")
+                FTP_CLIENT.upload_file(thumb_data, face_thumb_path)
+                db.set_face_thumb(conn, face_id, face_thumb_path)
+                
+                # Cleanup
+                os.unlink(thumb_tmp.name)
+        finally:
+            os.unlink(tmp_path)
 
         processed += 1
         if limit is not None and processed >= int(limit):
@@ -689,23 +855,14 @@ def get_face_thumbnail(face_id: int):
 
     thumb_path = row["thumb_path"]
     
-    # Handle relative paths - try multiple base directories
-    if not os.path.isabs(thumb_path):
-        # Try relative to working directory first
-        candidates = [
-            Path(thumb_path),
-            Path("chitra") / thumb_path,  # Gallery output folder
-            FACE_THUMB_ROOT / Path(thumb_path).name,  # .faces folder
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                thumb_path = str(candidate)
-                break
-    
-    if not os.path.exists(thumb_path):
-        return jsonify({"error": "thumb_file_missing", "tried": thumb_path}), 404
-
-    return send_file(thumb_path)
+    # Download from FTP
+    try:
+        thumb_data = FTP_CLIENT.download_file(thumb_path)
+        return send_file(io.BytesIO(thumb_data), mimetype='image/jpeg')
+    except FileNotFoundError:
+        return jsonify({"error": "thumb_not_found_on_ftp"}), 404
+    except Exception as e:
+        return jsonify({"error": f"ftp_error: {str(e)}"}), 500
 
 
 @app.get("/api/faces")
@@ -818,6 +975,7 @@ def assign_face_person(face_id: int):
 # -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
+@app.get("/api/persons/<int:person_id>/faces")
 def get_person_faces(person_id: int):
     """Get face thumbnails for a specific person."""
     conn = get_conn()
@@ -859,6 +1017,32 @@ def merge_persons_endpoint(target_person_id: int):
     except Exception as e:
         conn.close()
         return jsonify({"error": str(e)}), 500
+
+
+# -----------------------------------------------------------------------------
+# GENERIC STORAGE ENDPOINT
+# -----------------------------------------------------------------------------
+@app.get("/api/storage/<path:file_path>")
+def get_storage_file(file_path: str):
+    """
+    Generic endpoint to serve any file from FTP storage.
+    This allows direct URL access to files stored on FTP server.
+    """
+    try:
+        file_data = FTP_CLIENT.download_file(file_path)
+        ext = Path(file_path).suffix.lower()
+        mimetype = {
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+            '.png': 'image/png', '.gif': 'image/gif',
+            '.webp': 'image/webp', '.bmp': 'image/bmp',
+            '.tif': 'image/tiff', '.tiff': 'image/tiff',
+        }.get(ext, 'application/octet-stream')
+        
+        return send_file(io.BytesIO(file_data), mimetype=mimetype)
+    except FileNotFoundError:
+        return jsonify({"error": "file_not_found"}), 404
+    except Exception as e:
+        return jsonify({"error": f"ftp_error: {str(e)}"}), 500
 
 
 # -----------------------------------------------------------------------------

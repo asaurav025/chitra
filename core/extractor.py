@@ -10,11 +10,18 @@ import imagehash
 import rawpy
 import numpy as np
 from PIL import Image
+# Register HEIC/HEIF support
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass  # pillow-heif not installed, HEIC support will be limited
 
 # Supported non-RAW formats
 IMG_EXTS = {
     ".jpg", ".jpeg", ".png", ".bmp",
     ".webp", ".tif", ".tiff", ".gif",
+    ".heic", ".heif",  # Apple HEIC/HEIF format
 }
 
 # Supported RAW formats
