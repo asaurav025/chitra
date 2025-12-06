@@ -5,6 +5,7 @@ import io
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 from flask import Flask, jsonify, request, send_file
@@ -85,6 +86,8 @@ def ensure_photo_thumb(file_path: str, photo_id: int) -> str:
     # Check if thumbnail exists on FTP
     if not FTP_CLIENT.file_exists(thumb_path):
         # Download original, generate thumb, upload
+        tmp_path = None
+        thumb_file_path = None
         try:
             file_data = FTP_CLIENT.download_file(file_path)
             with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
@@ -92,18 +95,34 @@ def ensure_photo_thumb(file_path: str, photo_id: int) -> str:
                 tmp_path = tmp.name
             
             # Generate thumbnail
-            ensure_thumb(tmp_path, str(Path(tmp_path).with_suffix('.jpg')))
+            thumb_file_path = str(Path(tmp_path).with_suffix('.jpg'))
+            try:
+                ensure_thumb(tmp_path, thumb_file_path)
+            except Exception as thumb_err:
+                raise Exception(f"Thumbnail generation failed: {str(thumb_err)}")
+            
+            # Check if thumbnail was actually created
+            if not os.path.exists(thumb_file_path):
+                raise Exception(f"Thumbnail generation failed: {thumb_file_path} was not created (ensure_thumb returned without error but file missing)")
             
             # Read thumbnail and upload
-            with open(str(Path(tmp_path).with_suffix('.jpg')), 'rb') as f:
+            with open(thumb_file_path, 'rb') as f:
                 thumb_data = f.read()
             FTP_CLIENT.upload_file(thumb_data, thumb_path)
-            
-            # Cleanup
-            os.unlink(tmp_path)
-            os.unlink(str(Path(tmp_path).with_suffix('.jpg')))
         except Exception as e:
             raise Exception(f"Failed to create thumbnail: {str(e)}")
+        finally:
+            # Cleanup - only delete files that exist
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+            if thumb_file_path and os.path.exists(thumb_file_path):
+                try:
+                    os.unlink(thumb_file_path)
+                except:
+                    pass
     return thumb_path
 
 
@@ -278,42 +297,52 @@ def upload_photos():
         files.append(request.files["file"])
     files.extend(request.files.getlist("files"))
 
-    saved = []
-    conn = get_conn()
-
+    # Read all file data upfront (file objects may not be thread-safe)
+    file_data_list = []
     for storage in files:
         filename = storage.filename
         if not filename:
             continue
-
-        # Read file data (no local storage - all files go to FTP)
         file_data = storage.read()
-        
-        # Upload to FTP storage
-        remote_path = FTP_CLIENT.generate_photo_path(filename)
-        
-        # Ensure uniqueness
-        counter = 1
-        base_path = remote_path
-        while FTP_CLIENT.file_exists(remote_path):
-            path_obj = Path(base_path)
-            ext = path_obj.suffix
-            name = path_obj.stem
-            remote_path = f"{path_obj.parent}/{name}_{counter}{ext}"
-            counter += 1
-        
-        # Upload to FTP
+        file_data_list.append((filename, file_data))
+    
+    if not file_data_list:
+        return jsonify({"error": "no_valid_files"}), 400
+
+    # Check auto_process setting
+    auto_process = request.args.get("auto_process", "true").lower() == "true"
+    
+    def upload_single_file(filename: str, file_data: bytes) -> Dict[str, Any]:
+        """
+        Upload a single file - runs in parallel with other uploads.
+        Each thread gets its own database connection.
+        """
+        conn = None
+        tmp_path = None
         try:
+            conn = get_conn()
+            
+            # Upload to FTP storage
+            remote_path = FTP_CLIENT.generate_photo_path(filename)
+            
+            # Ensure uniqueness
+            counter = 1
+            base_path = remote_path
+            while FTP_CLIENT.file_exists(remote_path):
+                path_obj = Path(base_path)
+                ext = path_obj.suffix
+                name = path_obj.stem
+                remote_path = f"{path_obj.parent}/{name}_{counter}{ext}"
+                counter += 1
+            
+            # Upload to FTP (connection pooling handles concurrency)
             stored_path = FTP_CLIENT.upload_file(file_data, remote_path)
-        except Exception as e:
-            return jsonify({"error": f"ftp_upload_failed: {str(e)}"}), 500
-        
-        # Process metadata using temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix) as tmp:
-            tmp.write(file_data)
-            tmp_path = tmp.name
-        
-        try:
+            
+            # Process metadata using temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix) as tmp:
+                tmp.write(file_data)
+                tmp_path = tmp.name
+            
             # Collect metadata
             meta = collect_metadata(Path(tmp_path))
             # Store FTP path
@@ -325,33 +354,100 @@ def upload_photos():
             cur.execute("SELECT id FROM photos WHERE file_path=?", (stored_path,))
             row = cur.fetchone()
             if not row:
-                continue
+                return {"error": f"Failed to get photo ID for {filename}"}
             photo_id = row["id"]
             
             # Generate thumbnail
             thumb_path = ensure_photo_thumb(stored_path, photo_id)
             
             # Auto-process: embeddings and faces (if enabled)
-            auto_process = request.args.get("auto_process", "true").lower() == "true"
+            # Note: These are CPU-intensive and still run sequentially per file
+            # Consider moving to background queue for further optimization
             if auto_process:
-                # Process embedding and auto-tags
-                process_photo_embedding(photo_id, stored_path, conn)
-                # Process faces
-                process_photo_faces(photo_id, stored_path, conn)
+                try:
+                    # Process embedding and auto-tags
+                    process_photo_embedding(photo_id, stored_path, conn)
+                except Exception as e:
+                    # Don't fail upload if processing fails
+                    print(f"Warning: Failed to process embedding for {filename}: {e}")
+                try:
+                    # Process faces
+                    process_photo_faces(photo_id, stored_path, conn)
+                except Exception as e:
+                    # Don't fail upload if processing fails
+                    print(f"Warning: Failed to process faces for {filename}: {e}")
             
-            saved.append({
+            return {
                 "id": photo_id,
                 "file_path": stored_path,
                 "storage_url": f"/api/storage/{stored_path}",
                 "thumbnail": thumb_path,
                 "thumbnail_url": f"/api/storage/{thumb_path}",
-            })
+            }
+        except Exception as e:
+            import traceback
+            error_msg = f"Upload failed for {filename}: {str(e)}"
+            print(f"Error in upload_single_file: {error_msg}")
+            print(traceback.format_exc())
+            return {"error": error_msg}
         finally:
             # Clean up temporary file
-            os.unlink(tmp_path)
-
-    conn.close()
-    return jsonify({"saved": saved})
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+            # Close database connection
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+    
+    # Upload files in parallel (max 5 concurrent uploads)
+    # This significantly speeds up multiple file uploads
+    saved = []
+    errors = []
+    
+    # For single file, process directly (no threading overhead)
+    if len(file_data_list) == 1:
+        filename, file_data = file_data_list[0]
+        try:
+            result = upload_single_file(filename, file_data)
+            if "error" in result:
+                return jsonify({"error": result["error"]}), 500
+            saved.append(result)
+        except Exception as e:
+            return jsonify({"error": f"Exception uploading {filename}: {str(e)}"}), 500
+    else:
+        # Multiple files: use parallel processing
+        max_workers = min(5, len(file_data_list))  # Max 5 concurrent uploads
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all upload tasks
+            future_to_file = {
+                executor.submit(upload_single_file, filename, file_data): filename
+                for filename, file_data in file_data_list
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_file):
+                filename = future_to_file[future]
+                try:
+                    result = future.result()
+                    if "error" in result:
+                        errors.append(result["error"])
+                    else:
+                        saved.append(result)
+                except Exception as e:
+                    errors.append(f"Exception uploading {filename}: {str(e)}")
+    
+    # Return results
+    response = {"saved": saved}
+    if errors:
+        response["errors"] = errors
+    
+    return jsonify(response)
 
 
 # -----------------------------------------------------------------------------
@@ -424,8 +520,6 @@ def add_photo_tags(photo_id: int):
 # -----------------------------------------------------------------------------
 # AUTO TAG + EMBEDDINGS
 # -----------------------------------------------------------------------------
-@app.post("/api/index/embeddings")
-
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS FOR AUTO-PROCESSING
 # -----------------------------------------------------------------------------
@@ -529,6 +623,7 @@ def process_photo_faces(photo_id: int, file_path: str, conn, min_score=0.5, thum
         print(f"Error processing faces for photo {photo_id}: {e}")
         return 0
 
+@app.post("/api/index/embeddings")
 def index_embeddings():
     data = request.get_json(force=True, silent=True) or {}
     incremental = bool(data.get("incremental", True))

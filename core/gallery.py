@@ -7,13 +7,23 @@ from core.extractor import load_image
 def ensure_thumb(src_path: str, thumb_path: str, size=(256, 256)):
     """
     Always create a JPG thumbnail even for RAW images.
+    Raises exception on failure instead of silently failing.
     """
     try:
         img = load_image(Path(src_path))
+        if img is None:
+            raise Exception(f"Failed to load image from {src_path}")
         img.thumbnail(size)
+        # Ensure parent directory exists
+        thumb_path_obj = Path(thumb_path)
+        thumb_path_obj.parent.mkdir(parents=True, exist_ok=True)
         img.save(thumb_path, "JPEG", quality=85)
+        # Verify file was created
+        if not Path(thumb_path).exists():
+            raise Exception(f"Thumbnail file was not created at {thumb_path}")
     except Exception as e:
-        print(f"[red]Thumbnail failed[/red] {src_path}: {e}")
+        # Re-raise with more context
+        raise Exception(f"Thumbnail generation failed for {src_path}: {str(e)}") from e
 
 
 def build_gallery(
