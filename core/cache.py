@@ -1,6 +1,6 @@
 """
 Local caching for frequently accessed thumbnails.
-Uses in-memory LRU cache to reduce FTP round-trips.
+Uses in-memory LRU cache to reduce storage round-trips.
 """
 from functools import lru_cache
 from typing import Optional
@@ -18,7 +18,7 @@ def get_cached_thumbnail(thumb_path: str) -> Optional[bytes]:
     Get thumbnail from cache if available and not expired.
     
     Args:
-        thumb_path: FTP path to thumbnail
+        thumb_path: storage path to thumbnail
         
     Returns:
         Thumbnail data bytes if cached and valid, None otherwise
@@ -42,7 +42,7 @@ def cache_thumbnail(thumb_path: str, thumb_data: bytes):
     Cache thumbnail data.
     
     Args:
-        thumb_path: FTP path to thumbnail
+        thumb_path: storage path to thumbnail
         thumb_data: Thumbnail image data bytes
     """
     # If cache is full, remove oldest entry

@@ -11,22 +11,22 @@ from core import db
 from core.embedder import ClipEmbedder
 from core.extractor import load_image
 from core.face import face_encodings
-from core.storage_client import MinIOStorageClient
+from core.ftp_client import FTPStorageClient
 from core.gallery import ensure_thumb
 from core.tagger import auto_tags
 
 
 # Global instances (will be initialized per worker)
-_STORAGE_CLIENT = None
+_FTP_CLIENT = None
 _EMBEDDER = None
 
 
-def _get_storage_client():
-    """Get or create MinIO storage client instance."""
-    global _STORAGE_CLIENT
-    if _STORAGE_CLIENT is None:
-        _STORAGE_CLIENT = MinIOStorageClient()
-    return _STORAGE_CLIENT
+def _get_ftp_client():
+    """Get or create FTP client instance."""
+    global _FTP_CLIENT
+    if _FTP_CLIENT is None:
+        _FTP_CLIENT = FTPStorageClient()
+    return _FTP_CLIENT
 
 
 def _get_embedder():
@@ -43,15 +43,15 @@ def process_photo_embedding_job(photo_id: int, file_path: str, db_path: str):
     
     Args:
         photo_id: Photo ID in database
-        file_path: MinIO object key to the photo file
+        file_path: FTP path to the photo file
         db_path: Path to SQLite database
     """
     conn = db.connect(db_path)
-    storage_client = _get_storage_client()
+    ftp_client = _get_ftp_client()
     
     try:
-        # Download from MinIO to temporary file
-        file_data = storage_client.download_file(file_path)
+        # Download from FTP to temporary file
+        file_data = ftp_client.download_file(file_path)
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
             tmp.write(file_data)
             tmp_path = tmp.name
@@ -83,17 +83,17 @@ def process_photo_faces_job(photo_id: int, file_path: str, db_path: str, min_sco
     
     Args:
         photo_id: Photo ID in database
-        file_path: MinIO object key to the photo file
+        file_path: FTP path to the photo file
         db_path: Path to SQLite database
         min_score: Minimum face detection score
         thumb_size: Thumbnail size
     """
     conn = db.connect(db_path)
-    storage_client = _get_storage_client()
+    ftp_client = _get_ftp_client()
     
     try:
-        # Download from MinIO to temporary file
-        file_data = storage_client.download_file(file_path)
+        # Download from FTP to temporary file
+        file_data = ftp_client.download_file(file_path)
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
             tmp.write(file_data)
             tmp_path = tmp.name
@@ -140,15 +140,15 @@ def process_photo_faces_job(photo_id: int, file_path: str, db_path: str, min_sco
                     crop = img.crop((x, y, x + w, y + h))
                     crop = crop.resize((thumb_size, thumb_size))
                     
-                    # Save to temporary file, then upload to MinIO
+                    # Save to temporary file, then upload to FTP
                     with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as thumb_tmp:
                         crop.save(thumb_tmp.name, "JPEG", quality=90)
                         with open(thumb_tmp.name, 'rb') as f:
                             thumb_data = f.read()
                     
-                    # Upload to MinIO
-                    face_thumb_path = storage_client.generate_thumbnail_path(face_id, "face")
-                    storage_client.upload_file(thumb_data, face_thumb_path)
+                    # Upload to FTP
+                    face_thumb_path = ftp_client.generate_thumbnail_path(face_id, "face")
+                    ftp_client.upload_file(thumb_data, face_thumb_path)
                     db.set_face_thumb(conn, face_id, face_thumb_path)
                     
                     # Cleanup
@@ -168,12 +168,12 @@ def process_photo_faces_job(photo_id: int, file_path: str, db_path: str, min_sco
 def _process_single_embedding(pid: int, file_path: str, db_path: str) -> bool:
     """Process embedding for a single photo (used in parallel processing)."""
     conn = db.connect(db_path)
-    storage_client = _get_storage_client()
+    ftp_client = _get_ftp_client()
     em = _get_embedder()
     
     try:
-        # Download from MinIO to temporary file
-        file_data = storage_client.download_file(file_path)
+        # Download from FTP to temporary file
+        file_data = ftp_client.download_file(file_path)
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
             tmp.write(file_data)
             tmp_path = tmp.name
@@ -231,11 +231,11 @@ def index_embeddings_batch_job(photo_ids_and_paths: list, db_path: str, incremen
 def _process_single_face(pid: int, file_path: str, db_path: str, min_score: float, thumb_size: int) -> bool:
     """Process faces for a single photo (used in parallel processing)."""
     conn = db.connect(db_path)
-    storage_client = _get_storage_client()
+    ftp_client = _get_ftp_client()
     
     try:
-        # Download from MinIO to temporary file
-        file_data = storage_client.download_file(file_path)
+        # Download from FTP to temporary file
+        file_data = ftp_client.download_file(file_path)
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
             tmp.write(file_data)
             tmp_path = tmp.name
@@ -281,15 +281,15 @@ def _process_single_face(pid: int, file_path: str, db_path: str, min_score: floa
                     crop = img.crop((x, y, x + w, y + h))
                     crop = crop.resize((thumb_size, thumb_size))
                     
-                    # Save to temporary file, then upload to MinIO
+                    # Save to temporary file, then upload to FTP
                     with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as thumb_tmp:
                         crop.save(thumb_tmp.name, "JPEG", quality=90)
                         with open(thumb_tmp.name, 'rb') as f:
                             thumb_data = f.read()
                     
-                    # Upload to MinIO
-                    face_thumb_path = storage_client.generate_thumbnail_path(face_id, "face")
-                    storage_client.upload_file(thumb_data, face_thumb_path)
+                    # Upload to FTP
+                    face_thumb_path = ftp_client.generate_thumbnail_path(face_id, "face")
+                    ftp_client.upload_file(thumb_data, face_thumb_path)
                     db.set_face_thumb(conn, face_id, face_thumb_path)
                     
                     # Cleanup
