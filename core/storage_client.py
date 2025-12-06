@@ -39,7 +39,9 @@ class MinIOStorageClient:
         self.bucket_name = os.environ.get("MINIO_BUCKET", "chitra-photos")
         
         # Debug output (can be removed in production)
-        if os.environ.get("DEBUG_MINIO", "false").lower() == "true":
+        # Always show config in worker context to help debug credential issues
+        debug_minio = os.environ.get("DEBUG_MINIO", "false").lower() == "true"
+        if debug_minio or os.environ.get("RQ_WORKER", "false").lower() == "true":
             print(f"MinIO Config: endpoint={self.endpoint}, secure={self.secure}, bucket={self.bucket_name}")
         
         # Initialize MinIO client
@@ -59,6 +61,17 @@ class MinIOStorageClient:
             if not self.client.bucket_exists(self.bucket_name):
                 self.client.make_bucket(self.bucket_name)
                 print(f"Created MinIO bucket: {self.bucket_name}")
+        except S3Error as e:
+            if e.code == "SignatureDoesNotMatch":
+                raise Exception(
+                    f"MinIO authentication failed. Check your credentials:\n"
+                    f"  Endpoint: {self.endpoint}\n"
+                    f"  Access Key: {self.access_key[:4]}... (from MINIO_ACCESS_KEY env var)\n"
+                    f"  Secret Key: {'*' * len(self.secret_key)} (from MINIO_SECRET_KEY env var)\n"
+                    f"  Secure: {self.secure}\n"
+                    f"Error: {e}"
+                )
+            raise Exception(f"Failed to create bucket '{self.bucket_name}': {e}")
         except Exception as e:
             raise Exception(f"Failed to create bucket '{self.bucket_name}': {e}")
     
