@@ -105,3 +105,5 @@ urllib3==2.5.0
 wcwidth==0.2.14
 Flask>=3.0.0
 pyftpdlib>=1.5.9
+rq>=1.15.0
+redis>=5.0.0

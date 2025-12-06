@@ -11,6 +11,7 @@ import os
 from datetime import datetime
 import threading
 import time
+from queue import Queue, Empty
 
 
 class FTPStorageClient:
@@ -35,75 +36,138 @@ class FTPStorageClient:
         base_path = os.environ.get("FTP_STORAGE_BASE", "")
         self.base_path = base_path.strip() if base_path else ""
         
-        # Connection management
-        self._ftp = None
-        self._lock = threading.Lock()  # Thread-safe connection management
-        self._last_used = None  # Track last connection use for timeout
+        # Connection pool management
+        self._pool_size = int(os.environ.get("FTP_POOL_SIZE", "5"))
+        self._connection_pool = Queue(maxsize=self._pool_size)
+        self._lock = threading.Lock()  # Thread-safe connection pool management
         self._connection_timeout = 300  # 5 minutes - disconnect idle connections
+        self._connection_created = {}  # Track when connections were created
+        self._pool_initialized = False
+    
+    def _create_connection(self) -> ftplib.FTP:
+        """Create a new FTP connection."""
+        ftp = ftplib.FTP()
+        ftp.connect(self.host, self.port, timeout=30)
+        ftp.login(self.user, self.password)
+        ftp.set_pasv(True)
+        return ftp
+    
+    def _initialize_pool(self):
+        """Initialize connection pool with connections."""
+        if self._pool_initialized:
+            return
+        
+        with self._lock:
+            if self._pool_initialized:
+                return
+            
+            # Create initial connections
+            for _ in range(min(2, self._pool_size)):  # Start with 2 connections
+                try:
+                    ftp = self._create_connection()
+                    conn_id = id(ftp)
+                    self._connection_pool.put(ftp)
+                    self._connection_created[conn_id] = time.time()
+                except Exception as e:
+                    print(f"Warning: Failed to create initial FTP connection: {e}")
+            
+            self._pool_initialized = True
+    
+    def _get_connection_from_pool(self) -> ftplib.FTP:
+        """
+        Get a connection from the pool, creating new ones if needed.
+        Returns a connection that should be returned to pool after use.
+        """
+        self._initialize_pool()
+        
+        # Try to get connection from pool
+        try:
+            ftp = self._connection_pool.get(timeout=5)
+            conn_id = id(ftp)
+            
+            # Check if connection has timed out
+            if conn_id in self._connection_created:
+                created_time = self._connection_created[conn_id]
+                if (time.time() - created_time) > self._connection_timeout:
+                    # Connection is too old, close it and create new one
+                    try:
+                        ftp.quit()
+                    except:
+                        try:
+                            ftp.close()
+                        except:
+                            pass
+                    del self._connection_created[conn_id]
+                    ftp = self._create_connection()
+                    conn_id = id(ftp)
+                    self._connection_created[conn_id] = time.time()
+            
+            return ftp
+        except Empty:
+            # Pool is empty, create new connection
+            ftp = self._create_connection()
+            conn_id = id(ftp)
+            self._connection_created[conn_id] = time.time()
+            return ftp
+    
+    def _return_connection_to_pool(self, ftp: ftplib.FTP):
+        """Return a connection to the pool."""
+        if ftp is None:
+            return
+        
+        conn_id = id(ftp)
+        try:
+            # Try to put back in pool (non-blocking)
+            self._connection_pool.put_nowait(ftp)
+        except:
+            # Pool is full or connection is bad, close it
+            try:
+                ftp.quit()
+            except:
+                try:
+                    ftp.close()
+                except:
+                    pass
+            if conn_id in self._connection_created:
+                del self._connection_created[conn_id]
     
     def _connect(self) -> ftplib.FTP:
         """
-        Get or create FTP connection with thread safety.
-        Reuses existing connection if still valid.
+        Get FTP connection from pool (for backward compatibility).
+        Note: This returns a connection that should NOT be returned to pool
+        (for methods that manage their own connection lifecycle).
         """
-        with self._lock:
-            # Check if we have a valid connection
-            if self._ftp is not None:
-                # Check if connection has timed out
-                if self._last_used and (time.time() - self._last_used) > self._connection_timeout:
-                    # Connection is too old, reconnect
+        return self._get_connection_from_pool()
+    
+    def _disconnect(self, ftp: ftplib.FTP = None):
+        """
+        Close FTP connection or return to pool.
+        If ftp is provided, returns it to pool. Otherwise closes current connection.
+        """
+        if ftp:
+            self._return_connection_to_pool(ftp)
+        else:
+            # Legacy behavior - close all connections in pool
+            with self._lock:
+                while not self._connection_pool.empty():
                     try:
-                        self._ftp.quit()
-                    except:
+                        ftp = self._connection_pool.get_nowait()
                         try:
-                            self._ftp.close()
+                            ftp.quit()
                         except:
-                            pass
-                    self._ftp = None
-                else:
-                    # Test connection with a simple command to ensure it's alive
-                    try:
-                        self._ftp.voidcmd("NOOP")
-                        # Connection is good
-                        self._last_used = time.time()
-                        return self._ftp
-                    except (ftplib.error_temp, ftplib.error_perm, OSError, AttributeError, EOFError):
-                        # Connection is dead, need to reconnect
-                        self._ftp = None
-            
-            # Create new connection
-            try:
-                self._ftp = ftplib.FTP()
-                self._ftp.connect(self.host, self.port, timeout=30)
-                self._ftp.login(self.user, self.password)
-                # Set to passive mode for better compatibility
-                self._ftp.set_pasv(True)
-                self._last_used = time.time()
-                return self._ftp
-            except Exception as e:
-                # If connection fails, clear it
-                self._ftp = None
-                self._last_used = None
-                raise
-    
-    def _disconnect(self):
-        """Close FTP connection (thread-safe)"""
-        with self._lock:
-            if self._ftp:
-                try:
-                    self._ftp.quit()
-                except:
-                    try:
-                        self._ftp.close()
+                            try:
+                                ftp.close()
+                            except:
+                                pass
+                        conn_id = id(ftp)
+                        if conn_id in self._connection_created:
+                            del self._connection_created[conn_id]
                     except:
-                        pass
-                self._ftp = None
-                self._last_used = None
+                        break
+                self._pool_initialized = False
     
-    def _ensure_directory(self, remote_path: str):
+    def _ensure_directory(self, remote_path: str, ftp: ftplib.FTP = None):
         """Ensure directory structure exists on FTP server"""
-        ftp = self._connect()
-        
         # Start from root/home directory
         try:
             ftp.cwd("/")
@@ -146,13 +210,13 @@ class FTPStorageClient:
         remote_path: Path relative to FTP base (e.g., 'photos/2024/12/image.jpg')
         Returns: Relative path for storage in database
         
-        Note: Connection is kept alive after upload for reuse.
+        Note: Connection is returned to pool after upload.
         """
-        ftp = self._connect()
+        ftp = self._get_connection_from_pool()
         
-        # Try to ensure directory exists
+        # Try to ensure directory exists (using the same connection)
         try:
-            self._ensure_directory(remote_path)
+            self._ensure_directory(remote_path, ftp)
         except Exception as e:
             # If directory creation fails, provide helpful error
             error_msg = str(e)
@@ -197,16 +261,21 @@ class FTPStorageClient:
         try:
             # Use just the filename since we're already in the correct directory
             ftp.storbinary(f'STOR {filename}', file_obj, blocksize=8192*4)  # 32KB chunks for better performance
-            # Update last used time
-            with self._lock:
-                if self._last_used:
-                    self._last_used = time.time()
-        except (ftplib.error_temp, OSError, AttributeError) as e:
-            # Temporary errors - connection might be dead, disconnect and let next operation reconnect
-            self._disconnect()
+        except (ftplib.error_temp, OSError, AttributeError, EOFError) as e:
+            # Temporary errors - connection might be dead, close it
+            try:
+                ftp.quit()
+            except:
+                try:
+                    ftp.close()
+                except:
+                    pass
+            conn_id = id(ftp)
+            if conn_id in self._connection_created:
+                del self._connection_created[conn_id]
             raise Exception(f"FTP upload failed (connection error): {str(e)}")
         except ftplib.error_perm as e:
-            # Only disconnect on permission errors (likely permanent)
+            # Permission error - connection is likely still valid, return to pool
             error_str = str(e)
             if "550" in error_str:
                 raise Exception(
@@ -219,24 +288,108 @@ class FTPStorageClient:
                     f"Original error: {error_str}"
                 )
             raise Exception(f"FTP upload failed: {error_str}")
-        except (ftplib.error_temp, OSError) as e:
-            # Temporary errors - disconnect and let next operation reconnect
-            self._disconnect()
-            raise Exception(f"FTP upload failed (temporary error): {str(e)}")
         except Exception as e:
-            # Other errors - disconnect to be safe
-            self._disconnect()
+            # Other errors - close connection
+            try:
+                ftp.quit()
+            except:
+                try:
+                    ftp.close()
+                except:
+                    pass
+            conn_id = id(ftp)
+            if conn_id in self._connection_created:
+                del self._connection_created[conn_id]
             raise Exception(f"FTP upload failed: {str(e)}")
+        finally:
+            # Return connection to pool if not already closed
+            conn_id = id(ftp)
+            if conn_id in self._connection_created:
+                self._return_connection_to_pool(ftp)
         
-        # Connection is kept alive for reuse - don't disconnect!
         return remote_path  # Return relative path for database
+    
+    def download_file_streaming(self, remote_path: str, chunk_size: int = 8192*4):
+        """
+        Download file from FTP server as a generator (streaming).
+        Useful for large files to reduce memory usage.
+        
+        Note: This keeps the connection open until all chunks are consumed.
+        The connection is returned to pool after the generator is exhausted.
+        
+        Args:
+            remote_path: Path stored in database (relative to base)
+            chunk_size: Size of chunks to yield
+            
+        Yields:
+            bytes: Chunks of file data
+        """
+        ftp = self._get_connection_from_pool()
+        
+        # Construct full path
+        if self.base_path:
+            full_path = f"{self.base_path}/{remote_path}"
+        else:
+            full_path = remote_path
+        
+        chunks = []
+        error_occurred = None
+        
+        def collect_chunk(chunk):
+            chunks.append(chunk)
+        
+        try:
+            ftp.retrbinary(f'RETR {full_path}', collect_chunk, blocksize=chunk_size)
+        except (ftplib.error_temp, OSError, EOFError, AttributeError) as e:
+            # Connection errors - close connection
+            error_occurred = Exception(f"FTP download failed (connection error): {str(e)}")
+            try:
+                ftp.quit()
+            except:
+                try:
+                    ftp.close()
+                except:
+                    pass
+            conn_id = id(ftp)
+            if conn_id in self._connection_created:
+                del self._connection_created[conn_id]
+        except ftplib.error_perm as e:
+            # Permission error - return connection to pool (might be valid)
+            error_occurred = FileNotFoundError(f"File not found on FTP: {remote_path}")
+            self._return_connection_to_pool(ftp)
+        except Exception as e:
+            # Other error - close connection
+            error_occurred = Exception(f"FTP download failed: {str(e)}")
+            try:
+                ftp.quit()
+            except:
+                try:
+                    ftp.close()
+                except:
+                    pass
+            conn_id = id(ftp)
+            if conn_id in self._connection_created:
+                del self._connection_created[conn_id]
+        finally:
+            # Return connection to pool if not already closed
+            if error_occurred is None:
+                conn_id = id(ftp)
+                if conn_id in self._connection_created:
+                    self._return_connection_to_pool(ftp)
+        
+        if error_occurred:
+            raise error_occurred
+        
+        # Yield chunks as they were collected
+        for chunk in chunks:
+            yield chunk
     
     def download_file(self, remote_path: str) -> bytes:
         """
         Download file from FTP server.
         remote_path: Path stored in database (relative to base)
         """
-        ftp = self._connect()
+        ftp = self._get_connection_from_pool()
         
         # Construct full path for RETR command
         if self.base_path:
@@ -247,58 +400,80 @@ class FTPStorageClient:
         file_obj = io.BytesIO()
         try:
             ftp.retrbinary(f'RETR {full_path}', file_obj.write, blocksize=8192*4)  # 32KB chunks
-            # Update last used time
-            with self._lock:
-                self._last_used = time.time()
         except (ftplib.error_temp, OSError, EOFError, AttributeError) as e:
-            # Connection errors - disconnect and let next operation reconnect
-            self._disconnect()
+            # Connection errors - close connection
+            try:
+                ftp.quit()
+            except:
+                try:
+                    ftp.close()
+                except:
+                    pass
+            conn_id = id(ftp)
+            if conn_id in self._connection_created:
+                del self._connection_created[conn_id]
             raise Exception(f"FTP download failed (connection error): {str(e)}") from e
         except ftplib.error_perm as e:
-            # Permission error - disconnect
-            self._disconnect()
+            # Permission error - return connection to pool (might be valid)
+            self._return_connection_to_pool(ftp)
             raise FileNotFoundError(f"File not found on FTP: {remote_path}") from e
         except Exception as e:
-            # Other error - disconnect
-            self._disconnect()
+            # Other error - close connection
+            try:
+                ftp.quit()
+            except:
+                try:
+                    ftp.close()
+                except:
+                    pass
+            conn_id = id(ftp)
+            if conn_id in self._connection_created:
+                del self._connection_created[conn_id]
             raise Exception(f"FTP download failed: {str(e)}") from e
+        finally:
+            # Return connection to pool if not already closed
+            conn_id = id(ftp)
+            if conn_id in self._connection_created:
+                self._return_connection_to_pool(ftp)
         
         file_obj.seek(0)
         return file_obj.read()
     
     def file_exists(self, remote_path: str) -> bool:
         """Check if file exists on FTP server"""
+        ftp = None
         try:
-            ftp = self._connect()
+            ftp = self._get_connection_from_pool()
             # Construct full path
             if self.base_path:
                 full_path = f"{self.base_path}/{remote_path}"
             else:
                 full_path = remote_path
             ftp.size(full_path)
-            # Update last used time
-            with self._lock:
-                self._last_used = time.time()
             return True
         except:
             return False
+        finally:
+            if ftp:
+                self._return_connection_to_pool(ftp)
     
     def delete_file(self, remote_path: str) -> bool:
         """Delete file from FTP server"""
+        ftp = None
         try:
-            ftp = self._connect()
+            ftp = self._get_connection_from_pool()
             # Construct full path
             if self.base_path:
                 full_path = f"{self.base_path}/{remote_path}"
             else:
                 full_path = remote_path
             ftp.delete(full_path)
-            # Update last used time
-            with self._lock:
-                self._last_used = time.time()
             return True
         except:
             return False
+        finally:
+            if ftp:
+                self._return_connection_to_pool(ftp)
     
     def generate_photo_path(self, filename: str, photo_id: int = None) -> str:
         """

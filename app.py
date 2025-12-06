@@ -25,6 +25,16 @@ from core.embedder import ClipEmbedder
 from core.gallery import ensure_thumb
 from core.face import face_encodings
 from core.tagger import auto_tags
+from core.worker import get_queue
+from core.jobs import (
+    process_photo_embedding_job,
+    process_photo_faces_job,
+    index_embeddings_batch_job,
+    index_faces_batch_job,
+)
+from core.cache import get_cached_thumbnail, cache_thumbnail
+from rq import Queue
+from rq.job import Job
 import tempfile
 
 
@@ -241,7 +251,10 @@ def get_photo_image(photo_id: int):
             img_io = io.BytesIO()
             img.save(img_io, format='JPEG', quality=95)
             img_io.seek(0)
-            return send_file(img_io, mimetype='image/jpeg')
+            response = send_file(img_io, mimetype='image/jpeg')
+            response.cache_control.public = True
+            response.cache_control.max_age = 86400  # 24 hours
+            return response
         except Exception as e:
             return jsonify({"error": f"failed_to_convert: {str(e)}"}), 500
         finally:
@@ -255,33 +268,65 @@ def get_photo_image(photo_id: int):
         '.webp': 'image/webp',
     }.get(ext, 'application/octet-stream')
     
-    return send_file(io.BytesIO(file_data), mimetype=mimetype)
+    response = send_file(io.BytesIO(file_data), mimetype=mimetype)
+    response.cache_control.public = True
+    response.cache_control.max_age = 86400  # 24 hours
+    return response
 
 
 @app.get("/api/photos/<int:photo_id>/thumbnail")
 def get_photo_thumbnail(photo_id: int):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT file_path FROM photos WHERE id=?", (photo_id,))
+    cur.execute("SELECT file_path, thumb_path FROM photos WHERE id=?", (photo_id,))
     row = cur.fetchone()
-    conn.close()
-
+    
     if not row:
+        conn.close()
         return jsonify({"error": "photo_not_found"}), 404
 
     file_path = row["file_path"]
+    thumb_path = row["thumb_path"]
     
-    # Ensure thumbnail exists and get path
-    thumb_path = ensure_photo_thumb(file_path, photo_id)
+    # If thumb_path not in DB, generate it and store
+    if not thumb_path:
+        conn.close()
+        thumb_path = ensure_photo_thumb(file_path, photo_id)
+        # Re-open connection to update
+        conn = get_conn()
+        conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
+        conn.commit()
+        conn.close()
+    else:
+        conn.close()
+        # Check if thumbnail exists on FTP (only if we have path in DB)
+        if not FTP_CLIENT.file_exists(thumb_path):
+            # Thumbnail was deleted or doesn't exist, regenerate
+            thumb_path = ensure_photo_thumb(file_path, photo_id)
+            conn = get_conn()
+            conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
+            conn.commit()
+            conn.close()
     
-    # Download from FTP
-    try:
-        thumb_data = FTP_CLIENT.download_file(thumb_path)
-        return send_file(io.BytesIO(thumb_data), mimetype='image/jpeg')
-    except FileNotFoundError:
-        return jsonify({"error": "thumbnail_not_found_on_ftp"}), 404
-    except Exception as e:
-        return jsonify({"error": f"ftp_error: {str(e)}"}), 500
+    # Check cache first
+    thumb_data = get_cached_thumbnail(thumb_path)
+    
+    if thumb_data is None:
+        # Download from FTP
+        try:
+            thumb_data = FTP_CLIENT.download_file(thumb_path)
+            # Cache for future requests
+            cache_thumbnail(thumb_path, thumb_data)
+        except FileNotFoundError:
+            return jsonify({"error": "thumbnail_not_found_on_ftp"}), 404
+        except Exception as e:
+            return jsonify({"error": f"ftp_error: {str(e)}"}), 500
+    
+    response = send_file(io.BytesIO(thumb_data), mimetype='image/jpeg')
+    # Add HTTP caching headers
+    response.cache_control.public = True
+    response.cache_control.max_age = 86400  # 24 hours
+    return response
 
 
 # -----------------------------------------------------------------------------
@@ -325,10 +370,17 @@ def upload_photos():
             # Upload to FTP storage
             remote_path = FTP_CLIENT.generate_photo_path(filename)
             
-            # Ensure uniqueness
+            # Ensure uniqueness - check database first (much faster than FTP)
             counter = 1
             base_path = remote_path
-            while FTP_CLIENT.file_exists(remote_path):
+            cur = conn.cursor()
+            while True:
+                cur.execute("SELECT id FROM photos WHERE file_path=?", (remote_path,))
+                if cur.fetchone() is None:
+                    # Not in database, check FTP only if needed (for safety)
+                    if not FTP_CLIENT.file_exists(remote_path):
+                        break
+                # Path exists, generate new one
                 path_obj = Path(base_path)
                 ext = path_obj.suffix
                 name = path_obj.stem
@@ -360,22 +412,34 @@ def upload_photos():
             # Generate thumbnail
             thumb_path = ensure_photo_thumb(stored_path, photo_id)
             
+            # Store thumb_path in database
+            conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
+            conn.commit()
+            
             # Auto-process: embeddings and faces (if enabled)
-            # Note: These are CPU-intensive and still run sequentially per file
-            # Consider moving to background queue for further optimization
+            # Queue background jobs instead of processing synchronously
             if auto_process:
                 try:
-                    # Process embedding and auto-tags
-                    process_photo_embedding(photo_id, stored_path, conn)
+                    queue = get_queue()
+                    # Queue embedding processing job
+                    queue.enqueue(
+                        process_photo_embedding_job,
+                        photo_id,
+                        stored_path,
+                        DB_PATH,
+                        job_timeout='10m'  # 10 minute timeout
+                    )
+                    # Queue face processing job
+                    queue.enqueue(
+                        process_photo_faces_job,
+                        photo_id,
+                        stored_path,
+                        DB_PATH,
+                        job_timeout='10m'  # 10 minute timeout
+                    )
                 except Exception as e:
-                    # Don't fail upload if processing fails
-                    print(f"Warning: Failed to process embedding for {filename}: {e}")
-                try:
-                    # Process faces
-                    process_photo_faces(photo_id, stored_path, conn)
-                except Exception as e:
-                    # Don't fail upload if processing fails
-                    print(f"Warning: Failed to process faces for {filename}: {e}")
+                    # Don't fail upload if job queuing fails
+                    print(f"Warning: Failed to queue processing jobs for {filename}: {e}")
             
             return {
                 "id": photo_id,
@@ -646,39 +710,57 @@ def index_embeddings():
         cur.execute("SELECT id, file_path FROM photos ORDER BY id ASC")
 
     rows = cur.fetchall()
-    if not rows:
-        conn.close()
-        return jsonify({"indexed": 0})
-
-    indexed = 0
-
-    for r in rows:
-        pid = r["id"]
-        file_path = r["file_path"]
-        try:
-            # Download from FTP to temporary file
-            file_data = FTP_CLIENT.download_file(file_path)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
-                tmp.write(file_data)
-                tmp_path = tmp.name
-            try:
-                img_vec = em.image_embedding(tmp_path)
-                vec_bytes = img_vec.tobytes()
-                dim = img_vec.shape[0]
-                db.put_embedding(conn, pid, vec_bytes, dim)
-                
-                # auto tags
-                atags = auto_tags(em, tmp_path, k=6)
-                for tag, score in atags:
-                    db.add_tag(conn, pid, tag, float(score))
-                indexed += 1
-            finally:
-                os.unlink(tmp_path)
-        except Exception:
-            continue
-
     conn.close()
-    return jsonify({"indexed": indexed})
+    
+    if not rows:
+        return jsonify({"indexed": 0, "job_id": None, "message": "No photos to process"})
+
+    # Prepare photo list for batch job
+    photo_ids_and_paths = [(r["id"], r["file_path"]) for r in rows]
+    
+    # Queue background job
+    try:
+        queue = get_queue()
+        job = queue.enqueue(
+            index_embeddings_batch_job,
+            photo_ids_and_paths,
+            DB_PATH,
+            incremental,
+            job_timeout='1h'  # 1 hour timeout for batch processing
+        )
+        return jsonify({
+            "indexed": 0,  # Will be updated when job completes
+            "job_id": job.id,
+            "message": f"Queued {len(photo_ids_and_paths)} photos for processing",
+            "status": "queued"
+        })
+    except Exception as e:
+        return jsonify({"error": f"Failed to queue job: {str(e)}"}), 500
+
+
+@app.get("/api/jobs/<job_id>")
+def get_job_status(job_id: str):
+    """Get status of a background job."""
+    try:
+        queue = get_queue()
+        job = Job.fetch(job_id, connection=queue.connection)
+        
+        status_info = {
+            "job_id": job.id,
+            "status": job.get_status(),
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "ended_at": job.ended_at.isoformat() if job.ended_at else None,
+        }
+        
+        if job.is_finished:
+            status_info["result"] = job.result
+        elif job.is_failed:
+            status_info["error"] = str(job.exc_info) if job.exc_info else "Job failed"
+        
+        return jsonify(status_info)
+    except Exception as e:
+        return jsonify({"error": f"Job not found: {str(e)}"}), 404
 
 
 # -----------------------------------------------------------------------------
@@ -754,85 +836,35 @@ def index_faces():
     cur = conn.cursor()
     cur.execute("SELECT id, file_path FROM photos ORDER BY id ASC")
     rows = cur.fetchall()
-
-    processed = 0
-    for r in rows:
-        pid = r["id"]
-        file_path = r["file_path"]
-
-        # Download from FTP to temporary file
-        try:
-            file_data = FTP_CLIENT.download_file(file_path)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
-                tmp.write(file_data)
-                tmp_path = tmp.name
-        except Exception:
-            continue
-        
-        try:
-            faces = face_encodings(tmp_path)
-            if not faces:
-                continue
-            
-            img = load_image(Path(tmp_path))
-            
-            for idx_face, f in enumerate(faces):
-                if f.get("score", 1.0) < min_score:
-                    continue
-                
-                bbox = f["bbox"]
-                x, y, w, h = bbox
-                emb = f["embedding"]
-                emb_bytes = emb.astype("float32").tobytes()
-                
-                db.add_face(
-                    conn,
-                    photo_id=pid,
-                    face_index=idx_face,
-                    embedding_bytes=emb_bytes,
-                    bbox_x=float(x),
-                    bbox_y=float(y),
-                    bbox_w=float(w),
-                    bbox_h=float(h),
-                )
-                
-                # Get face_id
-                cur2 = conn.cursor()
-                cur2.execute(
-                    "SELECT id FROM faces WHERE photo_id=? AND face_index=?",
-                    (pid, idx_face),
-                )
-                row = cur2.fetchone()
-                if not row:
-                    continue
-                face_id = row["id"]
-                
-                # Generate thumbnail
-                crop = img.crop((x, y, x + w, y + h))
-                crop = crop.resize((thumb_size, thumb_size))
-                
-                # Save to temporary file, then upload to FTP
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as thumb_tmp:
-                    crop.save(thumb_tmp.name, "JPEG", quality=90)
-                    with open(thumb_tmp.name, 'rb') as f:
-                        thumb_data = f.read()
-                
-                # Upload to FTP
-                face_thumb_path = FTP_CLIENT.generate_thumbnail_path(face_id, "face")
-                FTP_CLIENT.upload_file(thumb_data, face_thumb_path)
-                db.set_face_thumb(conn, face_id, face_thumb_path)
-                
-                # Cleanup
-                os.unlink(thumb_tmp.name)
-        finally:
-            os.unlink(tmp_path)
-
-        processed += 1
-        if limit is not None and processed >= int(limit):
-            break
-
     conn.close()
-    return jsonify({"processed_photos": processed})
+    
+    if not rows:
+        return jsonify({"processed_photos": 0, "job_id": None, "message": "No photos to process"})
+    
+    # Apply limit if specified
+    photo_ids_and_paths = [(r["id"], r["file_path"]) for r in rows]
+    if limit is not None:
+        photo_ids_and_paths = photo_ids_and_paths[:int(limit)]
+    
+    # Queue background job
+    try:
+        queue = get_queue()
+        job = queue.enqueue(
+            index_faces_batch_job,
+            photo_ids_and_paths,
+            DB_PATH,
+            min_score,
+            thumb_size,
+            job_timeout='1h'  # 1 hour timeout for batch processing
+        )
+        return jsonify({
+            "processed_photos": 0,  # Will be updated when job completes
+            "job_id": job.id,
+            "message": f"Queued {len(photo_ids_and_paths)} photos for face processing",
+            "status": "queued"
+        })
+    except Exception as e:
+        return jsonify({"error": f"Failed to queue job: {str(e)}"}), 500
 
 
 @app.post("/api/index/faces-cluster")
@@ -950,14 +982,24 @@ def get_face_thumbnail(face_id: int):
 
     thumb_path = row["thumb_path"]
     
-    # Download from FTP
-    try:
-        thumb_data = FTP_CLIENT.download_file(thumb_path)
-        return send_file(io.BytesIO(thumb_data), mimetype='image/jpeg')
-    except FileNotFoundError:
-        return jsonify({"error": "thumb_not_found_on_ftp"}), 404
-    except Exception as e:
-        return jsonify({"error": f"ftp_error: {str(e)}"}), 500
+    # Check cache first
+    thumb_data = get_cached_thumbnail(thumb_path)
+    
+    if thumb_data is None:
+        # Download from FTP
+        try:
+            thumb_data = FTP_CLIENT.download_file(thumb_path)
+            # Cache for future requests
+            cache_thumbnail(thumb_path, thumb_data)
+        except FileNotFoundError:
+            return jsonify({"error": "thumb_not_found_on_ftp"}), 404
+        except Exception as e:
+            return jsonify({"error": f"ftp_error: {str(e)}"}), 500
+    
+    response = send_file(io.BytesIO(thumb_data), mimetype='image/jpeg')
+    response.cache_control.public = True
+    response.cache_control.max_age = 86400  # 24 hours
+    return response
 
 
 @app.get("/api/faces")

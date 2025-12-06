@@ -11,8 +11,27 @@ DB_DEFAULT_PATH = "photo.db"
 # CONNECTION + INIT
 # ----------------------------------------------------------------------
 def connect(db_path: str = DB_DEFAULT_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    """
+    Create SQLite connection with optimizations for concurrent access.
+    Uses WAL mode for better read concurrency.
+    """
+    conn = sqlite3.connect(db_path, timeout=30.0)  # 30 second timeout for busy connections
     conn.row_factory = sqlite3.Row
+    
+    # Enable WAL mode for better concurrency (allows concurrent reads)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except:
+        pass  # Ignore if WAL mode not supported
+    
+    # Optimize for performance
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL")  # Faster than FULL, still safe
+        conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        conn.execute("PRAGMA temp_store=MEMORY")  # Use memory for temp tables
+    except:
+        pass
+    
     return conn
 
 
@@ -33,7 +52,8 @@ def init_db(db_path: str = DB_DEFAULT_PATH):
             phash TEXT,
             exif_datetime TEXT,
             latitude REAL,
-            longitude REAL
+            longitude REAL,
+            thumb_path TEXT
         )
         """
     )
@@ -127,6 +147,13 @@ def init_db(db_path: str = DB_DEFAULT_PATH):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)")
 
+    # Migration: Add thumb_path column if it doesn't exist
+    try:
+        cur.execute("ALTER TABLE photos ADD COLUMN thumb_path TEXT")
+    except sqlite3.OperationalError:
+        # Column already exists, ignore
+        pass
+
     conn.commit()
     conn.close()
 
@@ -137,12 +164,12 @@ def init_db(db_path: str = DB_DEFAULT_PATH):
 def upsert_photo(conn: sqlite3.Connection, **meta: Any):
     """
     Insert or update a photo row.
-    Expected keys: file_path, size, created_at, checksum, phash, exif_datetime, latitude, longitude
+    Expected keys: file_path, size, created_at, checksum, phash, exif_datetime, latitude, longitude, thumb_path
     """
     conn.execute(
         """
-        INSERT INTO photos (file_path, size, created_at, checksum, phash, exif_datetime, latitude, longitude)
-        VALUES (:file_path, :size, :created_at, :checksum, :phash, :exif_datetime, :latitude, :longitude)
+        INSERT INTO photos (file_path, size, created_at, checksum, phash, exif_datetime, latitude, longitude, thumb_path)
+        VALUES (:file_path, :size, :created_at, :checksum, :phash, :exif_datetime, :latitude, :longitude, :thumb_path)
         ON CONFLICT(file_path) DO UPDATE SET
             size=excluded.size,
             created_at=excluded.created_at,
@@ -150,7 +177,8 @@ def upsert_photo(conn: sqlite3.Connection, **meta: Any):
             phash=excluded.phash,
             exif_datetime=excluded.exif_datetime,
             latitude=excluded.latitude,
-            longitude=excluded.longitude
+            longitude=excluded.longitude,
+            thumb_path=COALESCE(excluded.thumb_path, photos.thumb_path)
         """,
         meta,
     )
