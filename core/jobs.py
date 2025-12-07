@@ -7,6 +7,8 @@ import tempfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
+
 from core import db
 from core.embedder import ClipEmbedder
 from core.extractor import load_image
@@ -19,6 +21,89 @@ from core.tagger import auto_tags
 # Global instances (will be initialized per worker)
 _STORAGE_CLIENT = None
 _EMBEDDER = None
+
+
+def _auto_match_face_to_person(conn, face_id: int, face_embedding: np.ndarray, threshold: float = 0.75):
+    """
+    Automatically match a newly detected face to an existing person.
+    
+    Args:
+        conn: Database connection
+        face_id: ID of the face to match
+        face_embedding: Face embedding vector (numpy array)
+        threshold: Similarity threshold for matching (default 0.75)
+    """
+    try:
+        import faiss
+    except ImportError:
+        # FAISS not available, skip matching
+        return
+    
+    # Get all existing person faces with embeddings
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT f.id, f.embedding, f.person_id, p.name as person_name
+        FROM faces f
+        JOIN persons p ON f.person_id = p.id
+        WHERE f.embedding IS NOT NULL AND f.id != ?
+    """, (face_id,))
+    
+    existing_faces = cur.fetchall()
+    
+    if not existing_faces:
+        # No existing faces to match against
+        return
+    
+    # Build vectors for comparison
+    existing_vecs = []
+    existing_face_ids = []
+    existing_person_map = {}  # face_id -> (person_id, person_name)
+    
+    for row in existing_faces:
+        emb_bytes = row[1]  # embedding column
+        if not emb_bytes:
+            continue
+        v = np.frombuffer(emb_bytes, dtype=np.float32)
+        if v.size == 0:
+            continue
+        
+        existing_vecs.append(v)
+        existing_face_ids.append(row[0])  # face id
+        existing_person_map[row[0]] = (row[2], row[3])  # (person_id, person_name)
+    
+    if not existing_vecs:
+        return
+    
+    # Normalize and compare
+    face_vec = face_embedding.astype("float32")
+    existing_xb = np.stack(existing_vecs).astype("float32")
+    
+    # Normalize for cosine similarity
+    faiss.normalize_L2(face_vec.reshape(1, -1))
+    faiss.normalize_L2(existing_xb)
+    
+    # Build index and search
+    try:
+        index = faiss.IndexFlatIP(existing_xb.shape[1])
+        index.add(existing_xb)
+        
+        # Search for best match
+        distances, indices = index.search(face_vec.reshape(1, -1), 1)
+        
+        if distances[0, 0] >= threshold:
+            # Match found! Assign to existing person
+            matched_face_idx = indices[0, 0]
+            matched_face_id = existing_face_ids[matched_face_idx]
+            person_id, person_name = existing_person_map[matched_face_id]
+            
+            # Assign face to person
+            cur.execute("UPDATE faces SET person_id=? WHERE id=?", (person_id, face_id))
+            conn.commit()
+            
+            print(f"Auto-matched face {face_id} to existing person '{person_name}' (similarity: {distances[0, 0]:.3f})")
+    except Exception as e:
+        # If FAISS fails, skip matching
+        print(f"Warning: Face matching failed: {e}")
 
 
 def _get_storage_client():
@@ -150,6 +235,13 @@ def process_photo_faces_job(photo_id: int, file_path: str, db_path: str, min_sco
                     face_thumb_path = storage_client.generate_thumbnail_path(face_id, "face")
                     storage_client.upload_file(thumb_data, face_thumb_path)
                     db.set_face_thumb(conn, face_id, face_thumb_path)
+                    
+                    # Auto-match face to existing persons
+                    try:
+                        _auto_match_face_to_person(conn, face_id, emb, threshold=0.75)
+                    except Exception as e:
+                        # Don't fail face processing if matching fails
+                        print(f"Warning: Auto-matching face {face_id} failed: {e}")
                     
                     # Cleanup
                     os.unlink(thumb_tmp.name)
@@ -291,6 +383,13 @@ def _process_single_face(pid: int, file_path: str, db_path: str, min_score: floa
                     face_thumb_path = storage_client.generate_thumbnail_path(face_id, "face")
                     storage_client.upload_file(thumb_data, face_thumb_path)
                     db.set_face_thumb(conn, face_id, face_thumb_path)
+                    
+                    # Auto-match face to existing persons
+                    try:
+                        _auto_match_face_to_person(conn, face_id, emb, threshold=0.75)
+                    except Exception as e:
+                        # Don't fail face processing if matching fails
+                        print(f"Warning: Auto-matching face {face_id} failed: {e}")
                     
                     # Cleanup
                     os.unlink(thumb_tmp.name)

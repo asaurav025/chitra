@@ -28,7 +28,7 @@ from core.schemas import (
     IndexFacesRequest, ClusterFacesRequest, CreatePersonRequest,
     UpdatePersonRequest, AssignFacePersonRequest, MergePersonsRequest,
     PhotoResponse, PhotoListResponse, TagListResponse, TagResponse,
-    FaceListResponse, PersonListResponse, PersonResponse,
+    FaceResponse, FaceListResponse, PersonListResponse, PersonResponse,
     JobStatusResponse, SearchResultsResponse, ScanPathResponse,
     UploadPhotosResponse, HealthResponse, RootResponse, StatusResponse,
     ClusterFacesResponse, IndexJobResponse, FaceIndexJobResponse,
@@ -41,6 +41,7 @@ from core.tagger import auto_tags
 from core.gallery import ensure_thumb
 from core.cache import get_cached_thumbnail, cache_thumbnail
 from core.worker import get_queue
+from core.faiss_index import FAISSIndexManager
 from core.jobs import (
     process_photo_embedding_job,
     process_photo_faces_job,
@@ -175,14 +176,21 @@ async def health_check() -> HealthResponse:
     try:
         storage = get_storage_client()
         # Try to list buckets (lightweight operation)
-        storage.client.list_buckets()
-        health_info["storage_status"] = "ok"
-        health_info["storage_endpoint"] = storage.endpoint
-        health_info["storage_bucket"] = storage.bucket_name
+        try:
+            storage.client.list_buckets()
+            health_info["storage_status"] = "ok"
+            health_info["storage_endpoint"] = storage.endpoint
+            health_info["storage_bucket"] = storage.bucket_name
+        except Exception as e:
+            # Storage client exists but connection failed
+            health_info["storage_status"] = f"unavailable: {str(e)[:100]}"
+            health_info["status"] = "degraded"
+            health_info["storage_endpoint"] = getattr(storage, 'endpoint', 'unknown')
+            health_info["storage_bucket"] = getattr(storage, 'bucket_name', 'unknown')
     except Exception as e:
-        health_info["storage_status"] = f"unavailable: {str(e)[:100]}"
+        # Storage client creation failed
+        health_info["storage_status"] = f"error: {str(e)[:100]}"
         health_info["status"] = "degraded"
-        health_info["storage_note"] = "MinIO server not running or unreachable"
     
     # Return 200 even if degraded (service is still functional)
     return JSONResponse(content=health_info, status_code=200)
@@ -782,89 +790,290 @@ async def cluster_faces(
     data: ClusterFacesRequest,
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
-    """Cluster faces into persons using FAISS."""
+    """Cluster faces into persons using FAISS HNSW with persistence, matching to existing persons first."""
     import faiss
     
     threshold = data.threshold
     
-    rows = await db_async.get_faces_embeddings_async(conn)
+    # Initialize index manager
+    index_manager = FAISSIndexManager()
     
-    if not rows:
-        raise HTTPException(
-            status_code=400,
-            detail="no_faces_found",
-            headers={"X-Message": "No faces found. Run face indexing first."}
+    # Get ONLY unassigned faces (person_id IS NULL) - this prevents reassigning already-assigned faces
+    unassigned_faces = await db_async.get_unassigned_faces_embeddings_async(conn)
+    
+    if not unassigned_faces:
+        # All faces already assigned or no faces with embeddings
+        return ClusterFacesResponse(
+            clustered_faces=0,
+            persons_created=0,
+            threshold=threshold
         )
     
-    face_ids = []
-    vecs = []
+    # Get existing person faces for matching
+    existing_person_faces = await db_async.get_person_faces_embeddings_async(conn)
     
-    for row in rows:
+    # Process unassigned faces
+    unassigned_face_ids = []
+    unassigned_vecs = []
+    
+    for row in unassigned_faces:
         fid = row["id"]
         emb_bytes = row["embedding"]
+        if not emb_bytes:
+            continue
         v = np.frombuffer(emb_bytes, dtype=np.float32)
         if v.size == 0:
             continue
-        face_ids.append(fid)
-        vecs.append(v)
-    
-    if not vecs:
-        raise HTTPException(status_code=400, detail="no_valid_embeddings")
-    
-    xb = np.stack(vecs).astype("float32")
-    faiss.normalize_L2(xb)
-    dim = xb.shape[1]
-    
-    index = faiss.IndexFlatIP(dim)
-    index.add(xb)
-    
-    # For each face, find neighbors and cluster via union-find
-    n = xb.shape[0]
-    k = min(10, n)  # check top-10 nearest faces per face
-    
-    # Union-Find
-    parent = list(range(n))
-    
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-    
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-    
-    D, I = index.search(xb, k)
-    for i in range(n):
-        for j in range(1, k):  # skip self at j=0
-            if I[i, j] < 0:
-                continue
-            if D[i, j] >= threshold:
-                union(i, I[i, j])
-    
-    # Collect clusters
-    clusters: Dict[int, List[int]] = {}
-    for i in range(n):
-        root = find(i)
-        clusters.setdefault(root, []).append(i)
-    
-    # Assign persons
-    person_idx = 1
-    for root, members in clusters.items():
-        # create person name
-        person_name = f"Person {person_idx}"
-        person_id = await db_async.get_or_create_person_async(conn, person_name)
-        person_idx += 1
         
-        for m in members:
-            fid = face_ids[m]
-            await db_async.set_face_person_async(conn, fid, person_id)
+        unassigned_face_ids.append(fid)
+        unassigned_vecs.append(v)
     
-    await conn.commit()
+    if not unassigned_vecs:
+        # No valid embeddings in unassigned faces
+        return ClusterFacesResponse(
+            clustered_faces=0,
+            persons_created=0,
+            threshold=threshold
+        )
     
-    return ClusterFacesResponse(clustered_faces=len(face_ids), persons_created=len(clusters), threshold=threshold)
+    # Build index of existing person faces for matching
+    existing_person_vecs = []
+    existing_person_face_ids = []
+    existing_person_map = {}  # face_id -> (person_id, person_name)
+    
+    for row in existing_person_faces:
+        emb_bytes = row["embedding"]
+        if not emb_bytes:
+            continue
+        v = np.frombuffer(emb_bytes, dtype=np.float32)
+        if v.size == 0:
+            continue
+        
+        existing_person_vecs.append(v)
+        existing_person_face_ids.append(row["id"])
+        existing_person_map[row["id"]] = (row["person_id"], row["person_name"])
+    
+    # Phase 1: Match unassigned faces to existing persons (with batch processing)
+    matched_assignments = []  # List of (face_id, person_id) tuples for batch update
+    unmatched_indices = []
+    
+    # Process in batches to avoid loading all embeddings into memory at once
+    BATCH_SIZE = 1000
+    
+    if existing_person_vecs:
+        # Load or build HNSW index for existing person faces (with persistence)
+        existing_xb = np.stack(existing_person_vecs).astype("float32")
+        existing_index_name = "existing_person_faces"
+        
+        # Try to load existing index, or build new one
+        existing_index = index_manager.load_index(existing_index_name)
+        
+        # Check if index exists and is valid
+        index_needs_rebuild = False
+        if existing_index is None:
+            index_needs_rebuild = True
+        else:
+            # Check if index size matches current data
+            try:
+                if hasattr(existing_index, 'ntotal') and existing_index.ntotal != len(existing_person_vecs):
+                    index_needs_rebuild = True
+                elif not hasattr(existing_index, 'ntotal'):
+                    # Index doesn't have ntotal attribute, might be corrupted
+                    index_needs_rebuild = True
+            except Exception:
+                # Error checking index, rebuild
+                index_needs_rebuild = True
+        
+        if index_needs_rebuild:
+            # Index doesn't exist or is outdated, build new HNSW index
+            try:
+                existing_index = index_manager.build_hnsw_index(
+                    existing_xb,
+                    existing_index_name,
+                    m=32,  # Connections per node (tune for accuracy/speed)
+                    ef_construction=200
+                )
+            except Exception as e:
+                # If HNSW fails, fall back to IndexFlatIP
+                print(f"Warning: HNSW index build failed, using IndexFlatIP: {e}")
+                faiss.normalize_L2(existing_xb)
+                existing_dim = existing_xb.shape[1]
+                existing_index = faiss.IndexFlatIP(existing_dim)
+                existing_index.add(existing_xb)
+        
+        # Process unassigned faces in batches
+        for batch_start in range(0, len(unassigned_face_ids), BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, len(unassigned_face_ids))
+            batch_face_ids = unassigned_face_ids[batch_start:batch_end]
+            batch_vecs = unassigned_vecs[batch_start:batch_end]
+            
+            # Check batch against existing persons
+            batch_xb = np.stack(batch_vecs).astype("float32")
+            
+            # Search for best match in existing persons using HNSW
+            try:
+                D_match, I_match = index_manager.search(
+                    existing_index,
+                    batch_xb,
+                    k=1,
+                    ef_search=50  # Tune for accuracy/speed
+                )
+            except Exception as e:
+                # Fallback to direct FAISS search if manager search fails
+                print(f"Warning: Index manager search failed, using direct search: {e}")
+                faiss.normalize_L2(batch_xb)
+                D_match, I_match = existing_index.search(batch_xb, 1)
+            
+            for i, face_id in enumerate(batch_face_ids):
+                # Double-check face is still unassigned before processing
+                cur = await conn.cursor()
+                await cur.execute("SELECT person_id FROM faces WHERE id=?", (face_id,))
+                face_row = await cur.fetchone()
+                if face_row and face_row["person_id"] is not None:
+                    # Face was already assigned, skip it
+                    print(f"Warning: Face {face_id} was already assigned, skipping")
+                    continue
+                
+                similarity = D_match[i, 0] if D_match[i, 0] > 0 else 0
+                if similarity >= threshold:
+                    # Match found! Assign to existing person
+                    matched_existing_face_idx = I_match[i, 0]
+                    matched_existing_face_id = existing_person_face_ids[matched_existing_face_idx]
+                    person_id, person_name = existing_person_map[matched_existing_face_id]
+                    
+                    matched_assignments.append((face_id, person_id))
+                else:
+                    # No match found, will cluster later
+                    global_idx = batch_start + i
+                    unmatched_indices.append(global_idx)
+    else:
+        # No existing persons, all faces are unmatched
+        unmatched_indices = list(range(len(unassigned_face_ids)))
+    
+    # Batch update all matched faces
+    if matched_assignments:
+        await db_async.set_faces_person_batch_async(conn, matched_assignments)
+    matched_count = len(matched_assignments)
+    
+    # Phase 2: Cluster unmatched faces into new persons
+    if unmatched_indices:
+        unmatched_face_ids = [unassigned_face_ids[i] for i in unmatched_indices]
+        unmatched_vecs = [unassigned_vecs[i] for i in unmatched_indices]
+        
+        xb = np.stack(unmatched_vecs).astype("float32")
+        dim = xb.shape[1]
+        
+        # Build HNSW index for clustering (with persistence)
+        cluster_index_name = "unmatched_faces_cluster"
+        try:
+            cluster_index = index_manager.build_hnsw_index(
+                xb,
+                cluster_index_name,
+                m=32,  # Connections per node
+                ef_construction=200
+            )
+        except Exception as e:
+            # If HNSW fails, fall back to IndexFlatIP
+            print(f"Warning: HNSW index build failed, using IndexFlatIP: {e}")
+            faiss.normalize_L2(xb)
+            dim = xb.shape[1]
+            cluster_index = faiss.IndexFlatIP(dim)
+            cluster_index.add(xb)
+        
+        # For each face, find neighbors and cluster via union-find
+        n = xb.shape[0]
+        k = min(10, n)  # check top-10 nearest faces per face
+        
+        # Union-Find
+        parent = list(range(n))
+        
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+        
+        # Search for neighbors using HNSW
+        try:
+            D, I = index_manager.search(
+                cluster_index,
+                xb,
+                k=k,
+                ef_search=50
+            )
+        except Exception as e:
+            # Fallback to direct FAISS search if manager search fails
+            print(f"Warning: Index manager search failed, using direct search: {e}")
+            faiss.normalize_L2(xb)
+            D, I = cluster_index.search(xb, k)
+        for i in range(n):
+            for j in range(1, k):  # skip self at j=0
+                if I[i, j] < 0:
+                    continue
+                if D[i, j] >= threshold:
+                    union(i, I[i, j])
+        
+        # Collect clusters
+        clusters: Dict[int, List[int]] = {}
+        for i in range(n):
+            root = find(i)
+            clusters.setdefault(root, []).append(i)
+        
+        # Get existing person names to avoid duplicates
+        existing_person_names = set()
+        async with conn.execute("SELECT name FROM persons") as cur:
+            for row in await cur.fetchall():
+                existing_person_names.add(row["name"])
+        
+        # Assign new persons to clusters (collect all assignments first)
+        person_idx = 1
+        persons_created = 0
+        cluster_assignments = []  # List of (face_id, person_id) tuples for batch update
+        
+        for root, members in clusters.items():
+            # Find next available person name (avoid duplicates)
+            while True:
+                person_name = f"Person {person_idx}"
+                if person_name not in existing_person_names:
+                    break
+                person_idx += 1
+            
+            # Create or get person (get_or_create handles existing names)
+            person_id = await db_async.get_or_create_person_async(conn, person_name)
+            existing_person_names.add(person_name)  # Track created names
+            person_idx += 1
+            persons_created += 1
+            
+            for m in members:
+                fid = unmatched_face_ids[m]
+                # Double-check face is still unassigned before assigning
+                cur = await conn.cursor()
+                await cur.execute("SELECT person_id FROM faces WHERE id=?", (fid,))
+                face_row = await cur.fetchone()
+                if face_row and face_row["person_id"] is None:
+                    cluster_assignments.append((fid, person_id))
+                else:
+                    # Face was assigned by another process, skip it
+                    print(f"Warning: Face {fid} was already assigned, skipping")
+        
+        # Batch update all cluster assignments
+        if cluster_assignments:
+            await db_async.set_faces_person_batch_async(conn, cluster_assignments)
+    else:
+        persons_created = 0
+    
+    total_clustered = matched_count + len(unmatched_indices)
+    
+    return ClusterFacesResponse(
+        clustered_faces=total_clustered,
+        persons_created=persons_created,
+        threshold=threshold
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1049,6 +1258,35 @@ async def list_faces(
         ))
     
     return FaceListResponse(items=items)
+
+
+@app.post("/api/faces/{face_id}/assign-person")
+async def assign_face_person(
+    face_id: int,
+    data: AssignFacePersonRequest,
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """Assign a person to a face."""
+    person_id = data.person_id
+    
+    # Verify face exists
+    cur = await conn.cursor()
+    await cur.execute("SELECT id FROM faces WHERE id=?", (face_id,))
+    face_row = await cur.fetchone()
+    if not face_row:
+        raise HTTPException(status_code=404, detail="face_not_found")
+    
+    # Verify person exists
+    await cur.execute("SELECT id FROM persons WHERE id=?", (person_id,))
+    person_row = await cur.fetchone()
+    if not person_row:
+        raise HTTPException(status_code=404, detail="person_not_found")
+    
+    # Assign person to face
+    await db_async.set_face_person_async(conn, face_id, person_id)
+    
+    return StatusResponse(status="ok")
+
 
 @app.get("/api/persons")
 async def list_persons(

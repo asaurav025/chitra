@@ -326,8 +326,53 @@ async def get_faces_embeddings_async(conn: aiosqlite.Connection) -> List[sqlite3
     return rows
 
 
+async def get_unassigned_faces_embeddings_async(conn: aiosqlite.Connection) -> List[sqlite3.Row]:
+    """Get only unassigned faces (person_id IS NULL) with embeddings."""
+    async with conn.execute(
+        "SELECT id, embedding FROM faces WHERE person_id IS NULL AND embedding IS NOT NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+    return rows
+
+
+async def get_person_faces_embeddings_async(conn: aiosqlite.Connection) -> List[sqlite3.Row]:
+    """Get faces that are already assigned to persons with their embeddings."""
+    async with conn.execute(
+        """
+        SELECT f.id, f.embedding, f.person_id, p.name as person_name
+        FROM faces f
+        JOIN persons p ON f.person_id = p.id
+        WHERE f.embedding IS NOT NULL
+        """
+    ) as cur:
+        rows = await cur.fetchall()
+    return rows
+
+
 async def set_face_person_async(conn: aiosqlite.Connection, face_id: int, person_id: int) -> None:
+    """Set person for a single face (for backward compatibility)."""
     await conn.execute("UPDATE faces SET person_id=? WHERE id=?", (person_id, face_id))
+    await conn.commit()
+
+
+async def set_faces_person_batch_async(
+    conn: aiosqlite.Connection,
+    assignments: List[tuple[int, int]]
+) -> None:
+    """
+    Batch update person assignments for multiple faces.
+    
+    Args:
+        conn: Database connection
+        assignments: List of (face_id, person_id) tuples
+    """
+    if not assignments:
+        return
+    
+    await conn.executemany(
+        "UPDATE faces SET person_id=? WHERE id=?",
+        assignments
+    )
     await conn.commit()
 
 

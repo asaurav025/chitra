@@ -46,3 +46,7 @@ desktop.ini
 # Logs
 *.log
 
+
+# FAISS indexes
+faiss_indexes/
+*.index
