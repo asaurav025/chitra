@@ -138,7 +138,8 @@ class FAISSIndexManager:
         Returns:
             Tuple of (distances, indices)
         """
-        # Normalize query vectors
+        # Normalize query vectors (use copy to avoid modifying input)
+        query_vectors = query_vectors.copy()
         faiss.normalize_L2(query_vectors)
         
         # Set ef_search for HNSW (if applicable)

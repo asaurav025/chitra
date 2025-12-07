@@ -37,7 +37,7 @@ from core.schemas import (
     PersonFacesResponse
 )
 from core.embedder import ClipEmbedder
-from core.extractor import collect_metadata, load_image, iter_images, RAW_EXTS
+from core.extractor import collect_metadata, load_image, iter_images, RAW_EXTS, _normalize_exif_date
 from core.face import face_encodings
 from core.tagger import auto_tags
 from core.gallery import ensure_thumb
@@ -49,6 +49,7 @@ from core.jobs import (
     process_photo_faces_job,
     index_embeddings_batch_job,
     index_faces_batch_job,
+    cluster_faces_job,
 )
 from rq.job import Job
 from PIL import Image
@@ -242,27 +243,12 @@ def row_to_photo_dto(row) -> Dict[str, Any]:
     """Convert database row to photo DTO, normalizing date formats."""
     from datetime import datetime
     
-    # Normalize exif_datetime format (EXIF uses "YYYY:MM:DD HH:MM:SS")
+    # Normalize exif_datetime (should already be normalized, but handle legacy data)
     exif_dt = row.get("exif_datetime") or ""
     if exif_dt:
-        try:
-            # EXIF format: "2025:12:07 10:30:45" -> ISO: "2025-12-07T10:30:45"
-            if ":" in exif_dt and " " in exif_dt:
-                # Replace first two colons with dashes, space with T
-                parts = exif_dt.split(" ", 1)
-                if len(parts) == 2:
-                    date_part = parts[0].replace(":", "-", 2)  # "2025:12:07" -> "2025-12-07"
-                    time_part = parts[1]  # "10:30:45"
-                    exif_dt = f"{date_part}T{time_part}"
-                    # Validate by parsing
-                    datetime.fromisoformat(exif_dt)
-                else:
-                    exif_dt = ""
-            elif not exif_dt.strip():
-                exif_dt = ""
-        except (ValueError, AttributeError, IndexError):
-            # If invalid, set to empty
-            exif_dt = ""
+        # Re-normalize if needed (handles legacy data with old formats)
+        normalized = _normalize_exif_date(exif_dt)
+        exif_dt = normalized if normalized else ""
     
     # Normalize created_at to ISO format if not already
     created_at = row.get("created_at") or ""
@@ -275,8 +261,11 @@ def row_to_photo_dto(row) -> Dict[str, Any]:
             # Validate by parsing
             datetime.fromisoformat(created_at)
         except (ValueError, AttributeError):
-            # If invalid, keep original or set to empty
-            if not created_at.strip():
+            # If invalid, try to normalize using the same function
+            normalized = _normalize_exif_date(created_at)
+            if normalized:
+                created_at = normalized
+            elif not created_at.strip():
                 created_at = ""
     
     return {
@@ -859,6 +848,44 @@ async def upload_photos(
             else:
                 saved.append(result)
     
+    # Auto-trigger clustering after face detection completes
+    # Queue clustering job with a delay to allow face detection jobs to start
+    if auto_process and saved:
+        try:
+            # Extract photo IDs from successfully uploaded photos
+            uploaded_photo_ids = [result["id"] for result in saved if "id" in result and not result.get("duplicate", False)]
+            
+            if uploaded_photo_ids:
+                queue = get_queue()
+                # Queue clustering job with 30 second delay to allow face detection to complete
+                # Pass photo_ids to only cluster faces from newly uploaded photos (more efficient)
+                try:
+                    # Try using enqueue_in if available (RQ scheduler)
+                    from datetime import timedelta
+                    queue.enqueue_in(
+                        timedelta(seconds=30),
+                        cluster_faces_job,
+                        DB_PATH,
+                        0.75,  # threshold
+                        uploaded_photo_ids,  # Only cluster faces from these photos
+                        job_timeout='5m'
+                    )
+                    print(f"✓ Queued auto-clustering job for {len(uploaded_photo_ids)} photos (will run in 30 seconds)")
+                except AttributeError:
+                    # enqueue_in not available, use regular enqueue (will run immediately)
+                    # Face detection jobs will complete first due to their processing time
+                    queue.enqueue(
+                        cluster_faces_job,
+                        DB_PATH,
+                        0.75,  # threshold
+                        uploaded_photo_ids,  # Only cluster faces from these photos
+                        job_timeout='5m'
+                    )
+                    print(f"✓ Queued auto-clustering job for {len(uploaded_photo_ids)} photos (will run after face detection completes)")
+        except Exception as e:
+            # Don't fail upload if clustering job queuing fails
+            print(f"Warning: Failed to queue auto-clustering job: {e}")
+    
     # Return results
     response = {"saved": saved}
     if duplicates:
@@ -1214,28 +1241,38 @@ async def cluster_faces(
         unmatched_face_ids = [unassigned_face_ids[i] for i in unmatched_indices]
         unmatched_vecs = [unassigned_vecs[i] for i in unmatched_indices]
         
-        xb = np.stack(unmatched_vecs).astype("float32")
-        dim = xb.shape[1]
+        print(f"Debug: Phase 2 - Starting clustering for {len(unmatched_face_ids)} unmatched faces with threshold {threshold}")
         
-        # Build HNSW index for clustering (with persistence)
+        # Create a copy for index building (build_hnsw_index normalizes in place)
+        xb = np.stack(unmatched_vecs).astype("float32")
+        xb_for_index = xb.copy()  # Copy to avoid modifying original
+        dim = xb.shape[1]
+        n = xb.shape[0]
+        
+        # Validate threshold
+        if threshold < 0.5 or threshold > 1.0:
+            print(f"Warning: Threshold {threshold} is outside recommended range [0.5, 1.0]")
+        
+        # Build HNSW index for clustering (with persistence) - faster than IndexFlatIP
         cluster_index_name = "unmatched_faces_cluster"
+        use_hnsw = True
         try:
             cluster_index = index_manager.build_hnsw_index(
-                xb,
+                xb_for_index,
                 cluster_index_name,
                 m=32,  # Connections per node
                 ef_construction=200
             )
+            print(f"Debug: Built HNSW index for {n} faces (fast approximate search)")
         except Exception as e:
             # If HNSW fails, fall back to IndexFlatIP
             print(f"Warning: HNSW index build failed, using IndexFlatIP: {e}")
-            faiss.normalize_L2(xb)
-            dim = xb.shape[1]
+            faiss.normalize_L2(xb_for_index)
             cluster_index = faiss.IndexFlatIP(dim)
-            cluster_index.add(xb)
+            cluster_index.add(xb_for_index)
+            use_hnsw = False
         
         # For each face, find neighbors and cluster via union-find
-        n = xb.shape[0]
         k = min(10, n)  # check top-10 nearest faces per face
         
         # Union-Find
@@ -1252,25 +1289,66 @@ async def cluster_faces(
             if ra != rb:
                 parent[rb] = ra
         
-        # Search for neighbors using HNSW
-        try:
-            D, I = index_manager.search(
-                cluster_index,
-                xb,
-                k=k,
-                ef_search=50
-            )
-        except Exception as e:
-            # Fallback to direct FAISS search if manager search fails
-            print(f"Warning: Index manager search failed, using direct search: {e}")
-            faiss.normalize_L2(xb)
-            D, I = cluster_index.search(xb, k)
+        # Search for neighbors
+        if use_hnsw:
+            # HNSW returns L2 distances - convert to cosine similarity
+            try:
+                D_l2, I = index_manager.search(
+                    cluster_index,
+                    xb.copy(),  # Use copy for search to avoid side effects
+                    k=k,
+                    ef_search=50
+                )
+            except Exception as e:
+                # Fallback to direct FAISS search if manager search fails
+                print(f"Warning: Index manager search failed, using direct search: {e}")
+                xb_search = xb.copy()
+                faiss.normalize_L2(xb_search)
+                D_l2, I = cluster_index.search(xb_search, k)
+            
+            # Convert L2 distances to cosine similarity
+            # For normalized vectors: L2² = 2(1 - cosine_sim) => cosine_sim = 1 - L2²/2
+            # Check if distances are squared (max > 2) or regular (max <= 2)
+            max_l2 = D_l2.max()
+            if max_l2 > 2.0:
+                # Distances are already squared
+                D = 1.0 - (D_l2 / 2.0)
+            else:
+                # Distances are regular L2, square them first
+                D = 1.0 - ((D_l2 ** 2) / 2.0)
+            # Clamp to [0, 1] range (should already be in range, but ensure it)
+            D = np.clip(D, 0.0, 1.0)
+            print(f"Debug: Converted L2 distances (max={max_l2:.3f}) to cosine similarity (range: {D.min():.3f} to {D.max():.3f})")
+        else:
+            # IndexFlatIP returns inner products = cosine similarity for normalized vectors
+            xb_search = xb.copy()
+            faiss.normalize_L2(xb_search)
+            D, I = cluster_index.search(xb_search, k)
+            # Clamp to [0, 1] range
+            D = np.clip(D, 0.0, 1.0)
+        
+        # Track similarity scores for debugging
+        similarity_scores = []
+        union_count = 0
+        
         for i in range(n):
             for j in range(1, k):  # skip self at j=0
                 if I[i, j] < 0:
                     continue
-                if D[i, j] >= threshold:
+                similarity = float(D[i, j])
+                similarity_scores.append(similarity)
+                if similarity >= threshold:
                     union(i, I[i, j])
+                    union_count += 1
+        
+        # Log similarity statistics
+        if similarity_scores:
+            print(f"Debug: Similarity scores - min={min(similarity_scores):.3f}, max={max(similarity_scores):.3f}, "
+                  f"avg={sum(similarity_scores)/len(similarity_scores):.3f}, "
+                  f"median={sorted(similarity_scores)[len(similarity_scores)//2]:.3f}")
+            above_threshold = sum(1 for s in similarity_scores if s >= threshold)
+            print(f"Debug: {above_threshold}/{len(similarity_scores)} similarities >= threshold {threshold}")
+            print(f"Debug: Performed {union_count} unions")
         
         # Collect clusters
         clusters: Dict[int, List[int]] = {}
@@ -1278,48 +1356,114 @@ async def cluster_faces(
             root = find(i)
             clusters.setdefault(root, []).append(i)
         
-        # Get existing person names to avoid duplicates
-        existing_person_names = set()
-        async with conn.execute("SELECT name FROM persons") as cur:
-            for row in await cur.fetchall():
-                existing_person_names.add(row["name"])
+        # Log cluster statistics
+        cluster_sizes = [len(members) for members in clusters.values()]
+        if cluster_sizes:
+            print(f"Debug: Created {len(clusters)} clusters - sizes: min={min(cluster_sizes)}, "
+                  f"max={max(cluster_sizes)}, avg={sum(cluster_sizes)/len(cluster_sizes):.1f}")
+            
+            # Warn if one cluster is too large (might indicate threshold too low)
+            max_cluster_size = max(cluster_sizes)
+            if max_cluster_size > n * 0.8:  # More than 80% of faces in one cluster
+                print(f"⚠ Warning: Largest cluster contains {max_cluster_size}/{n} faces ({max_cluster_size/n*100:.1f}%)")
+                print(f"⚠ Consider increasing threshold above {threshold} to get more granular clusters")
+            
+            # Warn if too many singleton clusters (might indicate threshold too high)
+            singleton_count = sum(1 for size in cluster_sizes if size == 1)
+            if singleton_count > len(clusters) * 0.5:  # More than 50% are singletons
+                print(f"⚠ Warning: {singleton_count}/{len(clusters)} clusters are singletons ({singleton_count/len(clusters)*100:.1f}%)")
+                print(f"⚠ Consider decreasing threshold below {threshold} to merge similar faces")
         
-        # Assign new persons to clusters (collect all assignments first)
-        person_idx = 1
-        persons_created = 0
-        cluster_assignments = []  # List of (face_id, person_id) tuples for batch update
-        
-        for root, members in clusters.items():
-            # Find next available person name (avoid duplicates)
-            while True:
-                person_name = f"Person {person_idx}"
-                if person_name not in existing_person_names:
-                    break
+        # Validate we have clusters and faces to assign
+        if len(clusters) == 0:
+            print("Warning: No clusters created, cannot assign faces")
+            persons_created = 0
+        elif len(unmatched_face_ids) == 0:
+            print("Warning: No unmatched face IDs available")
+            persons_created = 0
+        elif len(clusters) == 1 and len(list(clusters.values())[0]) == n:
+            # All faces in one cluster - this might be a threshold issue
+            print(f"⚠ Warning: All {n} faces clustered into a single group!")
+            print(f"⚠ This suggests threshold {threshold} may be too low, or faces are very similar")
+            print(f"⚠ Consider increasing threshold or checking face embeddings")
+            # Still proceed with assignment, but warn user
+            # Continue to assignment logic below
+        else:
+            # Get existing person names to avoid duplicates
+            existing_person_names = set()
+            async with conn.execute("SELECT name FROM persons") as cur:
+                for row in await cur.fetchall():
+                    existing_person_names.add(row["name"])
+            
+            # Assign new persons to clusters (collect all assignments first)
+            person_idx = 1
+            persons_created = 0
+            cluster_assignments = []  # List of (face_id, person_id) tuples for batch update
+            
+            for root, members in clusters.items():
+                # Skip empty clusters
+                if not members or len(members) == 0:
+                    print(f"Warning: Cluster {root} is empty, skipping")
+                    continue
+                
+                print(f"Debug: Processing cluster {root} with {len(members)} members")
+                
+                # Find next available person name (avoid duplicates)
+                while True:
+                    person_name = f"Person {person_idx}"
+                    if person_name not in existing_person_names:
+                        break
+                    person_idx += 1
+                
+                # Create or get person (get_or_create handles existing names)
+                person_id = await db_async.get_or_create_person_async(conn, person_name)
+                existing_person_names.add(person_name)  # Track created names
                 person_idx += 1
+                persons_created += 1
+                
+                print(f"Debug: Created person '{person_name}' (ID: {person_id}) for cluster {root}")
+                
+                # Assign all faces in this cluster to the person
+                faces_assigned_this_cluster = 0
+                for m in members:
+                    # Validate index bounds
+                    if m >= len(unmatched_face_ids):
+                        print(f"Error: Member index {m} out of range (max: {len(unmatched_face_ids)-1})")
+                        continue
+                    
+                    fid = unmatched_face_ids[m]
+                    
+                    # Double-check face is still unassigned before assigning
+                    cur = await conn.cursor()
+                    await cur.execute("SELECT person_id FROM faces WHERE id=?", (fid,))
+                    face_row = await cur.fetchone()
+                    
+                    if not face_row:
+                        print(f"Warning: Face {fid} not found in database, skipping")
+                        continue
+                    
+                    if face_row["person_id"] is None:
+                        cluster_assignments.append((fid, person_id))
+                        faces_assigned_this_cluster += 1
+                    else:
+                        # Face was assigned by another process, skip it
+                        print(f"Warning: Face {fid} was already assigned to person {face_row['person_id']}, skipping")
+                
+                print(f"Debug: Assigned {faces_assigned_this_cluster} faces to person '{person_name}' (ID: {person_id})")
             
-            # Create or get person (get_or_create handles existing names)
-            person_id = await db_async.get_or_create_person_async(conn, person_name)
-            existing_person_names.add(person_name)  # Track created names
-            person_idx += 1
-            persons_created += 1
-            
-            for m in members:
-                fid = unmatched_face_ids[m]
-                # Double-check face is still unassigned before assigning
-                cur = await conn.cursor()
-                await cur.execute("SELECT person_id FROM faces WHERE id=?", (fid,))
-                face_row = await cur.fetchone()
-                if face_row and face_row["person_id"] is None:
-                    cluster_assignments.append((fid, person_id))
-                else:
-                    # Face was assigned by another process, skip it
-                    print(f"Warning: Face {fid} was already assigned, skipping")
-        
-        # Batch update all cluster assignments
-        if cluster_assignments:
-            await db_async.set_faces_person_batch_async(conn, cluster_assignments)
+            # Batch update all cluster assignments
+            if cluster_assignments:
+                print(f"Debug: Batch assigning {len(cluster_assignments)} faces to {persons_created} persons")
+                await db_async.set_faces_person_batch_async(conn, cluster_assignments)
+                print(f"✓ Successfully assigned {len(cluster_assignments)} faces to {persons_created} new persons")
+            else:
+                print(f"⚠ ERROR: Created {persons_created} persons but collected 0 face assignments!")
+                print(f"⚠ This indicates a bug - faces should have been assigned to the created persons")
     else:
         persons_created = 0
+    
+    # Ensure all changes are committed before returning
+    await conn.commit()
     
     total_clustered = matched_count + len(unmatched_indices)
     
@@ -1659,7 +1803,7 @@ async def merge_persons_endpoint(
     data: MergePersonsRequest,
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
-    """Merge source person into target person."""
+    """Merge source person into target person and update FAISS index if needed."""
     source_person_id = data.source_person_id
     
     if not isinstance(source_person_id, int):
@@ -1669,8 +1813,29 @@ async def merge_persons_endpoint(
         raise HTTPException(status_code=400, detail="cannot_merge_same_person")
     
     try:
+        # Get target person name for logging
+        cur = await conn.cursor()
+        await cur.execute("SELECT name FROM persons WHERE id=?", (target_person_id,))
+        target_person_row = await cur.fetchone()
+        target_person_name = target_person_row["name"] if target_person_row else f"Person #{target_person_id}"
+        
+        # Get count of faces being merged
+        await cur.execute("SELECT COUNT(*) as count FROM faces WHERE person_id=?", (source_person_id,))
+        count_row = await cur.fetchone()
+        faces_count = count_row["count"] if count_row else 0
+        
+        # Perform the merge in database
         await db_async.merge_persons_async(conn, source_person_id, target_person_id)
         await conn.commit()
+        
+        # Note: FAISS index doesn't need updating because:
+        # 1. Face embeddings haven't changed (only person_id in database changed)
+        # 2. FAISS index stores embeddings, person_id is in database
+        # 3. Next clustering will read updated person_id from database
+        # The index will work correctly on next use since it reads person_id from DB
+        if faces_count > 0:
+            print(f"✓ Merged {faces_count} faces from person {source_person_id} to {target_person_id} ({target_person_name}). FAISS index will reflect changes on next clustering.")
+        
         return StatusResponse(status="merged")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

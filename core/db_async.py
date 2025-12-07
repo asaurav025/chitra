@@ -369,9 +369,11 @@ async def set_faces_person_batch_async(
     if not assignments:
         return
     
+    # SQL expects (person_id, face_id) but assignments are (face_id, person_id)
+    # Swap the order to match SQL: SET person_id=? WHERE id=?
     await conn.executemany(
         "UPDATE faces SET person_id=? WHERE id=?",
-        assignments
+        [(person_id, face_id) for face_id, person_id in assignments]
     )
     await conn.commit()
 
@@ -490,7 +492,6 @@ async def get_face_thumbs_for_person_async(
         LEFT JOIN persons p ON p.id = f.person_id
         WHERE f.person_id = ?
         ORDER BY f.id ASC
-        LIMIT 10
         """,
         (person_id,),
     ) as cur:

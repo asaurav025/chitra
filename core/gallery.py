@@ -2,22 +2,36 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import List, Dict
+from PIL import Image
 from core.extractor import load_image
 
-def ensure_thumb(src_path: str, thumb_path: str, size=(256, 256)):
+def ensure_thumb(src_path: str, thumb_path: str, size=(512, 512)):
     """
     Always create a JPG thumbnail even for RAW images.
+    Uses high-quality resampling and JPEG settings for better quality.
     Raises exception on failure instead of silently failing.
     """
     try:
         img = load_image(Path(src_path))
         if img is None:
             raise Exception(f"Failed to load image from {src_path}")
-        img.thumbnail(size)
+        
+        # Use LANCZOS resampling for better quality (explicit resampling method)
+        img.thumbnail(size, Image.Resampling.LANCZOS)
+        
         # Ensure parent directory exists
         thumb_path_obj = Path(thumb_path)
         thumb_path_obj.parent.mkdir(parents=True, exist_ok=True)
-        img.save(thumb_path, "JPEG", quality=100)
+        
+        # Save with maximum quality settings for better RAW thumbnail quality
+        img.save(
+            thumb_path, 
+            "JPEG", 
+            quality=100, 
+            optimize=False,  # Don't optimize (faster, better quality)
+            subsampling=0    # No chroma subsampling (4:4:4, best quality)
+        )
+        
         # Verify file was created
         if not Path(thumb_path).exists():
             raise Exception(f"Thumbnail file was not created at {thumb_path}")
