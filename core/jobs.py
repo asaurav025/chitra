@@ -436,9 +436,9 @@ def index_faces_batch_job(photo_ids_and_paths: list, db_path: str, min_score=0.5
 
 
 
-def cluster_faces_job(db_path: str, threshold: float = 0.75, photo_ids: list = None):
+def cluster_faces_job(db_path: str, threshold: float = 0.75, photo_ids: list = None, reset: bool = False):
     """
-    Background job to cluster unassigned faces into persons.
+    Background job to cluster unassigned faces into persons using HDBSCAN.
     
     This job runs after face detection jobs complete to automatically
     group similar faces into persons.
@@ -448,6 +448,7 @@ def cluster_faces_job(db_path: str, threshold: float = 0.75, photo_ids: list = N
         threshold: Similarity threshold for clustering (default 0.75)
         photo_ids: Optional list of photo IDs to limit clustering to faces from these photos only.
                    If None, clusters all unassigned faces (less efficient for large databases).
+        reset: If True, unassign all faces before clustering (re-cluster everything).
     """
     import faiss
     from core.faiss_index import FAISSIndexManager
@@ -456,6 +457,12 @@ def cluster_faces_job(db_path: str, threshold: float = 0.75, photo_ids: list = N
     index_manager = FAISSIndexManager()
     
     try:
+        # If reset=True, unassign all faces first (re-cluster everything)
+        if reset:
+            cur = conn.cursor()
+            cur.execute("UPDATE faces SET person_id = NULL WHERE person_id IS NOT NULL")
+            conn.commit()
+            print(f"✓ Reset all face assignments - re-clustering all {cur.rowcount} faces")
         # Get unassigned faces with embeddings
         # If photo_ids provided, only cluster faces from those photos (more efficient)
         cur = conn.cursor()
@@ -636,86 +643,94 @@ def cluster_faces_job(db_path: str, threshold: float = 0.75, photo_ids: list = N
                 print(f"Warning: Failed to update FAISS index with matched faces: {e}")
                 # Continue - index will be rebuilt on next clustering
         
-        # Phase 2: Cluster unmatched faces into new persons
+        # Phase 2: Cluster unmatched faces into new persons using HDBSCAN
         persons_created = 0
         if unmatched_indices:
             unmatched_face_ids = [unassigned_face_ids[i] for i in unmatched_indices]
             unmatched_vecs = [unassigned_vecs[i] for i in unmatched_indices]
             
-            print(f"Debug: Phase 2 - Starting clustering for {len(unmatched_face_ids)} unmatched faces with threshold {threshold}")
+            print(f"Debug: Phase 2 - Starting HDBSCAN clustering for {len(unmatched_face_ids)} unmatched faces with threshold {threshold}")
             
             xb = np.stack(unmatched_vecs).astype("float32")
-            xb_for_index = xb.copy()
-            dim = xb.shape[1]
             n = xb.shape[0]
             
-            # Build HNSW index for clustering
-            cluster_index_name = "unmatched_faces_cluster"
-            use_hnsw = True
+            # Normalize embeddings for cosine similarity
+            # HDBSCAN with cosine metric expects normalized vectors
+            xb_normalized = xb.copy()
+            faiss.normalize_L2(xb_normalized)
+            
+            # Import HDBSCAN
             try:
-                cluster_index = index_manager.build_hnsw_index(
-                    xb_for_index, cluster_index_name, m=32, ef_construction=200
-                )
-                print(f"Debug: Built HNSW index for {n} faces")
-            except Exception as e:
-                print(f"Warning: HNSW build failed, using IndexFlatIP: {e}")
-                faiss.normalize_L2(xb_for_index)
-                cluster_index = faiss.IndexFlatIP(dim)
-                cluster_index.add(xb_for_index)
-                use_hnsw = False
+                import hdbscan
+            except ImportError:
+                print("Error: hdbscan not installed. Please install it: pip install hdbscan")
+                raise
             
-            # Union-Find for clustering
-            k = min(10, n)
-            parent = list(range(n))
+            # Configure HDBSCAN parameters
+            # min_cluster_size: minimum number of faces in a cluster (allow pairs)
+            # min_samples: minimum neighbors (lower = more permissive, higher = more strict)
+            # For threshold 0.75, use min_samples=2 to allow pairs with high similarity
+            # Lower threshold = more permissive clustering
+            min_cluster_size = max(2, int(n * 0.01))  # At least 2, or 1% of faces
+            min_samples = max(1, int(min_cluster_size * 0.5))  # Half of min_cluster_size
             
-            def find(x):
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
+            # Use euclidean metric on normalized vectors (equivalent to cosine distance)
+            # For L2-normalized vectors, euclidean distance = sqrt(2 * (1 - cosine_similarity))
+            # So we adjust the epsilon accordingly
+            # Cosine similarity threshold -> euclidean distance threshold
+            # cosine_sim >= threshold -> euclidean_dist <= sqrt(2 * (1 - threshold))
+            # Ensure epsilon is valid (>= 0 and reasonable)
+            euclidean_threshold = np.sqrt(max(0.0, 2.0 * (1.0 - threshold)))
+            # Cap epsilon at a reasonable maximum (e.g., 2.0 for normalized vectors)
+            euclidean_threshold = min(euclidean_threshold, 2.0)
             
-            def union(a, b):
-                ra, rb = find(a), find(b)
-                if ra != rb:
-                    parent[rb] = ra
+            # HDBSCAN parameters
+            clusterer_kwargs = {
+                'min_cluster_size': min_cluster_size,
+                'min_samples': min_samples,
+                'metric': 'euclidean',  # Use euclidean on normalized vectors (equivalent to cosine)
+                'cluster_selection_method': 'eom',  # Excess of Mass
+                'prediction_data': True  # Enable approximate_predict for future matching
+            }
             
-            # Search for neighbors
-            if use_hnsw:
-                try:
-                    D_l2, I = index_manager.search(cluster_index, xb.copy(), k=k, ef_search=50)
-                except Exception as e:
-                    print(f"Warning: Search failed, using direct search: {e}")
-                    xb_search = xb.copy()
-                    faiss.normalize_L2(xb_search)
-                    D_l2, I = cluster_index.search(xb_search, k)
-                
-                # Convert L2 to cosine similarity
-                max_l2 = D_l2.max()
-                if max_l2 > 2.0:
-                    D = 1.0 - (D_l2 / 2.0)
-                else:
-                    D = 1.0 - ((D_l2 ** 2) / 2.0)
-                D = np.clip(D, 0.0, 1.0)
-            else:
-                xb_search = xb.copy()
-                faiss.normalize_L2(xb_search)
-                D, I = cluster_index.search(xb_search, k)
-                D = np.clip(D, 0.0, 1.0)
+            # Only add epsilon if it's positive and reasonable
+            if euclidean_threshold > 0:
+                clusterer_kwargs['cluster_selection_epsilon'] = float(euclidean_threshold)
             
-            # Cluster via union-find
-            for i in range(n):
-                for j in range(1, k):
-                    if I[i, j] < 0:
-                        continue
-                    similarity = float(D[i, j])
-                    if similarity >= threshold:
-                        union(i, I[i, j])
+            clusterer = hdbscan.HDBSCAN(**clusterer_kwargs)
             
-            # Collect clusters
+            # Perform clustering
+            cluster_labels = clusterer.fit_predict(xb_normalized)
+            
+            # Filter clusters based on average similarity within cluster
+            # Collect valid clusters (exclude noise points with label -1)
             clusters = {}
-            for i in range(n):
-                root = find(i)
-                clusters.setdefault(root, []).append(i)
+            for i, label in enumerate(cluster_labels):
+                if label >= 0:  # Valid cluster (not noise)
+                    clusters.setdefault(label, []).append(i)
+            
+            # Filter clusters by average similarity
+            valid_clusters = {}
+            for label, members in clusters.items():
+                if len(members) < 2:
+                    continue
+                
+                # Calculate average cosine similarity within cluster
+                cluster_vecs = xb_normalized[members]
+                # Compute pairwise cosine similarities
+                similarities = np.dot(cluster_vecs, cluster_vecs.T)
+                # Get upper triangle (excluding diagonal)
+                triu_indices = np.triu_indices(len(members), k=1)
+                avg_similarity = similarities[triu_indices].mean()
+                
+                # Only keep clusters with average similarity >= threshold
+                if avg_similarity >= threshold:
+                    valid_clusters[label] = members
+                    print(f"Debug: Cluster {label} has {len(members)} faces with avg similarity {avg_similarity:.3f}")
+                else:
+                    print(f"Debug: Cluster {label} rejected (avg similarity {avg_similarity:.3f} < {threshold})")
+            
+            clusters = valid_clusters
             
             # Create persons and assign faces
             if clusters:
@@ -811,6 +826,211 @@ def cluster_faces_job(db_path: str, threshold: float = 0.75, photo_ids: list = N
         
     except Exception as e:
         print(f"Error in cluster_faces_job: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        conn.close()
+
+
+def update_faiss_index_after_merge_job(
+    db_path: str,
+    source_person_id: int,
+    target_person_id: int
+):
+    """
+    Background job to update FAISS index after merging persons.
+    
+    Args:
+        db_path: Path to SQLite database
+        source_person_id: Source person ID that was merged (for logging)
+        target_person_id: Target person ID that faces were merged into
+    """
+    import faiss
+    import numpy as np
+    from core.faiss_index import FAISSIndexManager
+    
+    conn = db.connect(db_path)
+    index_manager = FAISSIndexManager()
+    
+    try:
+        cur = conn.cursor()
+        
+        # Get target person name for logging
+        cur.execute("SELECT name FROM persons WHERE id=?", (target_person_id,))
+        person_row = cur.fetchone()
+        target_person_name = person_row["name"] if person_row else f"Person #{target_person_id}"
+        
+        # Get all faces that were merged (now assigned to target_person_id)
+        # Query faces that were recently merged - we can identify them by checking
+        # if they exist in the target person (they were just merged)
+        cur.execute(
+            """
+            SELECT id, embedding 
+            FROM faces 
+            WHERE person_id = ? AND embedding IS NOT NULL
+            """,
+            (target_person_id,)
+        )
+        merged_faces = cur.fetchall()
+        
+        if not merged_faces:
+            print(f"ℹ No faces with embeddings found for person {target_person_id} after merge")
+            return {"updated": 0, "message": "No faces to update"}
+        
+        # Load existing FAISS index
+        existing_index_name = "existing_person_faces"
+        existing_index = index_manager.load_index(existing_index_name)
+        
+        if existing_index is None:
+            print(f"ℹ FAISS index not found - will be built on next clustering. Merged {len(merged_faces)} faces to person {target_person_id} ({target_person_name})")
+            return {"updated": 0, "message": "Index not found, will be built on next clustering"}
+        
+        # Prepare embeddings for batch update
+        merged_embeddings = []
+        face_ids = []
+        
+        for face_row in merged_faces:
+            face_id = face_row[0]  # id
+            face_embedding_bytes = face_row[1]  # embedding
+            
+            if face_embedding_bytes:
+                face_embedding = np.frombuffer(face_embedding_bytes, dtype=np.float32)
+                face_embedding = face_embedding.reshape(1, -1).astype(np.float32)
+                merged_embeddings.append(face_embedding)
+                face_ids.append(face_id)
+        
+        if not merged_embeddings:
+            print(f"ℹ No valid embeddings found for merged faces")
+            return {"updated": 0, "message": "No valid embeddings"}
+        
+        # Stack all embeddings into a single array
+        merged_xb = np.vstack(merged_embeddings)
+        
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(merged_xb)
+        
+        # Add to existing index
+        existing_index.add(merged_xb)
+        
+        # Save updated index
+        index_manager.save_index(existing_index, existing_index_name)
+        
+        print(f"✓ Updated FAISS index: Added {len(merged_embeddings)} merged faces from person {source_person_id} to person {target_person_id} ({target_person_name})")
+        
+        return {
+            "updated": len(merged_embeddings),
+            "message": f"Successfully updated FAISS index with {len(merged_embeddings)} face embeddings"
+        }
+        
+    except Exception as e:
+        print(f"Error updating FAISS index after merge: {e}")
+        import traceback
+        traceback.print_exc()
+        # Don't raise - merge already succeeded in database
+        return {"updated": 0, "error": str(e), "message": "Index update failed but merge succeeded"}
+    finally:
+        conn.close()
+
+
+def rebuild_faiss_index_job(db_path: str):
+    """
+    Background job to rebuild FAISS index from all persons with faces.
+    This is useful after merging persons or when the index is out of sync.
+    
+    Args:
+        db_path: Path to SQLite database
+    """
+    import faiss
+    import numpy as np
+    from core.faiss_index import FAISSIndexManager
+    
+    conn = db.connect(db_path)
+    index_manager = FAISSIndexManager()
+    
+    try:
+        cur = conn.cursor()
+        
+        # Get all faces assigned to persons with embeddings
+        cur.execute(
+            """
+            SELECT f.id, f.embedding, f.person_id, p.name as person_name
+            FROM faces f
+            JOIN persons p ON f.person_id = p.id
+            WHERE f.embedding IS NOT NULL
+            ORDER BY f.person_id, f.id
+            """
+        )
+        person_faces = cur.fetchall()
+        
+        if not person_faces:
+            print("ℹ No faces with embeddings found for any person")
+            # Delete existing index if it exists
+            existing_index_name = "existing_person_faces"
+            index_path = index_manager.index_dir / f"{existing_index_name}.index"
+            if index_path.exists():
+                index_path.unlink()
+                print("✓ Deleted empty FAISS index")
+            return {"updated": 0, "message": "No faces to index"}
+        
+        # Prepare embeddings
+        embeddings = []
+        face_ids = []
+        person_ids = []
+        
+        for row in person_faces:
+            face_id = row[0]  # id
+            embedding_bytes = row[1]  # embedding
+            person_id = row[2]  # person_id
+            person_name = row[3]  # person_name
+            
+            if embedding_bytes:
+                face_embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+                face_embedding = face_embedding.reshape(1, -1).astype(np.float32)
+                embeddings.append(face_embedding)
+                face_ids.append(face_id)
+                person_ids.append(person_id)
+        
+        if not embeddings:
+            print("ℹ No valid embeddings found")
+            return {"updated": 0, "message": "No valid embeddings"}
+        
+        # Stack all embeddings into a single array
+        xb = np.vstack(embeddings)
+        
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(xb)
+        
+        # Build new index
+        existing_index_name = "existing_person_faces"
+        dim = xb.shape[1]
+        
+        try:
+            # Try to build HNSW index for faster search
+            new_index = index_manager.build_hnsw_index(
+                xb,
+                existing_index_name,
+                m=32,  # Connections per node
+                ef_construction=200
+            )
+            print(f"✓ Rebuilt HNSW FAISS index with {len(embeddings)} faces from {len(set(person_ids))} persons")
+        except Exception as e:
+            # Fall back to IndexFlatIP if HNSW fails
+            print(f"Warning: HNSW index build failed, using IndexFlatIP: {e}")
+            faiss.normalize_L2(xb)
+            new_index = faiss.IndexFlatIP(dim)
+            new_index.add(xb)
+            index_manager.save_index(new_index, existing_index_name)
+            print(f"✓ Rebuilt FAISS index (IndexFlatIP) with {len(embeddings)} faces from {len(set(person_ids))} persons")
+        
+        return {
+            "updated": len(embeddings),
+            "persons": len(set(person_ids)),
+            "message": f"Successfully rebuilt FAISS index with {len(embeddings)} face embeddings from {len(set(person_ids))} persons"
+        }
+        
+    except Exception as e:
+        print(f"Error rebuilding FAISS index: {e}")
         import traceback
         traceback.print_exc()
         raise

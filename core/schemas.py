@@ -44,6 +44,7 @@ class IndexFacesRequest(BaseModel):
 class ClusterFacesRequest(BaseModel):
     """Request model for clustering faces."""
     threshold: float = Field(default=0.75, ge=0.0, le=1.0, description="Similarity threshold for clustering")
+    reset: bool = Field(default=False, description="If True, unassign all faces before clustering (re-cluster everything)")
 
 
 class CreatePersonRequest(BaseModel):
@@ -171,6 +172,8 @@ class ClusterFacesResponse(BaseModel):
     clustered_faces: int = Field(..., description="Number of faces clustered")
     persons_created: int = Field(..., description="Number of persons created")
     threshold: float = Field(..., description="Similarity threshold used")
+    job_id: Optional[str] = Field(None, description="Background job ID if clustering was queued")
+    message: Optional[str] = Field(None, description="Status message")
 
 
 class SearchResultsResponse(BaseModel):

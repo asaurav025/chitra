@@ -518,3 +518,22 @@ async def merge_persons_async(
     await conn.execute("DELETE FROM persons WHERE id=?", (source_person_id,))
 
     await conn.commit()
+
+
+async def delete_persons_without_faces_async(conn: aiosqlite.Connection) -> int:
+    """
+    Delete all persons that have no faces assigned to them.
+    
+    Returns:
+        Number of persons deleted
+    """
+    # Delete persons that have no faces
+    cursor = await conn.execute(
+        """
+        DELETE FROM persons
+        WHERE id NOT IN (SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL)
+        """
+    )
+    deleted_count = cursor.rowcount
+    await conn.commit()
+    return deleted_count

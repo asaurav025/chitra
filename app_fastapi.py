@@ -50,6 +50,8 @@ from core.jobs import (
     index_embeddings_batch_job,
     index_faces_batch_job,
     cluster_faces_job,
+    update_faiss_index_after_merge_job,
+    rebuild_faiss_index_job,
 )
 from rq.job import Job
 from PIL import Image
@@ -866,7 +868,7 @@ async def upload_photos(
                         timedelta(seconds=30),
                         cluster_faces_job,
                         DB_PATH,
-                        0.75,  # threshold
+                        0.6,  # threshold (less strict matching)
                         uploaded_photo_ids,  # Only cluster faces from these photos
                         job_timeout='5m'
                     )
@@ -877,7 +879,7 @@ async def upload_photos(
                     queue.enqueue(
                         cluster_faces_job,
                         DB_PATH,
-                        0.75,  # threshold
+                        0.6,  # threshold (less strict matching)
                         uploaded_photo_ids,  # Only cluster faces from these photos
                         job_timeout='5m'
                     )
@@ -1071,16 +1073,30 @@ async def cluster_faces(
     data: ClusterFacesRequest,
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
-    """Cluster faces into persons using FAISS HNSW with persistence, matching to existing persons first."""
-    import faiss
-    
+    """Cluster faces into persons using HDBSCAN (queued as background job)."""
     threshold = data.threshold
+    reset = data.reset
     
-    # Initialize index manager
-    index_manager = FAISSIndexManager()
-    
-    # Get ONLY unassigned faces (person_id IS NULL) - this prevents reassigning already-assigned faces
-    unassigned_faces = await db_async.get_unassigned_faces_embeddings_async(conn)
+    # Queue clustering job (uses HDBSCAN implementation)
+    queue = get_queue()
+    try:
+        job = queue.enqueue(
+            cluster_faces_job,
+            DB_PATH,
+            threshold,
+            None,  # photo_ids - None means cluster all unassigned faces
+            reset,  # reset parameter
+            job_timeout='10m'  # Clustering can take time
+        )
+        return ClusterFacesResponse(
+            clustered_faces=0,  # Will be updated when job completes
+            persons_created=0,
+            threshold=threshold,
+            job_id=job.id,
+            message=f"Clustering job queued (reset={reset}). Check job status for results."
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to queue clustering job: {str(e)}")
     
     if not unassigned_faces:
         # All faces already assigned or no faces with embeddings
@@ -1803,7 +1819,7 @@ async def merge_persons_endpoint(
     data: MergePersonsRequest,
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
-    """Merge source person into target person and update FAISS index if needed."""
+    """Merge source person into target person and queue FAISS index update job."""
     source_person_id = data.source_person_id
     
     if not isinstance(source_person_id, int):
@@ -1828,17 +1844,65 @@ async def merge_persons_endpoint(
         await db_async.merge_persons_async(conn, source_person_id, target_person_id)
         await conn.commit()
         
-        # Note: FAISS index doesn't need updating because:
-        # 1. Face embeddings haven't changed (only person_id in database changed)
-        # 2. FAISS index stores embeddings, person_id is in database
-        # 3. Next clustering will read updated person_id from database
-        # The index will work correctly on next use since it reads person_id from DB
+        # Queue background job to update FAISS index
         if faces_count > 0:
-            print(f"✓ Merged {faces_count} faces from person {source_person_id} to {target_person_id} ({target_person_name}). FAISS index will reflect changes on next clustering.")
+            try:
+                queue = get_queue()
+                job = queue.enqueue(
+                    update_faiss_index_after_merge_job,
+                    DB_PATH,
+                    source_person_id,
+                    target_person_id,
+                    job_timeout='5m'  # Should be quick, but allow some buffer
+                )
+                print(f"✓ Merged {faces_count} faces from person {source_person_id} to {target_person_id} ({target_person_name}). Queued FAISS index update job (ID: {job.id})")
+            except Exception as e:
+                # Don't fail the merge if job queuing fails
+                print(f"Warning: Failed to queue FAISS index update job: {e}")
+                print(f"✓ Merged {faces_count} faces from person {source_person_id} to {target_person_id} ({target_person_name}). Index will be updated on next clustering.")
+        else:
+            print(f"✓ Merged person {source_person_id} to {target_person_id} ({target_person_name}). No faces to merge.")
         
         return StatusResponse(status="merged")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/persons/rebuild-index")
+async def rebuild_faiss_index_endpoint(
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """Rebuild FAISS index from all persons with faces (queued as background job)."""
+    queue = get_queue()
+    try:
+        job = queue.enqueue(
+            rebuild_faiss_index_job,
+            DB_PATH,
+            job_timeout='10m'  # Rebuilding can take time for large databases
+        )
+        return JobStatusResponse(
+            job_id=job.id,
+            status=job.get_status(),
+            created_at=job.created_at.isoformat() if job.created_at else None,
+            started_at=job.started_at.isoformat() if job.started_at else None,
+            ended_at=job.ended_at.isoformat() if job.ended_at else None,
+            result=job.result if job.is_finished else None,
+            error=str(job.exc_info) if job.is_failed and job.exc_info else None
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to queue rebuild job: {str(e)}")
+
+
+@app.post("/api/persons/cleanup")
+async def cleanup_persons_without_faces_endpoint(
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """Delete all persons that have no faces assigned to them."""
+    try:
+        deleted_count = await db_async.delete_persons_without_faces_async(conn)
+        return StatusResponse(status=f"deleted {deleted_count} person(s) without faces")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
