@@ -1530,24 +1530,65 @@ async def assign_face_person(
     data: AssignFacePersonRequest,
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
-    """Assign a person to a face."""
+    """Assign a person to a face and update matching index for future auto-matching."""
+    import faiss
+    import numpy as np
+    
     person_id = data.person_id
     
-    # Verify face exists
+    # Verify face exists and get its embedding
     cur = await conn.cursor()
-    await cur.execute("SELECT id FROM faces WHERE id=?", (face_id,))
+    await cur.execute("SELECT id, embedding FROM faces WHERE id=?", (face_id,))
     face_row = await cur.fetchone()
     if not face_row:
         raise HTTPException(status_code=404, detail="face_not_found")
     
     # Verify person exists
-    await cur.execute("SELECT id FROM persons WHERE id=?", (person_id,))
+    await cur.execute("SELECT id, name FROM persons WHERE id=?", (person_id,))
     person_row = await cur.fetchone()
     if not person_row:
         raise HTTPException(status_code=404, detail="person_not_found")
     
-    # Assign person to face
+    person_name = person_row["name"]
+    face_embedding_bytes = face_row["embedding"]
+    
+    # Assign person to face in database first
     await db_async.set_face_person_async(conn, face_id, person_id)
+    
+    # Update FAISS index to include this newly assigned face for future matching
+    if face_embedding_bytes:
+        try:
+            index_manager = FAISSIndexManager()
+            existing_index_name = "existing_person_faces"
+            
+            # Load existing index
+            existing_index = index_manager.load_index(existing_index_name)
+            
+            if existing_index is not None:
+                # Index exists - update it incrementally with new face
+                face_embedding = np.frombuffer(face_embedding_bytes, dtype=np.float32)
+                face_embedding = face_embedding.reshape(1, -1).astype(np.float32)
+                
+                # Normalize embedding for cosine similarity
+                faiss.normalize_L2(face_embedding)
+                
+                # Add to existing index
+                existing_index.add(face_embedding)
+                
+                # Save updated index
+                index_manager.save_index(existing_index, existing_index_name)
+                print(f"✓ Updated FAISS index: Added face {face_id} to person {person_id} ({person_name}) for future matching")
+            else:
+                # Index doesn't exist yet - will be built on next clustering
+                # This is fine, the face will be included when index is built
+                print(f"ℹ FAISS index not found - will be built on next clustering. Face {face_id} assigned to person {person_id} ({person_name})")
+        except Exception as e:
+            # Don't fail the assignment if index update fails
+            print(f"Warning: Failed to update FAISS index after manual assignment: {e}")
+            # Assignment still succeeded in database
+    else:
+        # Face has no embedding, can't update index but assignment succeeded
+        print(f"Warning: Face {face_id} has no embedding, skipping index update")
     
     return StatusResponse(status="ok")
 
