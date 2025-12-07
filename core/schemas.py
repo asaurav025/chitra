@@ -93,6 +93,7 @@ class PhotoListResponse(BaseModel):
     items: List[PhotoResponse] = Field(..., description="List of photos")
     limit: int = Field(..., description="Pagination limit")
     offset: int = Field(..., description="Pagination offset")
+    total: int = Field(..., description="Total number of photos")
 
 
 class TagResponse(BaseModel):

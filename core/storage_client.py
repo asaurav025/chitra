@@ -109,6 +109,25 @@ class MinIOStorageClient:
         except Exception as e:
             raise Exception(f"MinIO upload failed for '{remote_path}': {e}")
     
+    def upload_file_from_path(self, file_path: str, remote_path: str) -> str:
+        """
+        Upload file to MinIO directly from file path (for large files).
+        Avoids loading entire file into memory.
+        """
+        try:
+            file_size = os.path.getsize(file_path)
+            with open(file_path, 'rb') as file_obj:
+                self.client.put_object(
+                    self.bucket_name,
+                    remote_path,
+                    file_obj,
+                    length=file_size,
+                    content_type=self._get_content_type(remote_path)
+                )
+            return remote_path
+        except Exception as e:
+            raise Exception(f"MinIO upload from path failed for '{remote_path}': {e}")
+    
     async def upload_file_async(self, file_data: bytes, remote_path: str) -> str:
         """
         Upload file to MinIO (async).
@@ -116,6 +135,14 @@ class MinIOStorageClient:
         """
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.upload_file, file_data, remote_path)
+    
+    async def upload_file_from_path_async(self, file_path: str, remote_path: str) -> str:
+        """
+        Upload file to MinIO directly from file path (async, for large files).
+        Avoids loading entire file into memory.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.upload_file_from_path, file_path, remote_path)
     
     def download_file(self, remote_path: str) -> bytes:
         """

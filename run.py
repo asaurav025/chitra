@@ -42,7 +42,9 @@ def main():
             host=args.host,
             port=args.port,
             reload=True,
-            log_level=args.log_level
+            log_level=args.log_level,
+            timeout_keep_alive=300,  # 5 minutes for large uploads
+            limit_concurrency=100
         )
     else:
         print(f"Starting Chitra API in production mode on {args.host}:{args.port} with {args.workers} workers")
@@ -52,7 +54,9 @@ def main():
             port=args.port,
             workers=args.workers,
             log_level=args.log_level,
-            access_log=True
+            access_log=True,
+            timeout_keep_alive=300,  # 5 minutes for large uploads
+            limit_concurrency=100
         )
 
 

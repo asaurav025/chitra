@@ -14,6 +14,8 @@ from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
 import aiosqlite
 import asyncio
@@ -104,6 +106,32 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan
 )
+
+# Size limit middleware for large file uploads
+class MaxUploadSizeMiddleware(BaseHTTPMiddleware):
+    """Middleware to limit upload size and prevent memory issues."""
+    MAX_SIZE = 5 * 1024 * 1024 * 1024  # 5GB default
+    
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "POST" and "/api/photos/upload" in str(request.url):
+            content_length = request.headers.get("content-length")
+            if content_length:
+                try:
+                    size = int(content_length)
+                    if size > self.MAX_SIZE:
+                        return JSONResponse(
+                            {
+                                "error": f"File too large. Maximum size: {self.MAX_SIZE / (1024**3):.1f}GB",
+                                "max_size": self.MAX_SIZE,
+                                "received_size": size
+                            },
+                            status_code=413
+                        )
+                except (ValueError, TypeError):
+                    pass  # Invalid content-length, let it proceed
+        return await call_next(request)
+
+app.add_middleware(MaxUploadSizeMiddleware)
 
 # CORS middleware
 app.add_middleware(
@@ -328,12 +356,27 @@ async def list_photos(
 ):
     """List photos with pagination, sorted by date (newest first)."""
     cur = await conn.cursor()
+    
+    # Get total count
+    await cur.execute("SELECT COUNT(*) FROM photos")
+    total = (await cur.fetchone())[0]
+    
     # Sort by exif_datetime if available, otherwise created_at, newest first
+    # Normalize EXIF dates (YYYY:MM:DD HH:MM:SS -> YYYY-MM-DDTHH:MM:SS) for proper sorting
     await cur.execute(
         """
         SELECT * FROM photos 
         ORDER BY 
-            COALESCE(NULLIF(exif_datetime, ''), created_at) DESC,
+            CASE 
+                WHEN exif_datetime != '' AND exif_datetime IS NOT NULL THEN
+                    -- Normalize EXIF format: YYYY:MM:DD HH:MM:SS -> YYYY-MM-DDTHH:MM:SS
+                    -- Extract date parts and time part, then combine with proper separators
+                    SUBSTR(exif_datetime, 1, 4) || '-' || 
+                    SUBSTR(exif_datetime, 6, 2) || '-' || 
+                    SUBSTR(exif_datetime, 9, 2) || 'T' || 
+                    SUBSTR(exif_datetime, 12)
+                ELSE created_at
+            END DESC,
             id DESC
         LIMIT ? OFFSET ?
         """,
@@ -342,7 +385,7 @@ async def list_photos(
     rows = await cur.fetchall()
     
     items = [PhotoResponse(**row_to_photo_dto(dict(row))) for row in rows]
-    return PhotoListResponse(items=items, limit=limit, offset=offset)
+    return PhotoListResponse(items=items, limit=limit, offset=offset, total=total)
 
 
 @app.get("/api/photos/{photo_id}")
@@ -626,27 +669,59 @@ async def upload_photos(
     if not files:
         raise HTTPException(status_code=400, detail="no_files")
     
-    # Read all file data upfront
-    file_data_list = []
-    for file in files:
-        if not file.filename:
-            continue
-        file_data = await file.read()
-        file_data_list.append((file.filename, file_data))
-    
-    if not file_data_list:
+    # Filter out files without filenames
+    valid_files = [f for f in files if f.filename]
+    if not valid_files:
         raise HTTPException(status_code=400, detail="no_valid_files")
     
-    async def upload_single_file_async(filename: str, file_data: bytes) -> Dict[str, Any]:
-        """Upload a single file asynchronously."""
+    async def upload_single_file_streaming(file: UploadFile) -> Dict[str, Any]:
+        """Upload a single file asynchronously using streaming to avoid loading entire file into memory."""
+        filename = file.filename
+        if not filename:
+            return {"error": "No filename provided"}
+        
         tmp_path = None
         thumb_file_path = None
         try:
+            # Stream file directly to temporary file (avoids loading entire file into memory)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix) as tmp:
+                # Stream in chunks to avoid memory issues
+                chunk_size = 1024 * 1024  # 1MB chunks
+                while chunk := await file.read(chunk_size):
+                    tmp.write(chunk)
+                tmp_path = tmp.name
+            
+            # Reset file pointer for potential reuse (though we won't reuse it)
+            await file.seek(0)
+            
+            # Collect metadata first to check for duplicates
+            # Run metadata collection in thread pool (I/O and CPU-bound)
+            loop = asyncio.get_event_loop()
+            meta = await loop.run_in_executor(None, collect_metadata, Path(tmp_path))
+            
             async with db_async.connect_async(DB_PATH) as conn:
+                # Check for duplicate by checksum BEFORE uploading to MinIO
+                if meta.get('checksum'):
+                    cur = await conn.cursor()
+                    await cur.execute(
+                        "SELECT id, file_path FROM photos WHERE checksum = ?",
+                        (meta['checksum'],)
+                    )
+                    existing_photo = await cur.fetchone()
+                    if existing_photo:
+                        # Duplicate found - skip upload and return existing photo info
+                        return {
+                            "id": existing_photo["id"],
+                            "file_path": existing_photo["file_path"],
+                            "duplicate": True,
+                            "message": f"Duplicate photo detected (same checksum as photo #{existing_photo['id']})"
+                        }
+                
+                # No duplicate found - proceed with upload
                 # Upload to MinIO storage
                 remote_path = storage.generate_photo_path(filename)
                 
-                # Ensure uniqueness - check database first
+                # Ensure path uniqueness - check database first
                 counter = 1
                 base_path = remote_path
                 cur = await conn.cursor()
@@ -664,18 +739,14 @@ async def upload_photos(
                     remote_path = f"{path_obj.parent}/{name}_{counter}{ext}"
                     counter += 1
                 
-                # Upload to MinIO
-                stored_path = await storage.upload_file_async(file_data, remote_path)
+                # Upload to MinIO directly from temp file (avoids loading entire file into memory)
+                # Check if file is empty
+                if os.path.getsize(tmp_path) == 0:
+                    return {"error": f"Empty file: {filename}"}
                 
-                # Process metadata using temporary file
-                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix) as tmp:
-                    tmp.write(file_data)
-                    tmp_path = tmp.name
+                # Upload directly from file path for large files
+                stored_path = await storage.upload_file_from_path_async(tmp_path, remote_path)
                 
-                # Collect metadata
-                # Run metadata collection in thread pool (I/O and CPU-bound)
-                loop = asyncio.get_event_loop()
-                meta = await loop.run_in_executor(None, collect_metadata, Path(tmp_path))
                 # Store MinIO path
                 meta['file_path'] = stored_path
                 await db_async.upsert_photo_async(conn, **meta)
@@ -729,7 +800,7 @@ async def upload_photos(
         except Exception as e:
             import traceback
             error_msg = f"Upload failed for {filename}: {str(e)}"
-            print(f"Error in upload_single_file_async: {error_msg}")
+            print(f"Error in upload_single_file_streaming: {error_msg}")
             print(traceback.format_exc())
             return {"error": error_msg}
         finally:
@@ -747,38 +818,51 @@ async def upload_photos(
     
     # Upload files in parallel (max 5 concurrent uploads)
     saved = []
+    duplicates = []
     errors = []
     
-    # For single file, process directly
-    if len(file_data_list) == 1:
-        filename, file_data = file_data_list[0]
+    # Process files (streaming, handles large files efficiently)
+    if len(valid_files) == 1:
+        # Single file
         try:
-            result = await upload_single_file_async(filename, file_data)
+            result = await upload_single_file_streaming(valid_files[0])
             if "error" in result:
                 raise HTTPException(status_code=500, detail=result["error"])
-            saved.append(result)
+            if result.get("duplicate"):
+                duplicates.append(result)
+            else:
+                saved.append(result)
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Exception uploading {filename}: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Exception uploading {valid_files[0].filename}: {str(e)}")
     else:
         # Multiple files: use asyncio.gather for parallel processing
-        tasks = [
-            upload_single_file_async(filename, file_data)
-            for filename, file_data in file_data_list
-        ]
+        # Limit concurrent uploads to avoid overwhelming system
+        semaphore = asyncio.Semaphore(3)  # Max 3 concurrent uploads for large files
+        
+        async def upload_with_semaphore(file: UploadFile):
+            async with semaphore:
+                return await upload_single_file_streaming(file)
+        
+        tasks = [upload_with_semaphore(file) for file in valid_files]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        for result in results:
+        for file, result in zip(valid_files, results):
+            filename = file.filename or "unknown"
             if isinstance(result, Exception):
-                errors.append(f"Exception: {str(result)}")
+                errors.append(f"{filename}: Exception: {str(result)}")
             elif "error" in result:
-                errors.append(result["error"])
+                errors.append(f"{filename}: {result['error']}")
+            elif result.get("duplicate"):
+                duplicates.append(result)
             else:
                 saved.append(result)
     
     # Return results
     response = {"saved": saved}
+    if duplicates:
+        response["duplicates"] = duplicates
     if errors:
         response["errors"] = errors
     
@@ -1280,6 +1364,7 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
 async def search_photos(
     q: Optional[str] = Query(None, alias="query"),
     limit: int = Query(20, ge=1, le=100),
+    min_score: float = Query(0.2, ge=0.0, le=1.0, description="Minimum similarity score (0.0-1.0)"),
     conn: aiosqlite.Connection = Depends(get_db_async),
     embedder: ClipEmbedder = Depends(get_embedder)
 ):
@@ -1313,7 +1398,16 @@ async def search_photos(
     mat = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
     
     sims = mat @ q_vec
-    idx = np.argsort(-sims)[:limit]
+    
+    # Filter by minimum score and get top results
+    valid_indices = np.where(sims >= min_score)[0]
+    if len(valid_indices) == 0:
+        return {"results": []}
+    
+    # Sort valid results by similarity (descending)
+    sorted_valid = valid_indices[np.argsort(-sims[valid_indices])]
+    # Take top limit results
+    idx = sorted_valid[:limit]
     
     cur = await conn.cursor()
     results = []
