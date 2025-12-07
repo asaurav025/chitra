@@ -211,15 +211,54 @@ async def root() -> RootResponse:
 # -----------------------------------------------------------------------------
 
 def row_to_photo_dto(row) -> Dict[str, Any]:
-    """Convert database row to photo DTO."""
+    """Convert database row to photo DTO, normalizing date formats."""
+    from datetime import datetime
+    
+    # Normalize exif_datetime format (EXIF uses "YYYY:MM:DD HH:MM:SS")
+    exif_dt = row.get("exif_datetime") or ""
+    if exif_dt:
+        try:
+            # EXIF format: "2025:12:07 10:30:45" -> ISO: "2025-12-07T10:30:45"
+            if ":" in exif_dt and " " in exif_dt:
+                # Replace first two colons with dashes, space with T
+                parts = exif_dt.split(" ", 1)
+                if len(parts) == 2:
+                    date_part = parts[0].replace(":", "-", 2)  # "2025:12:07" -> "2025-12-07"
+                    time_part = parts[1]  # "10:30:45"
+                    exif_dt = f"{date_part}T{time_part}"
+                    # Validate by parsing
+                    datetime.fromisoformat(exif_dt)
+                else:
+                    exif_dt = ""
+            elif not exif_dt.strip():
+                exif_dt = ""
+        except (ValueError, AttributeError, IndexError):
+            # If invalid, set to empty
+            exif_dt = ""
+    
+    # Normalize created_at to ISO format if not already
+    created_at = row.get("created_at") or ""
+    if created_at:
+        try:
+            # If it already has T, assume it's ISO-like
+            if "T" not in created_at and " " in created_at:
+                # Convert space to T: "2025-12-07 10:30:45" -> "2025-12-07T10:30:45"
+                created_at = created_at.replace(" ", "T", 1)
+            # Validate by parsing
+            datetime.fromisoformat(created_at)
+        except (ValueError, AttributeError):
+            # If invalid, keep original or set to empty
+            if not created_at.strip():
+                created_at = ""
+    
     return {
         "id": row["id"],
         "file_path": row["file_path"],
         "size": row["size"],
-        "created_at": row["created_at"],
+        "created_at": created_at,
         "checksum": row["checksum"],
         "phash": row["phash"],
-        "exif_datetime": row["exif_datetime"],
+        "exif_datetime": exif_dt,
         "latitude": row["latitude"],
         "longitude": row["longitude"],
         "thumb_path": row.get("thumb_path"),
@@ -287,10 +326,17 @@ async def list_photos(
     offset: int = Query(0, ge=0),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
-    """List photos with pagination."""
+    """List photos with pagination, sorted by date (newest first)."""
     cur = await conn.cursor()
+    # Sort by exif_datetime if available, otherwise created_at, newest first
     await cur.execute(
-        """SELECT * FROM photos ORDER BY id DESC LIMIT ? OFFSET ?""",
+        """
+        SELECT * FROM photos 
+        ORDER BY 
+            COALESCE(NULLIF(exif_datetime, ''), created_at) DESC,
+            id DESC
+        LIMIT ? OFFSET ?
+        """,
         (limit, offset),
     )
     rows = await cur.fetchall()
@@ -313,6 +359,68 @@ async def get_photo(
         raise HTTPException(status_code=404, detail="photo_not_found")
     
     return PhotoResponse(**row_to_photo_dto(dict(row)))
+
+
+@app.delete("/api/photos/{photo_id}")
+async def delete_photo(
+    photo_id: int,
+    conn: aiosqlite.Connection = Depends(get_db_async),
+    storage: MinIOStorageClient = Depends(get_storage_client)
+):
+    """Delete a photo and all related data."""
+    cur = await conn.cursor()
+    
+    # Get photo details before deletion
+    await cur.execute("SELECT file_path, thumb_path FROM photos WHERE id=?", (photo_id,))
+    row = await cur.fetchone()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="photo_not_found")
+    
+    file_path = row["file_path"]
+    thumb_path = row["thumb_path"] if row["thumb_path"] else None
+    
+    # Get face thumbnails for this photo before deletion
+    face_thumb_paths = []
+    await cur.execute(
+        """
+        SELECT ft.thumb_path 
+        FROM face_thumbs ft
+        JOIN faces f ON ft.face_id = f.id
+        WHERE f.photo_id = ?
+        """,
+        (photo_id,)
+    )
+    face_thumb_rows = await cur.fetchall()
+    for face_row in face_thumb_rows:
+        if face_row["thumb_path"]:
+            face_thumb_paths.append(face_row["thumb_path"])
+    
+    # Delete files from MinIO storage
+    try:
+        # Delete original photo file
+        if file_path:
+            await storage.delete_file_async(file_path)
+        
+        # Delete photo thumbnail if it exists
+        if thumb_path:
+            await storage.delete_file_async(thumb_path)
+        
+        # Delete face thumbnails
+        for face_thumb_path in face_thumb_paths:
+            try:
+                await storage.delete_file_async(face_thumb_path)
+            except Exception as e:
+                print(f"Warning: Failed to delete face thumbnail '{face_thumb_path}': {e}")
+    except Exception as e:
+        # Log error but continue with database deletion
+        print(f"Warning: Failed to delete some files from storage for photo {photo_id}: {e}")
+    
+    # Delete from database (CASCADE will handle related records: tags, embeddings, clusters, faces, face_thumbs)
+    await cur.execute("DELETE FROM photos WHERE id=?", (photo_id,))
+    await conn.commit()
+    
+    return {"message": "Photo deleted successfully", "photo_id": photo_id}
 
 
 @app.get("/api/photos/{photo_id}/image")
@@ -432,6 +540,68 @@ async def get_photo_thumbnail(
         media_type='image/jpeg',
         headers={"Cache-Control": "public, max-age=86400"}
     )
+
+
+@app.delete("/api/photos/{photo_id}")
+async def delete_photo(
+    photo_id: int,
+    conn: aiosqlite.Connection = Depends(get_db_async),
+    storage: MinIOStorageClient = Depends(get_storage_client)
+):
+    """Delete a photo and all related data."""
+    cur = await conn.cursor()
+    
+    # Get photo details before deletion
+    await cur.execute("SELECT file_path, thumb_path FROM photos WHERE id=?", (photo_id,))
+    row = await cur.fetchone()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="photo_not_found")
+    
+    file_path = row["file_path"]
+    thumb_path = row["thumb_path"] if row["thumb_path"] else None
+    
+    # Get face thumbnails for this photo before deletion
+    face_thumb_paths = []
+    await cur.execute(
+        """
+        SELECT ft.thumb_path 
+        FROM face_thumbs ft
+        JOIN faces f ON ft.face_id = f.id
+        WHERE f.photo_id = ?
+        """,
+        (photo_id,)
+    )
+    face_thumb_rows = await cur.fetchall()
+    for face_row in face_thumb_rows:
+        if face_row["thumb_path"]:
+            face_thumb_paths.append(face_row["thumb_path"])
+    
+    # Delete files from MinIO storage
+    try:
+        # Delete original photo file
+        if file_path:
+            await storage.delete_file_async(file_path)
+        
+        # Delete photo thumbnail if it exists
+        if thumb_path:
+            await storage.delete_file_async(thumb_path)
+        
+        # Delete face thumbnails
+        for face_thumb_path in face_thumb_paths:
+            try:
+                await storage.delete_file_async(face_thumb_path)
+            except Exception as e:
+                print(f"Warning: Failed to delete face thumbnail '{face_thumb_path}': {e}")
+    except Exception as e:
+        # Log error but continue with database deletion
+        print(f"Warning: Failed to delete some files from storage for photo {photo_id}: {e}")
+    
+    # Delete from database (CASCADE will handle related records: tags, embeddings, clusters, faces, face_thumbs)
+    await cur.execute("DELETE FROM photos WHERE id=?", (photo_id,))
+    await conn.commit()
+    
+    return {"message": "Photo deleted successfully", "photo_id": photo_id}
 
 
 @app.post("/api/photos/upload")

@@ -259,7 +259,7 @@ def faces_detect(
                     crop = img.crop((x, y, x + w, y + h))
                     crop = crop.resize((thumb_size, thumb_size))
                     thumb_path = faces_root / f"face_{face_id}.jpg"
-                    crop.save(thumb_path, "JPEG", quality=90)
+                    crop.save(thumb_path, "JPEG", quality=100)
                     db.set_face_thumb(conn, face_id, str(thumb_path))
 
                     face_count += 1
@@ -683,7 +683,7 @@ def export(
                 img = load_image(fp)
                 img.thumbnail((320, 320))
                 thumb_abs_path.parent.mkdir(parents=True, exist_ok=True)
-                img.save(thumb_abs_path, "JPEG", quality=85)
+                img.save(thumb_abs_path, "JPEG", quality=100)
             except Exception as e:
                 print(f"[red]Failed thumb[/red] {file_path}: {e}")
                 continue

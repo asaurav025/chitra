@@ -17,7 +17,7 @@ def ensure_thumb(src_path: str, thumb_path: str, size=(256, 256)):
         # Ensure parent directory exists
         thumb_path_obj = Path(thumb_path)
         thumb_path_obj.parent.mkdir(parents=True, exist_ok=True)
-        img.save(thumb_path, "JPEG", quality=85)
+        img.save(thumb_path, "JPEG", quality=100)
         # Verify file was created
         if not Path(thumb_path).exists():
             raise Exception(f"Thumbnail file was not created at {thumb_path}")

@@ -227,7 +227,7 @@ def process_photo_faces_job(photo_id: int, file_path: str, db_path: str, min_sco
                     
                     # Save to temporary file, then upload to MinIO
                     with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as thumb_tmp:
-                        crop.save(thumb_tmp.name, "JPEG", quality=90)
+                        crop.save(thumb_tmp.name, "JPEG", quality=100)
                         with open(thumb_tmp.name, 'rb') as f:
                             thumb_data = f.read()
                     
@@ -375,7 +375,7 @@ def _process_single_face(pid: int, file_path: str, db_path: str, min_score: floa
                     
                     # Save to temporary file, then upload to MinIO
                     with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as thumb_tmp:
-                        crop.save(thumb_tmp.name, "JPEG", quality=90)
+                        crop.save(thumb_tmp.name, "JPEG", quality=100)
                         with open(thumb_tmp.name, 'rb') as f:
                             thumb_data = f.read()
                     

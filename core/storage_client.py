@@ -168,6 +168,11 @@ class MinIOStorageClient:
             print(f"Failed to delete file '{remote_path}': {e}")
             return False
     
+    async def delete_file_async(self, remote_path: str) -> bool:
+        """Delete file from MinIO (async)."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.delete_file, remote_path)
+    
     def generate_presigned_url(self, remote_path: str, expires_seconds: int = 3600) -> str:
         """
         Generate pre-signed URL for temporary access.
