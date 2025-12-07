@@ -500,7 +500,7 @@ async def get_photo_image(
             return Response(
                 content=img_io.read(),
                 media_type='image/jpeg',
-                headers={"Cache-Control": "public, max-age=86400"}
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"failed_to_convert: {str(e)}")
@@ -519,7 +519,7 @@ async def get_photo_image(
     return Response(
         content=file_data,
         media_type=mimetype,
-        headers={"Cache-Control": "public, max-age=86400"}
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
     )
 
 
@@ -570,7 +570,7 @@ async def get_photo_thumbnail(
     return Response(
         content=thumb_data,
         media_type='image/jpeg',
-        headers={"Cache-Control": "public, max-age=86400"}
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
     )
 
 
@@ -1643,7 +1643,7 @@ async def get_face_thumbnail(
     return Response(
         content=thumb_data,
         media_type='image/jpeg',
-        headers={"Cache-Control": "public, max-age=86400"}
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
     )
 
 
