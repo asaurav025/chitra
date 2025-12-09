@@ -62,6 +62,11 @@ export RELOAD=false  # Set to 'true' for development
 
 # Redis Configuration (optional, for background jobs)
 export REDIS_URL=redis://localhost:6379/0
+
+# Authentication Configuration (required for production)
+export JWT_SECRET_KEY=your-secret-key-change-in-production  # Use a strong random secret
+export JWT_ALGORITHM=HS256
+export JWT_ACCESS_TOKEN_EXPIRE_MINUTES=1440  # 24 hours
 ```
 
 ## Running the Service

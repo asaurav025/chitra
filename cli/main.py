@@ -11,13 +11,14 @@ from rich import print
 from rich.table import Table
 from tqdm import tqdm
 
-from core import db
+from core import db, db_async, auth
 from core.extractor import iter_images, collect_metadata, load_image
 from core.embedder import ClipEmbedder
 from core.tagger import auto_tags
 from core.cluster import threshold_clusters
 from core.gallery import build_gallery
 from core.face import face_encodings
+import asyncio
 
 app = typer.Typer(add_completion=False, help="Chitra — Photo Intelligence CLI")
 
@@ -29,7 +30,45 @@ app = typer.Typer(add_completion=False, help="Chitra — Photo Intelligence CLI"
 def init(db_path: str = typer.Option("photo.db", "--db", help="SQLite database path")):
     """Create / migrate the database schema."""
     db.init_db(db_path)
+    # Also initialize async schema (includes users table)
+    asyncio.run(db_async.init_db_async(db_path))
     print(f"[green]Initialized[/green] SQLite at {db_path}")
+
+
+@app.command("create-admin")
+def create_admin(
+    username: str = typer.Option(..., "--username", "-u", help="Admin username"),
+    password: str = typer.Option(..., "--password", "-p", help="Admin password"),
+    email: str = typer.Option(None, "--email", "-e", help="Admin email (optional)"),
+    db_path: str = typer.Option("photo.db", "--db", help="SQLite database path"),
+):
+    """Create an admin user (auto-whitelisted)."""
+    async def _create_admin():
+        async with db_async.connect_async(db_path) as conn:
+            # Check if user already exists
+            existing = await db_async.get_user_by_username_async(conn, username)
+            if existing:
+                print(f"[red]User '{username}' already exists![/red]")
+                raise typer.Exit(code=1)
+            
+            # Hash password
+            password_hash = auth.hash_password(password)
+            
+            # Create admin user (auto-whitelisted)
+            user_id = await db_async.create_user_async(
+                conn,
+                username=username,
+                password_hash=password_hash,
+                email=email,
+                role="admin",
+                auto_whitelist=True
+            )
+            
+            print(f"[green]Admin user '{username}' created successfully![/green]")
+            print(f"[dim]User ID: {user_id}[/dim]")
+            print(f"[dim]Role: admin (auto-whitelisted)[/dim]")
+    
+    asyncio.run(_create_admin())
 
 
 # ---------------------------------------------------------------------------

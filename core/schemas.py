@@ -233,3 +233,75 @@ class ErrorResponse(BaseModel):
     error: str = Field(..., description="Error message")
     detail: Optional[str] = Field(None, description="Error detail")
 
+
+# -----------------------------------------------------------------------------
+# AUTHENTICATION SCHEMAS
+# -----------------------------------------------------------------------------
+
+class UserCreateRequest(BaseModel):
+    """Request model for user registration."""
+    username: str = Field(..., min_length=3, max_length=50, description="Username (3-50 characters)")
+    email: Optional[str] = Field(None, description="Email address (optional)")
+    password: str = Field(..., min_length=8, description="Password (minimum 8 characters)")
+
+
+class UserLoginRequest(BaseModel):
+    """Request model for user login."""
+    username: str = Field(..., description="Username")
+    password: str = Field(..., description="Password")
+
+
+class UserResponse(BaseModel):
+    """User response model."""
+    id: int = Field(..., description="User ID")
+    username: str = Field(..., description="Username")
+    email: Optional[str] = Field(None, description="Email address")
+    role: str = Field(..., description="User role (admin or user)")
+    is_active: bool = Field(..., description="Whether account is active")
+    is_whitelisted: bool = Field(..., description="Whether user is whitelisted")
+    whitelisted_at: Optional[str] = Field(None, description="When user was whitelisted")
+    created_at: Optional[str] = Field(None, description="Account creation timestamp")
+    last_login: Optional[str] = Field(None, description="Last login timestamp")
+
+    class Config:
+        from_attributes = True
+
+
+class TokenResponse(BaseModel):
+    """Response model for authentication token."""
+    access_token: str = Field(..., description="JWT access token")
+    token_type: str = Field(default="bearer", description="Token type")
+    user: UserResponse = Field(..., description="User information")
+
+
+class RegisterResponse(BaseModel):
+    """Response model for user registration."""
+    message: str = Field(..., description="Registration status message")
+    username: str = Field(..., description="Registered username")
+    status: str = Field(default="pending_approval", description="Account status")
+
+
+class PendingUserResponse(BaseModel):
+    """Response for pending approval users."""
+    id: int = Field(..., description="User ID")
+    username: str = Field(..., description="Username")
+    email: Optional[str] = Field(None, description="Email address")
+    created_at: str = Field(..., description="Account creation timestamp")
+    status: str = Field(default="pending_approval", description="Account status")
+
+
+class UserListResponse(BaseModel):
+    """Response for user list."""
+    users: List[UserResponse] = Field(..., description="List of users")
+    pending_count: int = Field(default=0, description="Count of pending users")
+
+
+class WhitelistUserRequest(BaseModel):
+    """Request to whitelist a user."""
+    user_id: int = Field(..., description="User ID to whitelist")
+
+
+class UpdateUserRoleRequest(BaseModel):
+    """Request to update user role."""
+    role: str = Field(..., description="New role (admin or user)")
+

@@ -149,6 +149,26 @@ async def init_db_async(db_path: str = DB_DEFAULT_PATH) -> None:
             """
         )
 
+        # Users (authentication)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('admin', 'user')),
+                is_active BOOLEAN DEFAULT 1,
+                is_whitelisted BOOLEAN DEFAULT 0,
+                whitelisted_at TEXT,
+                whitelisted_by INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_login TEXT,
+                FOREIGN KEY(whitelisted_by) REFERENCES users(id)
+            )
+            """
+        )
+
         # Indexes
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_checksum ON photos(checksum)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_path ON photos(file_path)")
@@ -156,12 +176,29 @@ async def init_db_async(db_path: str = DB_DEFAULT_PATH) -> None:
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_photo ON tags(photo_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_whitelisted ON users(is_whitelisted)")
 
         # Migration: Add thumb_path column if it doesn't exist
         try:
             await conn.execute("ALTER TABLE photos ADD COLUMN thumb_path TEXT")
         except aiosqlite.OperationalError:
             # Column already exists, ignore
+            pass
+
+        # Migration: Add users table columns if they don't exist (for existing databases)
+        try:
+            await conn.execute("ALTER TABLE users ADD COLUMN is_whitelisted BOOLEAN DEFAULT 0")
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await conn.execute("ALTER TABLE users ADD COLUMN whitelisted_at TEXT")
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await conn.execute("ALTER TABLE users ADD COLUMN whitelisted_by INTEGER")
+        except aiosqlite.OperationalError:
             pass
 
         await conn.commit()
@@ -537,3 +574,168 @@ async def delete_persons_without_faces_async(conn: aiosqlite.Connection) -> int:
     deleted_count = cursor.rowcount
     await conn.commit()
     return deleted_count
+
+
+# ----------------------------------------------------------------------
+# USERS (AUTHENTICATION) (ASYNC)
+# ----------------------------------------------------------------------
+async def create_user_async(
+    conn: aiosqlite.Connection,
+    username: str,
+    password_hash: str,
+    email: Optional[str] = None,
+    role: str = "user",
+    auto_whitelist: bool = False
+) -> int:
+    """
+    Create a new user.
+    
+    Args:
+        conn: Database connection
+        username: Username (must be unique)
+        password_hash: Hashed password
+        email: Optional email address
+        role: User role ('admin' or 'user')
+        auto_whitelist: If True, automatically whitelist the user (for first admin)
+    
+    Returns:
+        User ID
+    """
+    is_whitelisted = 1 if (auto_whitelist or role == "admin") else 0
+    whitelisted_at = None
+    if is_whitelisted:
+        from datetime import datetime
+        whitelisted_at = datetime.utcnow().isoformat()
+    
+    async with conn.execute(
+        """
+        INSERT INTO users (username, email, password_hash, role, is_whitelisted, whitelisted_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (username, email, password_hash, role, is_whitelisted, whitelisted_at)
+    ) as cur:
+        await conn.commit()
+        return cur.lastrowid
+
+
+async def get_user_by_username_async(
+    conn: aiosqlite.Connection,
+    username: str
+) -> Optional[sqlite3.Row]:
+    """Get user by username."""
+    async with conn.execute(
+        "SELECT * FROM users WHERE username = ?",
+        (username,)
+    ) as cur:
+        return await cur.fetchone()
+
+
+async def get_user_by_id_async(
+    conn: aiosqlite.Connection,
+    user_id: int
+) -> Optional[sqlite3.Row]:
+    """Get user by ID."""
+    async with conn.execute(
+        "SELECT * FROM users WHERE id = ?",
+        (user_id,)
+    ) as cur:
+        return await cur.fetchone()
+
+
+async def update_last_login_async(
+    conn: aiosqlite.Connection,
+    user_id: int
+) -> None:
+    """Update user's last login timestamp."""
+    from datetime import datetime
+    await conn.execute(
+        "UPDATE users SET last_login = ? WHERE id = ?",
+        (datetime.utcnow().isoformat(), user_id)
+    )
+    await conn.commit()
+
+
+async def get_pending_users_async(conn: aiosqlite.Connection) -> List[sqlite3.Row]:
+    """Get all users waiting for whitelist approval."""
+    async with conn.execute(
+        "SELECT * FROM users WHERE is_whitelisted = 0 AND is_active = 1 ORDER BY created_at ASC"
+    ) as cur:
+        rows = await cur.fetchall()
+    return rows
+
+
+async def whitelist_user_async(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    whitelisted_by: int
+) -> None:
+    """Whitelist a user (admin action)."""
+    from datetime import datetime
+    await conn.execute(
+        """
+        UPDATE users 
+        SET is_whitelisted = 1,
+            whitelisted_at = ?,
+            whitelisted_by = ?
+        WHERE id = ?
+        """,
+        (datetime.utcnow().isoformat(), whitelisted_by, user_id)
+    )
+    await conn.commit()
+
+
+async def unwhitelist_user_async(conn: aiosqlite.Connection, user_id: int) -> None:
+    """Remove user from whitelist."""
+    await conn.execute(
+        """
+        UPDATE users 
+        SET is_whitelisted = 0, 
+            whitelisted_at = NULL, 
+            whitelisted_by = NULL 
+        WHERE id = ?
+        """,
+        (user_id,)
+    )
+    await conn.commit()
+
+
+async def list_users_async(
+    conn: aiosqlite.Connection,
+    include_pending: bool = False
+) -> List[sqlite3.Row]:
+    """List users, optionally including pending (non-whitelisted) ones."""
+    if include_pending:
+        async with conn.execute(
+            "SELECT * FROM users ORDER BY created_at DESC"
+        ) as cur:
+            rows = await cur.fetchall()
+    else:
+        async with conn.execute(
+            "SELECT * FROM users WHERE is_whitelisted = 1 ORDER BY created_at DESC"
+        ) as cur:
+            rows = await cur.fetchall()
+    return rows
+
+
+async def update_user_role_async(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    role: str
+) -> None:
+    """Update user role."""
+    if role not in ("admin", "user"):
+        raise ValueError("Role must be 'admin' or 'user'")
+    await conn.execute(
+        "UPDATE users SET role = ? WHERE id = ?",
+        (role, user_id)
+    )
+    await conn.commit()
+
+
+async def deactivate_user_async(conn: aiosqlite.Connection, user_id: int) -> None:
+    """Deactivate a user account."""
+    await conn.execute(
+        "UPDATE users SET is_active = 0 WHERE id = ?",
+        (user_id,)
+    )
+    await conn.commit()

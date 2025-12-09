@@ -11,9 +11,10 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Optional
 from pathlib import Path
 
-from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Body
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Body, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
@@ -34,8 +35,12 @@ from core.schemas import (
     JobStatusResponse, SearchResultsResponse, ScanPathResponse,
     UploadPhotosResponse, HealthResponse, RootResponse, StatusResponse,
     ClusterFacesResponse, IndexJobResponse, FaceIndexJobResponse,
-    PersonFacesResponse
+    PersonFacesResponse,
+    UserCreateRequest, UserLoginRequest, UserResponse, TokenResponse,
+    RegisterResponse, PendingUserResponse, UserListResponse,
+    WhitelistUserRequest, UpdateUserRoleRequest
 )
+from core import auth
 from core.embedder import ClipEmbedder
 from core.extractor import collect_metadata, load_image, iter_images, RAW_EXTS, _normalize_exif_date
 from core.face import face_encodings
@@ -70,6 +75,9 @@ _EMBEDDER: ClipEmbedder | None = None
 
 # Database path
 DB_PATH = os.environ.get("CHITRA_DB_PATH", db_async.DB_DEFAULT_PATH)
+
+# OAuth2 scheme for token extraction
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
 @asynccontextmanager
@@ -136,13 +144,20 @@ class MaxUploadSizeMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(MaxUploadSizeMiddleware)
 
-# CORS middleware
+# CORS middleware - allow specific origins or all for development
+cors_origins = os.environ.get("CORS_ORIGINS", "*")
+if cors_origins == "*":
+    allowed_origins = ["*"]
+else:
+    allowed_origins = [origin.strip() for origin in cors_origins.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
@@ -176,6 +191,87 @@ def get_embedder() -> ClipEmbedder:
     if _EMBEDDER is None:
         _EMBEDDER = ClipEmbedder()
     return _EMBEDDER
+
+
+# -----------------------------------------------------------------------------
+# AUTHENTICATION DEPENDENCIES
+# -----------------------------------------------------------------------------
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    conn: aiosqlite.Connection = Depends(get_db_async)
+) -> aiosqlite.Row:
+    """Get current authenticated user from JWT token."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    payload = auth.verify_token(token)
+    if payload is None:
+        raise credentials_exception
+    
+    user_id_str: str = payload.get("sub")
+    if user_id_str is None:
+        raise credentials_exception
+    
+    try:
+        user_id = int(user_id_str)
+    except (ValueError, TypeError):
+        raise credentials_exception
+    
+    user = await db_async.get_user_by_id_async(conn, user_id)
+    if user is None:
+        raise credentials_exception
+    
+    return user
+
+
+async def get_current_active_user(
+    current_user: aiosqlite.Row = Depends(get_current_user)
+) -> aiosqlite.Row:
+    """Ensure user is active AND whitelisted."""
+    if not current_user["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is deactivated"
+        )
+    if not current_user["is_whitelisted"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account pending admin approval. Please contact an administrator."
+        )
+    return current_user
+
+
+async def require_admin(
+    current_user: aiosqlite.Row = Depends(get_current_active_user)
+) -> aiosqlite.Row:
+    """Require admin role."""
+    if current_user["role"] != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return current_user
+
+
+def row_to_user_dto(row: aiosqlite.Row) -> Dict[str, Any]:
+    """Convert database row to user DTO."""
+    # Convert sqlite3.Row to dict for .get() support
+    row_dict = dict(row)
+    return {
+        "id": row_dict["id"],
+        "username": row_dict["username"],
+        "email": row_dict.get("email"),
+        "role": row_dict["role"],
+        "is_active": bool(row_dict["is_active"]),
+        "is_whitelisted": bool(row_dict["is_whitelisted"]),
+        "whitelisted_at": row_dict.get("whitelisted_at"),
+        "created_at": row_dict.get("created_at"),
+        "last_login": row_dict.get("last_login"),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -238,12 +334,284 @@ async def root() -> RootResponse:
 
 
 # -----------------------------------------------------------------------------
+# AUTHENTICATION ENDPOINTS
+# -----------------------------------------------------------------------------
+
+@app.post("/api/auth/register", response_model=RegisterResponse)
+async def register(
+    data: UserCreateRequest,
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """Register a new user account (pending admin approval)."""
+    # Check if username already exists
+    existing_user = await db_async.get_user_by_username_async(conn, data.username)
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already registered"
+        )
+    
+    # Check if email already exists (if provided)
+    if data.email:
+        async with conn.execute(
+            "SELECT id FROM users WHERE email = ?",
+            (data.email,)
+        ) as cur:
+            existing_email = await cur.fetchone()
+        if existing_email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+    
+    # Hash password
+    password_hash = auth.hash_password(data.password)
+    
+    # Create user (not whitelisted by default)
+    try:
+        user_id = await db_async.create_user_async(
+            conn,
+            username=data.username,
+            password_hash=password_hash,
+            email=data.email,
+            role="user",
+            auto_whitelist=False
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create user: {str(e)}"
+        )
+    
+    return RegisterResponse(
+        message="Registration successful. Your account is pending admin approval.",
+        username=data.username,
+        status="pending_approval"
+    )
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """Login and get JWT access token."""
+    # Authenticate user
+    user = await auth.authenticate_user(conn, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Check if user is whitelisted
+    if not user["is_whitelisted"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account pending admin approval. Please contact an administrator."
+        )
+    
+    # Check if user is active
+    if not user["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is deactivated"
+        )
+    
+    # Update last login
+    await db_async.update_last_login_async(conn, user["id"])
+    
+    # Create access token (sub must be string for JWT standard)
+    access_token = auth.create_access_token(
+        data={"sub": str(user["id"]), "username": user["username"], "role": user["role"]}
+    )
+    
+    return TokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse(**row_to_user_dto(user))
+    )
+
+
+@app.get("/api/auth/me", response_model=UserResponse)
+async def get_current_user_info(
+    current_user: aiosqlite.Row = Depends(get_current_active_user)
+):
+    """Get current authenticated user information."""
+    return UserResponse(**row_to_user_dto(current_user))
+
+
+@app.post("/api/auth/logout")
+async def logout():
+    """Logout endpoint (client should discard token)."""
+    return {"message": "Logged out successfully"}
+
+
+# -----------------------------------------------------------------------------
+# ADMIN ENDPOINTS - USER MANAGEMENT
+# -----------------------------------------------------------------------------
+
+@app.get("/api/admin/users", response_model=UserListResponse)
+async def list_users(
+    include_pending: bool = Query(False, description="Include pending users"),
+    current_user: aiosqlite.Row = Depends(require_admin),
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """List all users (admin only)."""
+    users = await db_async.list_users_async(conn, include_pending=include_pending)
+    
+    # Get pending count
+    pending = await db_async.get_pending_users_async(conn)
+    pending_count = len(pending)
+    
+    return UserListResponse(
+        users=[UserResponse(**row_to_user_dto(u)) for u in users],
+        pending_count=pending_count
+    )
+
+
+@app.get("/api/admin/users/pending", response_model=List[PendingUserResponse])
+async def list_pending_users(
+    current_user: aiosqlite.Row = Depends(require_admin),
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """List all users pending whitelist approval (admin only)."""
+    pending = await db_async.get_pending_users_async(conn)
+    return [
+        PendingUserResponse(
+            id=u["id"],
+            username=u["username"],
+            email=u["email"],
+            created_at=u["created_at"] or "",
+            status="pending_approval"
+        )
+        for u in pending
+    ]
+
+
+@app.post("/api/admin/users/{user_id}/whitelist", response_model=UserResponse)
+async def whitelist_user_endpoint(
+    user_id: int,
+    current_user: aiosqlite.Row = Depends(require_admin),
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """Whitelist a user (admin only)."""
+    # Verify user exists
+    user = await db_async.get_user_by_id_async(conn, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    if user["is_whitelisted"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User is already whitelisted"
+        )
+    
+    # Whitelist user
+    await db_async.whitelist_user_async(conn, user_id, current_user["id"])
+    
+    # Return updated user
+    updated_user = await db_async.get_user_by_id_async(conn, user_id)
+    return UserResponse(**row_to_user_dto(updated_user))
+
+
+@app.post("/api/admin/users/{user_id}/unwhitelist", response_model=StatusResponse)
+async def unwhitelist_user_endpoint(
+    user_id: int,
+    current_user: aiosqlite.Row = Depends(require_admin),
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """Remove user from whitelist (admin only)."""
+    # Prevent unwhitelisting yourself
+    if user_id == current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot unwhitelist yourself"
+        )
+    
+    # Verify user exists
+    user = await db_async.get_user_by_id_async(conn, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    await db_async.unwhitelist_user_async(conn, user_id)
+    return StatusResponse(status="User removed from whitelist")
+
+
+@app.put("/api/admin/users/{user_id}/role", response_model=UserResponse)
+async def update_user_role_endpoint(
+    user_id: int,
+    data: UpdateUserRoleRequest,
+    current_user: aiosqlite.Row = Depends(require_admin),
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """Update user role (admin only)."""
+    # Prevent changing your own role
+    if user_id == current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot change your own role"
+        )
+    
+    # Verify user exists
+    user = await db_async.get_user_by_id_async(conn, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    await db_async.update_user_role_async(conn, user_id, data.role)
+    
+    # Return updated user
+    updated_user = await db_async.get_user_by_id_async(conn, user_id)
+    return UserResponse(**row_to_user_dto(updated_user))
+
+
+@app.post("/api/admin/users/{user_id}/deactivate", response_model=StatusResponse)
+async def deactivate_user_endpoint(
+    user_id: int,
+    current_user: aiosqlite.Row = Depends(require_admin),
+    conn: aiosqlite.Connection = Depends(get_db_async)
+):
+    """Deactivate a user account (admin only)."""
+    # Prevent deactivating yourself
+    if user_id == current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot deactivate yourself"
+        )
+    
+    # Verify user exists
+    user = await db_async.get_user_by_id_async(conn, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    await db_async.deactivate_user_async(conn, user_id)
+    return StatusResponse(status="User deactivated")
+
+
+# -----------------------------------------------------------------------------
 # HELPERS
 # -----------------------------------------------------------------------------
 
 def row_to_photo_dto(row) -> Dict[str, Any]:
     """Convert database row to photo DTO, normalizing date formats."""
     from datetime import datetime
+    
+    # Convert to dict if it's a Row object (for .get() support)
+    if hasattr(row, 'keys') and not isinstance(row, dict):
+        row = dict(row)
     
     # Normalize exif_datetime (should already be normalized, but handle legacy data)
     exif_dt = row.get("exif_datetime") or ""
@@ -343,6 +711,7 @@ async def ensure_photo_thumb_async(
 async def list_photos(
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """List photos with pagination, sorted by date (newest first)."""
@@ -382,6 +751,7 @@ async def list_photos(
 @app.get("/api/photos/{photo_id}")
 async def get_photo(
     photo_id: int,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Get photo details by ID."""
@@ -460,6 +830,7 @@ async def delete_photo(
 @app.get("/api/photos/{photo_id}/image")
 async def get_photo_image(
     photo_id: int,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async),
     storage: MinIOStorageClient = Depends(get_storage_client)
 ):
@@ -528,6 +899,7 @@ async def get_photo_image(
 @app.get("/api/photos/{photo_id}/thumbnail")
 async def get_photo_thumbnail(
     photo_id: int,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async),
     storage: MinIOStorageClient = Depends(get_storage_client)
 ):
@@ -576,73 +948,12 @@ async def get_photo_thumbnail(
     )
 
 
-@app.delete("/api/photos/{photo_id}")
-async def delete_photo(
-    photo_id: int,
-    conn: aiosqlite.Connection = Depends(get_db_async),
-    storage: MinIOStorageClient = Depends(get_storage_client)
-):
-    """Delete a photo and all related data."""
-    cur = await conn.cursor()
-    
-    # Get photo details before deletion
-    await cur.execute("SELECT file_path, thumb_path FROM photos WHERE id=?", (photo_id,))
-    row = await cur.fetchone()
-    
-    if not row:
-        raise HTTPException(status_code=404, detail="photo_not_found")
-    
-    file_path = row["file_path"]
-    thumb_path = row["thumb_path"] if row["thumb_path"] else None
-    
-    # Get face thumbnails for this photo before deletion
-    face_thumb_paths = []
-    await cur.execute(
-        """
-        SELECT ft.thumb_path 
-        FROM face_thumbs ft
-        JOIN faces f ON ft.face_id = f.id
-        WHERE f.photo_id = ?
-        """,
-        (photo_id,)
-    )
-    face_thumb_rows = await cur.fetchall()
-    for face_row in face_thumb_rows:
-        if face_row["thumb_path"]:
-            face_thumb_paths.append(face_row["thumb_path"])
-    
-    # Delete files from MinIO storage
-    try:
-        # Delete original photo file
-        if file_path:
-            await storage.delete_file_async(file_path)
-        
-        # Delete photo thumbnail if it exists
-        if thumb_path:
-            await storage.delete_file_async(thumb_path)
-        
-        # Delete face thumbnails
-        for face_thumb_path in face_thumb_paths:
-            try:
-                await storage.delete_file_async(face_thumb_path)
-            except Exception as e:
-                print(f"Warning: Failed to delete face thumbnail '{face_thumb_path}': {e}")
-    except Exception as e:
-        # Log error but continue with database deletion
-        print(f"Warning: Failed to delete some files from storage for photo {photo_id}: {e}")
-    
-    # Delete from database (CASCADE will handle related records: tags, embeddings, clusters, faces, face_thumbs)
-    await cur.execute("DELETE FROM photos WHERE id=?", (photo_id,))
-    await conn.commit()
-    
-    return {"message": "Photo deleted successfully", "photo_id": photo_id}
-
-
 @app.post("/api/photos/upload")
 async def upload_photos(
     files: Optional[List[UploadFile]] = File(None),
     file: Optional[UploadFile] = File(None),
     auto_process: bool = Form(True),
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     storage: MinIOStorageClient = Depends(get_storage_client)
 ):
     """Upload photos (supports multiple files).
@@ -907,6 +1218,7 @@ async def upload_photos(
 @app.post("/api/photos/scan-path")
 async def scan_path(
     data: ScanPathRequest,
+    current_user: aiosqlite.Row = Depends(require_admin),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Scan a directory path for photos and add them to the database."""
@@ -937,6 +1249,7 @@ async def scan_path(
 @app.get("/api/photos/{photo_id}/tags")
 async def get_photo_tags(
     photo_id: int,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Get tags for a photo."""
@@ -955,6 +1268,7 @@ async def get_photo_tags(
 async def add_photo_tags(
     photo_id: int,
     data: AddPhotoTagsRequest,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Add tags to a photo."""
@@ -987,6 +1301,7 @@ async def add_photo_tags(
 @app.post("/api/index/embeddings")
 async def index_embeddings(
     data: IndexEmbeddingsRequest,
+    current_user: aiosqlite.Row = Depends(require_admin),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Queue embedding indexing job."""
@@ -1033,6 +1348,7 @@ async def index_embeddings(
 @app.post("/api/index/faces")
 async def index_faces(
     data: IndexFacesRequest,
+    current_user: aiosqlite.Row = Depends(require_admin),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Queue face detection job."""
@@ -1071,6 +1387,7 @@ async def index_faces(
 @app.post("/api/index/faces-cluster")
 async def cluster_faces(
     data: ClusterFacesRequest,
+    current_user: aiosqlite.Row = Depends(require_admin),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Cluster faces into persons using HDBSCAN (queued as background job)."""
@@ -1495,7 +1812,10 @@ async def cluster_faces(
 # -----------------------------------------------------------------------------
 
 @app.get("/api/jobs/{job_id}")
-async def get_job_status(job_id: str) -> JobStatusResponse:
+async def get_job_status(
+    job_id: str,
+    current_user: aiosqlite.Row = Depends(get_current_active_user)
+) -> JobStatusResponse:
     """Get status of a background job."""
     try:
         queue = get_queue()
@@ -1525,6 +1845,7 @@ async def search_photos(
     q: Optional[str] = Query(None, alias="query"),
     limit: int = Query(20, ge=1, le=100),
     min_score: float = Query(0.2, ge=0.0, le=1.0, description="Minimum similarity score (0.0-1.0)"),
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async),
     embedder: ClipEmbedder = Depends(get_embedder)
 ):
@@ -1588,6 +1909,7 @@ async def search_photos(
 @app.get("/api/search/by-person")
 async def search_by_person(
     name: Optional[str] = Query(None, alias="q"),
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Search photos containing a specific person."""
@@ -1622,6 +1944,7 @@ async def search_by_person(
 @app.get("/api/faces/{face_id}/thumbnail")
 async def get_face_thumbnail(
     face_id: int,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async),
     storage: MinIOStorageClient = Depends(get_storage_client)
 ):
@@ -1665,6 +1988,7 @@ async def get_face_thumbnail(
 
 @app.get("/api/faces")
 async def list_faces(
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ) -> FaceListResponse:
     """List all faces with thumbnails."""
@@ -1688,6 +2012,7 @@ async def list_faces(
 async def assign_face_person(
     face_id: int,
     data: AssignFacePersonRequest,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Assign a person to a face and update matching index for future auto-matching."""
@@ -1755,6 +2080,7 @@ async def assign_face_person(
 
 @app.get("/api/persons")
 async def list_persons(
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """List all persons."""
@@ -1767,6 +2093,7 @@ async def list_persons(
 @app.post("/api/persons")
 async def create_person(
     data: CreatePersonRequest,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Create a new person."""
@@ -1783,6 +2110,7 @@ async def create_person(
 async def update_person(
     person_id: int,
     data: UpdatePersonRequest,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Update a person's name."""
@@ -1798,6 +2126,7 @@ async def update_person(
 @app.get("/api/persons/{person_id}/faces")
 async def get_person_faces(
     person_id: int,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Get face thumbnails for a specific person."""
@@ -1817,6 +2146,7 @@ async def get_person_faces(
 async def merge_persons_endpoint(
     target_person_id: int,
     data: MergePersonsRequest,
+    current_user: aiosqlite.Row = Depends(require_admin),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Merge source person into target person and queue FAISS index update job."""
@@ -1872,6 +2202,7 @@ async def merge_persons_endpoint(
 
 @app.post("/api/persons/rebuild-index")
 async def rebuild_faiss_index_endpoint(
+    current_user: aiosqlite.Row = Depends(require_admin),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Rebuild FAISS index from all persons with faces (queued as background job)."""
@@ -1897,6 +2228,7 @@ async def rebuild_faiss_index_endpoint(
 
 @app.post("/api/persons/cleanup")
 async def cleanup_persons_without_faces_endpoint(
+    current_user: aiosqlite.Row = Depends(require_admin),
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Delete all persons that have no faces assigned to them."""
@@ -1914,6 +2246,7 @@ async def cleanup_persons_without_faces_endpoint(
 @app.get("/api/storage/{file_path:path}")
 async def get_storage_file(
     file_path: str,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     storage: MinIOStorageClient = Depends(get_storage_client)
 ):
     """Generic endpoint to serve any file from MinIO storage."""
