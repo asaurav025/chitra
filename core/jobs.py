@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from core import db
+from core import video
 from core.embedder import ClipEmbedder
 from core.extractor import load_image
 from core.face import face_encodings
@@ -21,6 +22,14 @@ from core.tagger import auto_tags
 # Global instances (will be initialized per worker)
 _STORAGE_CLIENT = None
 _EMBEDDER = None
+
+
+def _is_video(conn, photo_id: int) -> bool:
+    """True if the photo row is a video (image-only ML jobs must skip these)."""
+    cur = conn.cursor()
+    cur.execute("SELECT media_type FROM photos WHERE id=?", (photo_id,))
+    row = cur.fetchone()
+    return bool(row and row["media_type"] == "video")
 
 
 def _auto_match_face_to_person(conn, face_id: int, face_embedding: np.ndarray, threshold: float = 0.75):
@@ -133,14 +142,17 @@ def process_photo_embedding_job(photo_id: int, file_path: str, db_path: str):
     """
     conn = db.connect(db_path)
     storage_client = _get_storage_client()
-    
+
     try:
+        if _is_video(conn, photo_id):
+            print(f"Skipping embedding for video photo {photo_id}")
+            return True
         # Download from MinIO to temporary file
         file_data = storage_client.download_file(file_path)
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
             tmp.write(file_data)
             tmp_path = tmp.name
-        
+
         try:
             em = _get_embedder()
             img_vec = em.image_embedding(tmp_path)
@@ -175,14 +187,17 @@ def process_photo_faces_job(photo_id: int, file_path: str, db_path: str, min_sco
     """
     conn = db.connect(db_path)
     storage_client = _get_storage_client()
-    
+
     try:
+        if _is_video(conn, photo_id):
+            print(f"Skipping face detection for video photo {photo_id}")
+            return 0
         # Download from MinIO to temporary file
         file_data = storage_client.download_file(file_path)
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
             tmp.write(file_data)
             tmp_path = tmp.name
-        
+
         try:
             faces = face_encodings(tmp_path)
             if not faces:
@@ -262,8 +277,11 @@ def _process_single_embedding(pid: int, file_path: str, db_path: str) -> bool:
     conn = db.connect(db_path)
     storage_client = _get_storage_client()
     em = _get_embedder()
-    
+
     try:
+        if _is_video(conn, pid):
+            print(f"Skipping embedding for video photo {pid}")
+            return False
         # Download from MinIO to temporary file
         file_data = storage_client.download_file(file_path)
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
@@ -324,14 +342,17 @@ def _process_single_face(pid: int, file_path: str, db_path: str, min_score: floa
     """Process faces for a single photo (used in parallel processing)."""
     conn = db.connect(db_path)
     storage_client = _get_storage_client()
-    
+
     try:
+        if _is_video(conn, pid):
+            print(f"Skipping face detection for video photo {pid}")
+            return False
         # Download from MinIO to temporary file
         file_data = storage_client.download_file(file_path)
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
             tmp.write(file_data)
             tmp_path = tmp.name
-        
+
         try:
             faces = face_encodings(tmp_path)
             if not faces:
@@ -434,6 +455,73 @@ def index_faces_batch_job(photo_ids_and_paths: list, db_path: str, min_score=0.5
     
     return processed
 
+
+
+def process_video_transcode_job(photo_id: int, file_path: str, db_path: str):
+    """Probe an uploaded video; if it isn't web-safe (e.g. HEVC .mov), transcode to an
+    H.264/AAC MP4 derivative for browser playback. Writes dimensions/duration/codec and a
+    `transcode_status` the UI polls. Heavy/CPU-bound — runs on the dedicated `video` queue.
+    """
+    conn = db.connect(db_path)
+    storage_client = _get_storage_client()
+    tmp_src = None
+    tmp_out = None
+    try:
+        if not video.ensure_ffmpeg():
+            print(f"ffmpeg/ffprobe not available; cannot transcode video {photo_id}")
+            db.update_video_fields(conn, photo_id, transcode_status="failed")
+            return False
+
+        db.update_video_fields(conn, photo_id, transcode_status="processing")
+
+        ext = Path(file_path).suffix
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp_src = tmp.name
+        storage_client.download_to_path(file_path, tmp_src)
+
+        info = video.ffprobe_info(tmp_src)
+        db.update_video_fields(
+            conn,
+            photo_id,
+            width=info.get("width"),
+            height=info.get("height"),
+            duration_seconds=info.get("duration_seconds"),
+            video_codec=info.get("video_codec"),
+        )
+
+        if video.is_web_safe(info, ext):
+            db.update_video_fields(
+                conn, photo_id, playback_path=file_path, transcode_status="not_needed"
+            )
+            print(f"Video {photo_id} is already web-safe; serving original")
+            return True
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp_out = tmp.name
+        video.transcode_to_h264(tmp_src, tmp_out)
+
+        playback_key = storage_client.generate_playback_path(photo_id)
+        storage_client.upload_file_from_path(tmp_out, playback_key)
+        db.update_video_fields(
+            conn, photo_id, playback_path=playback_key, transcode_status="ready"
+        )
+        print(f"Video {photo_id} transcoded -> {playback_key}")
+        return True
+    except Exception as e:
+        print(f"Error transcoding video {photo_id}: {e}")
+        try:
+            db.update_video_fields(conn, photo_id, transcode_status="failed")
+        except Exception:
+            pass
+        return False
+    finally:
+        for p in (tmp_src, tmp_out):
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        conn.close()
 
 
 def cluster_faces_job(db_path: str, threshold: float = 0.75, photo_ids: list = None, reset: bool = False):

@@ -28,16 +28,22 @@ else
     PYTHON_CMD="python3"
 fi
 
-echo "Starting $WORKER_COUNT Chitra RQ workers..."
+echo "Starting $WORKER_COUNT Chitra RQ workers (default queue)..."
 
-# Start workers in background and save PIDs
+# Start default-queue workers in background and save PIDs
 for i in $(seq 1 $WORKER_COUNT); do
     echo "Starting worker $i..."
-    $PYTHON_CMD worker.py > "logs/worker_$i.log" 2>&1 &
+    $PYTHON_CMD worker.py default > "logs/worker_$i.log" 2>&1 &
     echo $! > "logs/worker_$i.pid"
     echo "Worker $i started with PID $(cat logs/worker_$i.pid)"
 done
 
-echo "All $WORKER_COUNT workers started"
+# Single dedicated video-queue worker: serializes CPU-heavy transcodes (one at a time)
+echo "Starting video transcode worker..."
+$PYTHON_CMD worker.py video > "logs/worker_video.log" 2>&1 &
+echo $! > "logs/worker_video.pid"
+echo "Video worker started with PID $(cat logs/worker_video.pid)"
+
+echo "All $WORKER_COUNT default workers + 1 video worker started"
 echo "Worker PIDs:"
 cat logs/worker_*.pid | xargs echo

@@ -84,6 +84,11 @@ class PhotoResponse(BaseModel):
     longitude: Optional[float] = Field(None, description="GPS longitude")
     thumb_path: Optional[str] = Field(None, description="Thumbnail path in storage")
     score: Optional[float] = Field(None, description="Search relevance score (for search results)")
+    media_type: str = Field("photo", description="'photo' or 'video'")
+    duration_seconds: Optional[float] = Field(None, description="Video duration in seconds")
+    width: Optional[int] = Field(None, description="Pixel width (videos)")
+    height: Optional[int] = Field(None, description="Pixel height (videos)")
+    playback_status: Optional[str] = Field(None, description="Video transcode status: pending/processing/ready/not_needed/failed")
 
     class Config:
         from_attributes = True

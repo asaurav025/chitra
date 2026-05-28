@@ -22,14 +22,16 @@ from core.worker import get_redis_connection
 
 if __name__ == "__main__":
     redis_conn = get_redis_connection()
-    
-    # Create queues
-    queues = [Queue("default", connection=redis_conn)]
-    
-    print("Starting RQ worker...")
+
+    # Queue names from CLI args (default: ["default"]). The 'video' queue is run by a
+    # single dedicated worker so at most one CPU-heavy transcode runs at a time.
+    queue_names = sys.argv[1:] or ["default"]
+    queues = [Queue(name, connection=redis_conn) for name in queue_names]
+
+    print(f"Starting RQ worker on queues: {', '.join(queue_names)}")
     print(f"Redis: {os.environ.get('REDIS_HOST', 'localhost')}:{os.environ.get('REDIS_PORT', '6379')}")
     print("Press Ctrl+C to stop")
-    
+
     # In newer RQ versions, pass connection directly to Worker
     worker = Worker(queues, connection=redis_conn)
     worker.work()

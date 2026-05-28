@@ -87,6 +87,12 @@ class MinIOStorageClient:
             '.arw': 'image/x-sony-arw',
             '.heic': 'image/heic',
             '.heif': 'image/heif',
+            '.mp4': 'video/mp4',
+            '.m4v': 'video/mp4',
+            '.mov': 'video/quicktime',
+            '.webm': 'video/webm',
+            '.mkv': 'video/x-matroska',
+            '.avi': 'video/x-msvideo',
         }
         return content_types.get(ext, 'application/octet-stream')
     
@@ -172,6 +178,33 @@ class MinIOStorageClient:
         """
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.download_file, remote_path)
+
+    def download_to_path(self, remote_path: str, local_path: str) -> str:
+        """Stream an object from MinIO to a local file path (avoids buffering in memory)."""
+        try:
+            self.client.fget_object(self.bucket_name, remote_path, local_path)
+            return local_path
+        except Exception as e:
+            from minio.error import S3Error
+            if isinstance(e, S3Error) and e.code == "NoSuchKey":
+                raise FileNotFoundError(f"File not found in MinIO: {remote_path}")
+            raise Exception(f"MinIO download_to_path failed for '{remote_path}': {e}")
+
+    def stat_object_size(self, remote_path: str) -> int:
+        """Return the object size in bytes. Raises FileNotFoundError if missing."""
+        try:
+            return self.client.stat_object(self.bucket_name, remote_path).size
+        except S3Error as e:
+            if e.code in ("NoSuchKey", "NoSuchObject"):
+                raise FileNotFoundError(f"File not found in MinIO: {remote_path}")
+            raise
+
+    def get_object_range(self, remote_path: str, offset: int, length: int):
+        """Return the raw urllib3 response for a byte range. The CALLER must
+        close()/release_conn() the response after streaming it."""
+        return self.client.get_object(
+            self.bucket_name, remote_path, offset=offset, length=length
+        )
     
     def file_exists(self, remote_path: str) -> bool:
         """Check if file exists in MinIO (sync)."""
@@ -234,6 +267,10 @@ class MinIOStorageClient:
         
         return f"photos/{year}/{month}/{filename}"
     
+    def generate_playback_path(self, photo_id: int) -> str:
+        """Object key for the web-safe (transcoded) playback derivative of a video."""
+        return f"videos/playback/{photo_id}.mp4"
+
     def generate_thumbnail_path(self, item_id: int, item_type: str = "photo") -> str:
         """
         Generate object key for thumbnail.

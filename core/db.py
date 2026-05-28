@@ -53,7 +53,14 @@ def init_db(db_path: str = DB_DEFAULT_PATH):
             exif_datetime TEXT,
             latitude REAL,
             longitude REAL,
-            thumb_path TEXT
+            thumb_path TEXT,
+            media_type TEXT,
+            duration_seconds REAL,
+            width INTEGER,
+            height INTEGER,
+            playback_path TEXT,
+            transcode_status TEXT,
+            video_codec TEXT
         )
         """
     )
@@ -154,6 +161,21 @@ def init_db(db_path: str = DB_DEFAULT_PATH):
         # Column already exists, ignore
         pass
 
+    # Migration: Add video columns (NULL on existing rows; NULL media_type == photo)
+    for _ddl in (
+        "ALTER TABLE photos ADD COLUMN media_type TEXT",
+        "ALTER TABLE photos ADD COLUMN duration_seconds REAL",
+        "ALTER TABLE photos ADD COLUMN width INTEGER",
+        "ALTER TABLE photos ADD COLUMN height INTEGER",
+        "ALTER TABLE photos ADD COLUMN playback_path TEXT",
+        "ALTER TABLE photos ADD COLUMN transcode_status TEXT",
+        "ALTER TABLE photos ADD COLUMN video_codec TEXT",
+    ):
+        try:
+            cur.execute(_ddl)
+        except sqlite3.OperationalError:
+            pass
+
     conn.commit()
     conn.close()
 
@@ -161,15 +183,35 @@ def init_db(db_path: str = DB_DEFAULT_PATH):
 # ----------------------------------------------------------------------
 # PHOTOS
 # ----------------------------------------------------------------------
+_VIDEO_FIELD_COLUMNS = (
+    "media_type",
+    "duration_seconds",
+    "width",
+    "height",
+    "playback_path",
+    "transcode_status",
+    "video_codec",
+)
+
+
 def upsert_photo(conn: sqlite3.Connection, **meta: Any):
     """
     Insert or update a photo row.
-    Expected keys: file_path, size, created_at, checksum, phash, exif_datetime, latitude, longitude, thumb_path
+    Expected keys: file_path, size, created_at, checksum, phash, exif_datetime,
+                   latitude, longitude, thumb_path, media_type, width, height, duration_seconds
     """
+    meta.setdefault("thumb_path", None)
+    meta.setdefault("media_type", "photo")
+    meta.setdefault("width", None)
+    meta.setdefault("height", None)
+    meta.setdefault("duration_seconds", None)
+
     conn.execute(
         """
-        INSERT INTO photos (file_path, size, created_at, checksum, phash, exif_datetime, latitude, longitude, thumb_path)
-        VALUES (:file_path, :size, :created_at, :checksum, :phash, :exif_datetime, :latitude, :longitude, :thumb_path)
+        INSERT INTO photos (file_path, size, created_at, checksum, phash, exif_datetime,
+                            latitude, longitude, thumb_path, media_type, width, height, duration_seconds)
+        VALUES (:file_path, :size, :created_at, :checksum, :phash, :exif_datetime,
+                :latitude, :longitude, :thumb_path, :media_type, :width, :height, :duration_seconds)
         ON CONFLICT(file_path) DO UPDATE SET
             size=excluded.size,
             created_at=excluded.created_at,
@@ -178,9 +220,40 @@ def upsert_photo(conn: sqlite3.Connection, **meta: Any):
             exif_datetime=excluded.exif_datetime,
             latitude=excluded.latitude,
             longitude=excluded.longitude,
-            thumb_path=COALESCE(excluded.thumb_path, photos.thumb_path)
+            thumb_path=COALESCE(excluded.thumb_path, photos.thumb_path),
+            media_type=excluded.media_type,
+            width=COALESCE(excluded.width, photos.width),
+            height=COALESCE(excluded.height, photos.height),
+            duration_seconds=COALESCE(excluded.duration_seconds, photos.duration_seconds)
         """,
         meta,
+    )
+    conn.commit()
+
+
+def update_video_fields(conn: sqlite3.Connection, photo_id: int, **fields: Any):
+    """Update video-specific columns for a photo (transcode job writeback)."""
+    cols = [k for k in fields if k in _VIDEO_FIELD_COLUMNS]
+    if not cols:
+        return
+    set_clause = ", ".join(f"{c}=?" for c in cols)
+    params = [fields[c] for c in cols]
+    params.append(photo_id)
+    conn.execute(f"UPDATE photos SET {set_clause} WHERE id=?", params)
+    conn.commit()
+
+
+def update_capture_date(
+    conn: sqlite3.Connection, photo_id: int, created_at: str, exif_datetime: str
+):
+    """Set the capture-date columns for a photo/video (used by the video date backfill).
+
+    `update_video_fields` only writes the video-specific columns, so it can't touch
+    `created_at`/`exif_datetime`.
+    """
+    conn.execute(
+        "UPDATE photos SET created_at=?, exif_datetime=? WHERE id=?",
+        (created_at, exif_datetime, photo_id),
     )
     conn.commit()
 

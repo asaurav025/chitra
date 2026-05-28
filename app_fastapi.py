@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import io
 import tempfile
+import hashlib
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Optional
 from pathlib import Path
@@ -41,8 +42,9 @@ from core.schemas import (
     WhitelistUserRequest, UpdateUserRoleRequest
 )
 from core import auth
+from core import video
 from core.embedder import ClipEmbedder
-from core.extractor import collect_metadata, load_image, iter_images, RAW_EXTS, _normalize_exif_date
+from core.extractor import collect_metadata, load_image, iter_images, is_video, RAW_EXTS, _normalize_exif_date
 from core.face import face_encodings
 from core.tagger import auto_tags
 from core.gallery import ensure_thumb
@@ -52,6 +54,7 @@ from core.faiss_index import FAISSIndexManager
 from core.jobs import (
     process_photo_embedding_job,
     process_photo_faces_job,
+    process_video_transcode_job,
     index_embeddings_batch_job,
     index_faces_batch_job,
     cluster_faces_job,
@@ -102,7 +105,13 @@ async def lifespan(app: FastAPI):
         print("✓ Database initialized")
     except Exception as e:
         print(f"Warning: Database initialization failed: {e}")
-    
+
+    # Video support requires the ffmpeg/ffprobe CLIs (apt-get install ffmpeg)
+    if video.ensure_ffmpeg():
+        print("✓ ffmpeg/ffprobe available (video upload supported)")
+    else:
+        print("Warning: ffmpeg/ffprobe NOT found — video posters and transcoding will fail")
+
     yield
     
     # Shutdown
@@ -211,7 +220,11 @@ async def get_current_user(
     payload = auth.verify_token(token)
     if payload is None:
         raise credentials_exception
-    
+
+    # Media-scoped tokens are for <video>/<img> src only; never grant full API access.
+    if auth.is_media_token(payload):
+        raise credentials_exception
+
     user_id_str: str = payload.get("sub")
     if user_id_str is None:
         raise credentials_exception
@@ -649,6 +662,11 @@ def row_to_photo_dto(row) -> Dict[str, Any]:
         "latitude": row["latitude"],
         "longitude": row["longitude"],
         "thumb_path": row.get("thumb_path"),
+        "media_type": row.get("media_type") or "photo",
+        "duration_seconds": row.get("duration_seconds"),
+        "width": row.get("width"),
+        "height": row.get("height"),
+        "playback_status": row.get("transcode_status"),
     }
 
 
@@ -701,6 +719,40 @@ async def ensure_photo_thumb_async(
                 os.unlink(thumb_file_path)
     
     return thumb_path
+
+
+async def ensure_video_poster_async(
+    local_src_path: str,
+    photo_id: int,
+    storage: MinIOStorageClient,
+) -> Optional[str]:
+    """Extract a poster (keyframe JPEG) from a local video file and upload it to the
+    photo thumbnail path. Returns the thumbnail object key, or None on failure
+    (a missing poster must never fail the upload)."""
+    thumb_path = storage.generate_thumbnail_path(photo_id, "photo")
+    if not video.ensure_ffmpeg():
+        print("ffmpeg not available; skipping video poster")
+        return None
+
+    poster_tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as pt:
+            poster_tmp = pt.name
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, video.extract_poster, local_src_path, poster_tmp)
+        with open(poster_tmp, "rb") as f:
+            poster_data = f.read()
+        await storage.upload_file_async(poster_data, thumb_path)
+        return thumb_path
+    except Exception as e:
+        print(f"Warning: video poster generation failed for photo {photo_id}: {e}")
+        return None
+    finally:
+        if poster_tmp and os.path.exists(poster_tmp):
+            try:
+                os.unlink(poster_tmp)
+            except OSError:
+                pass
 
 
 # -----------------------------------------------------------------------------
@@ -775,14 +827,18 @@ async def delete_photo(
     cur = await conn.cursor()
     
     # Get photo details before deletion
-    await cur.execute("SELECT file_path, thumb_path FROM photos WHERE id=?", (photo_id,))
+    await cur.execute("SELECT file_path, thumb_path, playback_path FROM photos WHERE id=?", (photo_id,))
     row = await cur.fetchone()
-    
+
     if not row:
         raise HTTPException(status_code=404, detail="photo_not_found")
-    
+
     file_path = row["file_path"]
     thumb_path = row["thumb_path"] if row["thumb_path"] else None
+    # Transcoded video derivative (only delete when it differs from the original)
+    playback_path = row["playback_path"] if row["playback_path"] else None
+    if playback_path == file_path:
+        playback_path = None
     
     # Get face thumbnails for this photo before deletion
     face_thumb_paths = []
@@ -809,7 +865,11 @@ async def delete_photo(
         # Delete photo thumbnail if it exists
         if thumb_path:
             await storage.delete_file_async(thumb_path)
-        
+
+        # Delete transcoded video derivative if present
+        if playback_path:
+            await storage.delete_file_async(playback_path)
+
         # Delete face thumbnails
         for face_thumb_path in face_thumb_paths:
             try:
@@ -887,8 +947,10 @@ async def get_photo_image(
         '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
         '.png': 'image/png', '.gif': 'image/gif',
         '.webp': 'image/webp',
+        '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime',
+        '.webm': 'video/webm', '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo',
     }.get(ext, 'application/octet-stream')
-    
+
     return Response(
         content=file_data,
         media_type=mimetype,
@@ -899,11 +961,12 @@ async def get_photo_image(
 @app.get("/api/photos/{photo_id}/thumbnail")
 async def get_photo_thumbnail(
     photo_id: int,
+    request: Request,
     current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async),
     storage: MinIOStorageClient = Depends(get_storage_client)
 ):
-    """Get photo thumbnail."""
+    """Get photo thumbnail with browser caching support."""
     cur = await conn.cursor()
     await cur.execute("SELECT file_path, thumb_path FROM photos WHERE id=?", (photo_id,))
     row = await cur.fetchone()
@@ -927,6 +990,22 @@ async def get_photo_thumbnail(
             await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
             await conn.commit()
     
+    # Generate ETag based on photo_id and thumb_path (stable identifier)
+    etag_value = hashlib.md5(f"{photo_id}:{thumb_path}".encode()).hexdigest()
+    etag = f'"{etag_value}"'
+    
+    # Check If-None-Match header for conditional request
+    if_none_match = request.headers.get("If-None-Match")
+    if if_none_match == etag:
+        # Client has cached version, return 304 Not Modified
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": "public, max-age=604800",  # 7 days
+            }
+        )
+    
     # Check cache first
     thumb_data = get_cached_thumbnail(thumb_path)
     
@@ -944,7 +1023,11 @@ async def get_photo_thumbnail(
     return Response(
         content=thumb_data,
         media_type='image/jpeg',
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+        headers={
+            "ETag": etag,
+            "Cache-Control": "public, max-age=604800",  # Cache for 7 days (604800 seconds)
+            "Vary": "Authorization",  # Cache varies by auth token
+        }
     )
 
 
@@ -1060,16 +1143,35 @@ async def upload_photos(
                 if not row:
                     return {"error": f"Failed to get photo ID for {filename}"}
                 photo_id = row["id"]
-                
-                # Generate thumbnail
-                thumb_path = await ensure_photo_thumb_async(stored_path, photo_id, storage, conn)
-                
+
+                is_vid = is_video(filename)
+
+                # Generate thumbnail (image) or poster keyframe (video, from the local temp file)
+                if is_vid:
+                    thumb_path = await ensure_video_poster_async(tmp_path, photo_id, storage)
+                else:
+                    thumb_path = await ensure_photo_thumb_async(stored_path, photo_id, storage, conn)
+
                 # Store thumb_path in database
-                await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
-                await conn.commit()
-                
-                # Auto-process: embeddings and faces (if enabled)
-                if auto_process:
+                if thumb_path:
+                    await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
+                    await conn.commit()
+
+                if is_vid:
+                    # Videos: skip image-only ML; mark pending and queue transcode on the
+                    # dedicated single-concurrency 'video' queue.
+                    await db_async.update_video_fields_async(conn, photo_id, transcode_status="pending")
+                    try:
+                        get_queue("video").enqueue(
+                            process_video_transcode_job,
+                            photo_id,
+                            stored_path,
+                            DB_PATH,
+                            job_timeout='2h'
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to queue transcode job for {filename}: {e}")
+                elif auto_process:
                     try:
                         queue = get_queue()
                         # Queue embedding processing job
@@ -1091,13 +1193,15 @@ async def upload_photos(
                     except Exception as e:
                         # Don't fail upload if job queuing fails
                         print(f"Warning: Failed to queue processing jobs for {filename}: {e}")
-                
+
                 return {
                     "id": photo_id,
                     "file_path": stored_path,
                     "storage_url": f"/api/storage/{stored_path}",
                     "thumbnail": thumb_path,
-                    "thumbnail_url": f"/api/storage/{thumb_path}",
+                    "thumbnail_url": f"/api/storage/{thumb_path}" if thumb_path else None,
+                    "media_type": "video" if is_vid else "photo",
+                    "transcode_status": "pending" if is_vid else None,
                 }
         except Exception as e:
             import traceback
@@ -1165,8 +1269,11 @@ async def upload_photos(
     # Queue clustering job with a delay to allow face detection jobs to start
     if auto_process and saved:
         try:
-            # Extract photo IDs from successfully uploaded photos
-            uploaded_photo_ids = [result["id"] for result in saved if "id" in result and not result.get("duplicate", False)]
+            # Extract photo IDs from successfully uploaded photos (videos have no faces to cluster)
+            uploaded_photo_ids = [
+                result["id"] for result in saved
+                if "id" in result and not result.get("duplicate", False) and result.get("media_type") != "video"
+            ]
             
             if uploaded_photo_ids:
                 queue = get_queue()
@@ -2258,14 +2365,137 @@ async def get_storage_file(
             '.png': 'image/png', '.gif': 'image/gif',
             '.webp': 'image/webp', '.bmp': 'image/bmp',
             '.tif': 'image/tiff', '.tiff': 'image/tiff',
+            '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime',
+            '.webm': 'video/webm', '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo',
         }.get(ext, 'application/octet-stream')
-        
+
         return Response(content=file_data, media_type=mimetype)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="file_not_found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"storage_error: {str(e)}")
 
+
+# -----------------------------------------------------------------------------
+# VIDEO STREAMING (range-capable, query-param auth for <video> tags)
+# -----------------------------------------------------------------------------
+
+@app.get("/api/media-token")
+async def issue_media_token(
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
+):
+    """Issue a short-lived, media-scoped token the frontend appends to a <video> src
+    (a <video> tag cannot send an Authorization header)."""
+    return {"token": auth.create_media_token(current_user["id"])}
+
+
+async def get_media_user(
+    token: str = Query(..., description="Media-scoped token from /api/media-token"),
+    conn: aiosqlite.Connection = Depends(get_db_async),
+) -> aiosqlite.Row:
+    """Authenticate a streaming request via a media-scoped query-param token."""
+    payload = auth.verify_media_token(token)
+    if payload is None:
+        raise HTTPException(status_code=401, detail="invalid_or_expired_media_token")
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="invalid_media_token")
+    user = await db_async.get_user_by_id_async(conn, user_id)
+    if user is None or not user["is_active"] or not user["is_whitelisted"]:
+        raise HTTPException(status_code=403, detail="not_authorized")
+    return user
+
+
+def _parse_range_header(range_header: str, size: int):
+    """Parse a single HTTP byte range. Returns (start, end) inclusive, or (None, None)
+    if unsatisfiable/malformed."""
+    if not range_header or not range_header.startswith("bytes="):
+        return None, None
+    spec = range_header[len("bytes="):].split(",")[0].strip()
+    if "-" not in spec:
+        return None, None
+    start_s, end_s = spec.split("-", 1)
+    try:
+        if start_s == "":
+            n = int(end_s)
+            if n <= 0:
+                return None, None
+            start = max(0, size - n)
+            end = size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else size - 1
+    except ValueError:
+        return None, None
+    if start > end or start >= size:
+        return None, None
+    return start, min(end, size - 1)
+
+
+@app.get("/api/photos/{photo_id}/video")
+async def stream_photo_video(
+    photo_id: int,
+    request: Request,
+    media_user: aiosqlite.Row = Depends(get_media_user),
+    conn: aiosqlite.Connection = Depends(get_db_async),
+    storage: MinIOStorageClient = Depends(get_storage_client),
+):
+    """Stream a video's web-safe playback bytes with HTTP Range (206) support."""
+    cur = await conn.cursor()
+    await cur.execute(
+        "SELECT media_type, playback_path, transcode_status, file_path FROM photos WHERE id=?",
+        (photo_id,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="photo_not_found")
+    if (row["media_type"] or "photo") != "video":
+        raise HTTPException(status_code=400, detail="not_a_video")
+
+    key = row["playback_path"]
+    if not key:
+        status_val = row["transcode_status"]
+        if status_val == "failed":
+            raise HTTPException(status_code=422, detail="transcode_failed")
+        # pending / processing / NULL
+        raise HTTPException(status_code=409, detail="transcode_in_progress")
+
+    loop = asyncio.get_event_loop()
+    try:
+        size = await loop.run_in_executor(None, storage.stat_object_size, key)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="file_not_found_on_storage")
+
+    def _stream(offset: int, length: int):
+        resp = storage.get_object_range(key, offset, length)
+        try:
+            for chunk in resp.stream(1024 * 1024):
+                yield chunk
+        finally:
+            resp.close()
+            resp.release_conn()
+
+    range_header = request.headers.get("range")
+    if range_header:
+        start, end = _parse_range_header(range_header, size)
+        if start is None:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        length = end - start + 1
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(length),
+            "Cache-Control": "no-store",
+        }
+        return StreamingResponse(_stream(start, length), status_code=206, media_type="video/mp4", headers=headers)
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(size),
+        "Cache-Control": "no-store",
+    }
+    return StreamingResponse(_stream(0, size), status_code=200, media_type="video/mp4", headers=headers)
 
 
 if __name__ == "__main__":

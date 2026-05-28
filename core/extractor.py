@@ -31,6 +31,16 @@ RAW_EXTS = {
     ".rw2", ".orf", ".raf", ".dng", ".srw", ".pef",
 }
 
+# Supported video formats
+VIDEO_EXTS = {
+    ".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi",
+}
+
+
+def is_video(path: str | Path) -> bool:
+    """True if the path has a recognized video extension."""
+    return Path(path).suffix.lower() in VIDEO_EXTS
+
 
 # ----------------------------------------------------------------------
 # IMAGE ITERATOR
@@ -343,9 +353,40 @@ def compute_phash(path: Path) -> str:
 # FINAL METADATA BUILDER
 # ----------------------------------------------------------------------
 def collect_metadata(path: Path) -> Dict:
-    """Collect file metadata + EXIF + phash for DB insertion."""
+    """Collect file metadata for DB insertion.
+
+    Photos get EXIF + perceptual hash. Videos skip those image-only steps
+    (load_image/PIL can't open video) and rely on file mtime for the date.
+    """
     st = path.stat()
     checksum = sha1sum(path)
+
+    if is_video(path):
+        # Pull the real capture date from container metadata (ffprobe creation_time);
+        # fall back to file mtime if ffprobe is unavailable or the file has no date.
+        creation_time = ""
+        try:
+            from . import video
+            creation_time = video.ffprobe_info(path).get("creation_time") or ""
+        except Exception:
+            creation_time = ""
+
+        if creation_time:
+            created_at = creation_time
+        else:
+            created_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime))
+        return {
+            "file_path": str(path),
+            "size": st.st_size,
+            "created_at": created_at,
+            "checksum": checksum,
+            "phash": "",
+            "exif_datetime": creation_time,
+            "latitude": None,
+            "longitude": None,
+            "media_type": "video",
+        }
+
     ph = compute_phash(path)
     exif = get_exif(path)
 
@@ -370,4 +411,5 @@ def collect_metadata(path: Path) -> Dict:
         "exif_datetime": normalized_exif_dt,  # Store normalized format
         "latitude": exif.get("latitude"),
         "longitude": exif.get("longitude"),
+        "media_type": "photo",
     }

@@ -1,3 +1,5 @@
+# NOTE: video support requires the system ffmpeg/ffprobe CLIs (apt-get install ffmpeg).
+# No Python video packages are needed — core/video.py shells out to the CLIs.
 albucore==0.0.24
 albumentations==2.0.8
 annotated-types==0.7.0

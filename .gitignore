@@ -30,6 +30,10 @@ env/
 *.db
 *.sqlite
 *.sqlite3
+*.bak-*
+
+# Local env (contains MinIO secrets)
+.env.production
 
 # IDE
 .vscode/
@@ -45,6 +49,7 @@ desktop.ini
 
 # Logs
 *.log
+logs/
 
 
 # FAISS indexes

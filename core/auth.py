@@ -15,6 +15,9 @@ import aiosqlite
 JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "your-secret-key-change-in-production")
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # 24 hours
+# Short-lived token for <video>/<img> tags that can't send an Authorization header.
+MEDIA_TOKEN_EXPIRE_MINUTES = int(os.environ.get("MEDIA_TOKEN_EXPIRE_MINUTES", "60"))
+MEDIA_TOKEN_SCOPE = "media"
 
 
 def hash_password(password: str) -> str:
@@ -79,6 +82,27 @@ def verify_token(token: str) -> Optional[Dict[str, Any]]:
         return payload
     except JWTError:
         return None
+
+
+def create_media_token(user_id: int, expires_minutes: Optional[int] = None) -> str:
+    """Create a short-lived, media-scoped JWT for streaming endpoints accessed via
+    a `<video>`/`<img>` src query param (which cannot carry an Authorization header)."""
+    expire = datetime.utcnow() + timedelta(minutes=expires_minutes or MEDIA_TOKEN_EXPIRE_MINUTES)
+    to_encode = {"sub": str(user_id), "scope": MEDIA_TOKEN_SCOPE, "exp": expire}
+    return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def verify_media_token(token: str) -> Optional[Dict[str, Any]]:
+    """Verify a media-scoped token. Returns payload only if valid AND media-scoped."""
+    payload = verify_token(token)
+    if payload is None or payload.get("scope") != MEDIA_TOKEN_SCOPE:
+        return None
+    return payload
+
+
+def is_media_token(payload: Dict[str, Any]) -> bool:
+    """True if a decoded payload is a media-scoped token (must not grant full API access)."""
+    return payload.get("scope") == MEDIA_TOKEN_SCOPE
 
 
 async def authenticate_user(

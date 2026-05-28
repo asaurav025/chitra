@@ -63,7 +63,14 @@ async def init_db_async(db_path: str = DB_DEFAULT_PATH) -> None:
                 exif_datetime TEXT,
                 latitude REAL,
                 longitude REAL,
-                thumb_path TEXT
+                thumb_path TEXT,
+                media_type TEXT,
+                duration_seconds REAL,
+                width INTEGER,
+                height INTEGER,
+                playback_path TEXT,
+                transcode_status TEXT,
+                video_codec TEXT
             )
             """
         )
@@ -187,6 +194,21 @@ async def init_db_async(db_path: str = DB_DEFAULT_PATH) -> None:
             # Column already exists, ignore
             pass
 
+        # Migration: Add video columns (NULL on existing rows; NULL media_type == photo)
+        for _ddl in (
+            "ALTER TABLE photos ADD COLUMN media_type TEXT",
+            "ALTER TABLE photos ADD COLUMN duration_seconds REAL",
+            "ALTER TABLE photos ADD COLUMN width INTEGER",
+            "ALTER TABLE photos ADD COLUMN height INTEGER",
+            "ALTER TABLE photos ADD COLUMN playback_path TEXT",
+            "ALTER TABLE photos ADD COLUMN transcode_status TEXT",
+            "ALTER TABLE photos ADD COLUMN video_codec TEXT",
+        ):
+            try:
+                await conn.execute(_ddl)
+            except aiosqlite.OperationalError:
+                pass
+
         # Migration: Add users table columns if they don't exist (for existing databases)
         try:
             await conn.execute("ALTER TABLE users ADD COLUMN is_whitelisted BOOLEAN DEFAULT 0")
@@ -207,20 +229,36 @@ async def init_db_async(db_path: str = DB_DEFAULT_PATH) -> None:
 # ----------------------------------------------------------------------
 # PHOTOS (ASYNC)
 # ----------------------------------------------------------------------
+_VIDEO_FIELD_COLUMNS = (
+    "media_type",
+    "duration_seconds",
+    "width",
+    "height",
+    "playback_path",
+    "transcode_status",
+    "video_codec",
+)
+
+
 async def upsert_photo_async(conn: aiosqlite.Connection, **meta: Any) -> None:
     """
     Insert or update a photo row (async).
     Expected keys: file_path, size, created_at, checksum, phash,
-                   exif_datetime, latitude, longitude, thumb_path (optional)
+                   exif_datetime, latitude, longitude, thumb_path, media_type,
+                   width, height, duration_seconds (all optional)
     """
-    # Ensure thumb_path is in meta (default to None if not provided)
-    if 'thumb_path' not in meta:
-        meta['thumb_path'] = None
-    
+    meta.setdefault("thumb_path", None)
+    meta.setdefault("media_type", "photo")
+    meta.setdefault("width", None)
+    meta.setdefault("height", None)
+    meta.setdefault("duration_seconds", None)
+
     await conn.execute(
         """
-        INSERT INTO photos (file_path, size, created_at, checksum, phash, exif_datetime, latitude, longitude, thumb_path)
-        VALUES (:file_path, :size, :created_at, :checksum, :phash, :exif_datetime, :latitude, :longitude, :thumb_path)
+        INSERT INTO photos (file_path, size, created_at, checksum, phash, exif_datetime,
+                            latitude, longitude, thumb_path, media_type, width, height, duration_seconds)
+        VALUES (:file_path, :size, :created_at, :checksum, :phash, :exif_datetime,
+                :latitude, :longitude, :thumb_path, :media_type, :width, :height, :duration_seconds)
         ON CONFLICT(file_path) DO UPDATE SET
             size=excluded.size,
             created_at=excluded.created_at,
@@ -229,10 +267,26 @@ async def upsert_photo_async(conn: aiosqlite.Connection, **meta: Any) -> None:
             exif_datetime=excluded.exif_datetime,
             latitude=excluded.latitude,
             longitude=excluded.longitude,
-            thumb_path=COALESCE(excluded.thumb_path, photos.thumb_path)
+            thumb_path=COALESCE(excluded.thumb_path, photos.thumb_path),
+            media_type=excluded.media_type,
+            width=COALESCE(excluded.width, photos.width),
+            height=COALESCE(excluded.height, photos.height),
+            duration_seconds=COALESCE(excluded.duration_seconds, photos.duration_seconds)
         """,
         meta,
     )
+    await conn.commit()
+
+
+async def update_video_fields_async(conn: aiosqlite.Connection, photo_id: int, **fields: Any) -> None:
+    """Update video-specific columns for a photo (async)."""
+    cols = [k for k in fields if k in _VIDEO_FIELD_COLUMNS]
+    if not cols:
+        return
+    set_clause = ", ".join(f"{c}=?" for c in cols)
+    params = [fields[c] for c in cols]
+    params.append(photo_id)
+    await conn.execute(f"UPDATE photos SET {set_clause} WHERE id=?", params)
     await conn.commit()
 
 
