@@ -38,12 +38,16 @@ for i in $(seq 1 $WORKER_COUNT); do
     echo "Worker $i started with PID $(cat logs/worker_$i.pid)"
 done
 
-# Single dedicated video-queue worker: serializes CPU-heavy transcodes (one at a time)
-echo "Starting video transcode worker..."
-$PYTHON_CMD worker.py video > "logs/worker_video.log" 2>&1 &
-echo $! > "logs/worker_video.pid"
-echo "Video worker started with PID $(cat logs/worker_video.pid)"
+# Dedicated video-queue workers: caps concurrent CPU-heavy transcodes.
+# They share the unit's CPUQuota=400%, so 2 workers ≈ 2 cores per transcode.
+VIDEO_WORKER_COUNT="${VIDEO_WORKER_COUNT:-2}"
+echo "Starting $VIDEO_WORKER_COUNT video transcode workers..."
+for i in $(seq 1 $VIDEO_WORKER_COUNT); do
+    $PYTHON_CMD worker.py video > "logs/worker_video_$i.log" 2>&1 &
+    echo $! > "logs/worker_video_$i.pid"
+    echo "Video worker $i started with PID $(cat logs/worker_video_$i.pid)"
+done
 
-echo "All $WORKER_COUNT default workers + 1 video worker started"
+echo "All $WORKER_COUNT default workers + $VIDEO_WORKER_COUNT video workers started"
 echo "Worker PIDs:"
 cat logs/worker_*.pid | xargs echo
