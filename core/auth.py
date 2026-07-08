@@ -5,6 +5,7 @@ Handles password hashing, JWT token generation, and user authentication.
 from __future__ import annotations
 
 import os
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from jose import JWTError, jwt
@@ -12,7 +13,13 @@ import bcrypt
 import aiosqlite
 
 # JWT Configuration
-JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
+if not JWT_SECRET_KEY:
+    # Ephemeral secret: tokens won't survive a restart. Set JWT_SECRET_KEY in
+    # the environment (.env.production) — a guessable constant here would let
+    # anyone forge valid tokens.
+    JWT_SECRET_KEY = secrets.token_hex(32)
+    print("WARNING: JWT_SECRET_KEY not set; using an ephemeral secret — all tokens invalidate on restart")
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # 24 hours
 # Short-lived token for <video>/<img> tags that can't send an Authorization header.
