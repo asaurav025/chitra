@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -17,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 FFMPEG = "ffmpeg"
 FFPROBE = "ffprobe"
+
+# Intel Quick Sync (VA-API) render node for hardware transcoding. Requires the
+# iHD driver and rw access (render group) — see homelab-extras/13-igpu-transcode.
+VAAPI_DEVICE = os.environ.get("VAAPI_DEVICE", "/dev/dri/renderD128")
 
 # Codecs/containers browsers can play natively without transcoding.
 _WEB_SAFE_VIDEO_CODECS = {"h264", "avc1"}
@@ -151,13 +156,39 @@ def extract_poster(
         raise RuntimeError(f"ffmpeg poster extraction failed: {proc.stderr.strip()[-2000:]}")
 
 
-def transcode_to_h264(
-    src_path: str | Path,
-    out_mp4_path: str | Path,
-    timeout: int = 7200,
-) -> None:
-    """Transcode to a web-safe H.264/AAC MP4 with faststart. Raises RuntimeError on failure."""
-    cmd = [
+def hw_transcode_available() -> bool:
+    """True iff VA-API transcoding is enabled (CHITRA_HW_TRANSCODE != 0) and the
+    render node is accessible to this process (needs render group membership)."""
+    if os.environ.get("CHITRA_HW_TRANSCODE", "1") == "0":
+        return False
+    return os.access(VAAPI_DEVICE, os.R_OK | os.W_OK)
+
+
+def _hw_transcode_cmd(src_path: str | Path, out_mp4_path: str | Path) -> list[str]:
+    """Hybrid pipeline: software decode -> hwupload -> h264_vaapi encode.
+
+    Decode deliberately stays on the CPU: hardware-decoded 10-bit HEVC surfaces
+    feeding h264_vaapi hit a Gen9.5 iHD driver allocation bug ("Cannot allocate
+    memory"), and the encoder is the expensive half anyway. This also makes the
+    hw path work for any source ffmpeg can decode (ProRes, VP9, ...), not just
+    codecs the iGPU can."""
+    return [
+        FFMPEG, "-y",
+        "-init_hw_device", f"vaapi=va:{VAAPI_DEVICE}",
+        "-filter_hw_device", "va",
+        "-i", str(src_path),
+        "-vf", "format=nv12,hwupload",
+        "-c:v", "h264_vaapi",
+        "-qp", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(out_mp4_path),
+    ]
+
+
+def _sw_transcode_cmd(src_path: str | Path, out_mp4_path: str | Path) -> list[str]:
+    return [
         FFMPEG, "-y",
         "-i", str(src_path),
         "-c:v", "libx264",
@@ -169,6 +200,31 @@ def transcode_to_h264(
         "-movflags", "+faststart",
         str(out_mp4_path),
     ]
+
+
+def transcode_to_h264(
+    src_path: str | Path,
+    out_mp4_path: str | Path,
+    timeout: int = 7200,
+) -> None:
+    """Transcode to a web-safe H.264/AAC MP4 with faststart. Raises RuntimeError on failure.
+
+    Tries the Quick Sync (VA-API) hardware path first when available; any hardware
+    failure (undecodable codec, driver hiccup, rotation filters the hw path can't
+    apply) falls back to libx264 on CPU.
+    """
+    if hw_transcode_available():
+        cmd = _hw_transcode_cmd(src_path, out_mp4_path)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if proc.returncode == 0 and Path(out_mp4_path).exists():
+            return
+        logger.warning(
+            "VAAPI transcode failed for %s, falling back to libx264: %s",
+            src_path, proc.stderr.strip()[-500:],
+        )
+        Path(out_mp4_path).unlink(missing_ok=True)
+
+    cmd = _sw_transcode_cmd(src_path, out_mp4_path)
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0 or not Path(out_mp4_path).exists():
         raise RuntimeError(f"ffmpeg transcode failed: {proc.stderr.strip()[-2000:]}")

@@ -148,6 +148,90 @@ class TestParseCreationTime(unittest.TestCase):
         self.assertIsNone(video._parse_creation_time(None))
 
 
+class TestTranscodeHwPath(unittest.TestCase):
+    """VAAPI hardware transcode with automatic libx264 fallback."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.out = str(Path(self.tmpdir.name) / "out.mp4")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _run_recorder(self, results):
+        """Fake subprocess.run: pops (returncode, create_file) per call, records cmds."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            rc, create = results.pop(0)
+            calls.append(cmd)
+            if create:
+                Path(self.out).write_bytes(b"mp4")
+            proc = mock.Mock()
+            proc.returncode = rc
+            proc.stderr = "fake stderr"
+            return proc
+
+        return calls, fake_run
+
+    def test_hw_available_uses_vaapi_only(self):
+        calls, fake_run = self._run_recorder([(0, True)])
+        with mock.patch("core.video.hw_transcode_available", return_value=True), \
+             mock.patch("core.video.subprocess.run", side_effect=fake_run):
+            video.transcode_to_h264("/tmp/in.mov", self.out)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("h264_vaapi", calls[0])
+        self.assertNotIn("libx264", calls[0])
+        # Hybrid pipeline: decode must stay on CPU (hw-decoded 10-bit surfaces
+        # feeding the encoder hit a Gen9.5 iHD ENOMEM bug), so frames are
+        # uploaded to the iGPU for encode only.
+        self.assertIn("format=nv12,hwupload", calls[0])
+        self.assertNotIn("-hwaccel", calls[0])
+
+    def test_hw_failure_falls_back_to_libx264(self):
+        calls, fake_run = self._run_recorder([(1, False), (0, True)])
+        with mock.patch("core.video.hw_transcode_available", return_value=True), \
+             mock.patch("core.video.subprocess.run", side_effect=fake_run):
+            video.transcode_to_h264("/tmp/in.mov", self.out)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("h264_vaapi", calls[0])
+        self.assertIn("libx264", calls[1])
+
+    def test_hw_unavailable_goes_straight_to_libx264(self):
+        calls, fake_run = self._run_recorder([(0, True)])
+        with mock.patch("core.video.hw_transcode_available", return_value=False), \
+             mock.patch("core.video.subprocess.run", side_effect=fake_run):
+            video.transcode_to_h264("/tmp/in.mov", self.out)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("libx264", calls[0])
+
+    def test_raises_when_both_paths_fail(self):
+        calls, fake_run = self._run_recorder([(1, False), (1, False)])
+        with mock.patch("core.video.hw_transcode_available", return_value=True), \
+             mock.patch("core.video.subprocess.run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError):
+                video.transcode_to_h264("/tmp/in.mov", self.out)
+        self.assertEqual(len(calls), 2)
+
+
+class TestHwTranscodeAvailable(unittest.TestCase):
+    def test_env_kill_switch_disables_hw(self):
+        with mock.patch.dict(os.environ, {"CHITRA_HW_TRANSCODE": "0"}), \
+             mock.patch("core.video.os.access", return_value=True):
+            self.assertFalse(video.hw_transcode_available())
+
+    def test_available_when_node_accessible(self):
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch("core.video.os.access", return_value=True):
+            os.environ.pop("CHITRA_HW_TRANSCODE", None)
+            self.assertTrue(video.hw_transcode_available())
+
+    def test_unavailable_without_node_access(self):
+        with mock.patch("core.video.os.access", return_value=False):
+            os.environ.pop("CHITRA_HW_TRANSCODE", None)
+            self.assertFalse(video.hw_transcode_available())
+
+
 class TestExtractorVideoBranch(unittest.TestCase):
     def test_is_video(self):
         self.assertTrue(extractor.is_video("clip.mp4"))
