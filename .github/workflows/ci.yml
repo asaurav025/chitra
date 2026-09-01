@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [flask, master]
+  pull_request:
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      # Config lives in pyproject.toml. Narrow rule set on purpose — see the
+      # comment there before widening it.
+      - run: ruff check .
+
+  test:
+    name: tests (green modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ffmpeg
+        # Not a pip dependency — the video module shells out to the CLIs.
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        # CPU wheels only: the pinned nvidia-* packages are ~8GB and unusable
+        # on a CPU-only runner (and on the production box).
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            -r requirements.txt
+
+      # Gate on the modules that are actually green. The suite as a whole has a
+      # known-failing baseline (see AGENTS.md); gating on it would make CI
+      # permanently red and therefore ignored. Move a module up here as it is
+      # repaired.
+      - name: Green modules
+        env:
+          CHITRA_DB_PATH: /tmp/chitra_test.db
+        run: |
+          for m in test_video test_auth_secret test_media_token \
+                   test_storage_client test_background_jobs; do
+            echo "::group::$m"
+            python tests/run_tests.py "$m" || exit 1
+            echo "::endgroup::"
+          done
+
+      - name: Full suite (informational)
+        # Expected baseline as of 2026-09-01: 53 tests, 7 failures, 4 errors.
+        # Non-blocking so the delta stays visible without gating on it.
+        continue-on-error: true
+        env:
+          CHITRA_DB_PATH: /tmp/chitra_test.db
+        run: python tests/run_tests.py

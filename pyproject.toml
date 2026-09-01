@@ -1,0 +1,23 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = [".venv", "faiss_indexes", "logs", "photos", "__pycache__"]
+
+[tool.ruff.lint]
+# Start deliberately narrow: correctness rules that would have caught real bugs
+# in this repo (F821 undefined-name flags the dead clustering block in
+# app_fastapi.py). Widen once the existing violations are cleared.
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    "E722", # bare except — pervasive in the startup migration paths
+    "E501", # line length — formatter's job, not the linter's
+]
+
+[tool.ruff.lint.per-file-ignores]
+"cli/tui.py" = ["F405", "F403"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# Tests default to the production photo.db unless CHITRA_DB_PATH is set.
+env = ["CHITRA_DB_PATH=/tmp/chitra_test.db"]

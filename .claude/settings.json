@@ -1,0 +1,56 @@
+{
+  "extraKnownMarketplaces": {
+    "ai-sdlc": {
+      "source": {
+        "source": "github",
+        "repo": "Parallelloop-ai/ai-sdlc"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "ai-sdlc@ai-sdlc": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python tests/run_tests.py*)",
+      "Bash(.venv/bin/python -m pytest*)",
+      "Bash(.venv/bin/python -c*)",
+      "Bash(.venv/bin/pip list*)",
+      "Bash(.venv/bin/pip show*)",
+      "Bash(.venv/bin/ruff*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git branch*)",
+      "Bash(rg*)",
+      "Bash(sqlite3 /tmp/*)"
+    ],
+    "deny": [
+      "Bash(sudo*)",
+      "Bash(systemctl*)",
+      "Bash(*stop_workers.sh*)",
+      "Bash(*start_workers.sh*)",
+      "Bash(*start_production.sh*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(rm -rf*)",
+      "Read(./.env.production)",
+      "Edit(./.env.production)",
+      "Edit(./photo.db)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.py) [ -x .venv/bin/ruff ] && .venv/bin/ruff format \"$f\" >/dev/null 2>&1;; esac; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}
