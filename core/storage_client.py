@@ -5,12 +5,16 @@ Replaces FTP client with object storage.
 import os
 import io
 import asyncio
+import logging
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timedelta
 
+import urllib3.exceptions
 from minio import Minio
-from minio.error import S3Error
+from minio.error import MinioException, S3Error
+
+logger = logging.getLogger(__name__)
 
 
 class MinIOStorageClient:
@@ -207,11 +211,43 @@ class MinIOStorageClient:
         )
     
     def file_exists(self, remote_path: str) -> bool:
-        """Check if file exists in MinIO (sync)."""
+        """Check if file exists in MinIO (sync).
+
+        False means either "not there" or "could not ask" — see the comment on
+        the transport branch before relying on that.
+        """
         try:
             self.client.stat_object(self.bucket_name, remote_path)
             return True
         except S3Error:
+            # A well-formed answer from the server: the object is absent (or
+            # not ours to see). Nothing to report.
+            return False
+        except (MinioException, urllib3.exceptions.HTTPError) as e:
+            # NOT an answer — the question never got through. With a failing
+            # disk under MinIO, `stat_object` raises urllib3's `MaxRetryError`
+            # (wrapping `ResponseError('too many 500 error responses')`), and a
+            # 500 that minio decodes itself arrives as `ServerError`. Neither
+            # is an `S3Error`, so both used to escape this method uncaught and
+            # surface as an unhandled 500 with no detail: 41 tracebacks through
+            # file_exists/stat_object in a ~2 hour window.
+            #
+            # Logged rather than swallowed, because a transport failure here
+            # means the storage is unhealthy and that is worth knowing.
+            #
+            # The semantics are deliberately imperfect: returning False for
+            # "I could not tell" conflates *absent* with *unreadable*. It is
+            # right in this method because every caller treats False as
+            # "regenerate it, or 404" — safe under either reading. Do NOT
+            # extend the pattern to code where the distinction matters (a
+            # delete, an overwrite guard, a dedup check): there, "I could not
+            # tell" must propagate, or an unreadable original gets treated as
+            # a free filename and overwritten.
+            logger.warning(
+                "MinIO stat failed for '%s'; storage unhealthy, reporting absent: %s",
+                remote_path,
+                e,
+            )
             return False
     
     async def file_exists_async(self, remote_path: str) -> bool:

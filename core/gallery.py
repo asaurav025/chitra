@@ -5,39 +5,105 @@ from typing import List, Dict
 from PIL import Image
 from core.extractor import load_image
 
+__all__ = ["ThumbnailUnavailable", "ensure_thumb", "build_gallery"]
+
+
+class ThumbnailUnavailable(Exception):
+    """`ensure_thumb` could not produce a thumbnail from this source.
+
+    Raised instead of a bare `Exception`/`RuntimeError` so the HTTP layer has
+    something typed to catch: an undecodable source used to propagate out of the
+    handler untouched and become a bare 500 with no detail, for a condition that
+    is not a server error at all.
+
+    `reason` is short and machine-readable — the whole point of the type:
+
+      ``"decode_failed"``     the bytes are not an image this build can decode
+                              (corrupt file, a RAW variant libraw refuses).
+                              Deterministic: retrying will never help.
+      ``"source_unreadable"`` the source could not be read at all — missing, or
+                              an I/O error off the disk. The object itself may
+                              well be fine.
+
+    `src_path` is the source that failed and `detail` the underlying message;
+    the original exception is always chained as `__cause__`.
+
+    Note what this deliberately does NOT cover: failing to *write* the
+    thumbnail. An unwritable thumbnail directory is a genuine server fault, so
+    that stays an ordinary exception and should stay a 500.
+    """
+
+    REASONS = ("decode_failed", "source_unreadable")
+
+    def __init__(self, reason: str, src_path: str, detail: str | None = None):
+        self.reason = reason
+        self.src_path = src_path
+        self.detail = detail
+        message = f"{reason}: {src_path}"
+        if detail:
+            message += f" ({detail})"
+        super().__init__(message)
+
+
+def _decode_for_thumbnail(src_path: str, size) -> Image.Image:
+    """Decode the source and shrink it in place. Raises only
+    `ThumbnailUnavailable`."""
+    try:
+        img = load_image(Path(src_path))
+        if img is None:
+            raise ThumbnailUnavailable(
+                "decode_failed", src_path, "loader returned None"
+            )
+        # PIL decodes lazily, so a truncated file blows up here, not at open().
+        # Use LANCZOS resampling for better quality.
+        img.thumbnail(size, Image.Resampling.LANCZOS)
+        return img
+    except ThumbnailUnavailable:
+        raise
+    except OSError as e:
+        # PIL's decode complaints (`UnidentifiedImageError`, "image file is
+        # truncated") are OSErrors carrying no errno; a real filesystem or I/O
+        # failure always carries one. That is the cleanest available line
+        # between "these bytes are not an image" and "I could not read them".
+        reason = "source_unreadable" if e.errno is not None else "decode_failed"
+        raise ThumbnailUnavailable(reason, src_path, str(e)) from e
+    except Exception as e:
+        # Notably RuntimeError("Failed to decode RAW image ...") from
+        # load_image, which is what the mislabelled `.arw` JPEGs used to raise.
+        raise ThumbnailUnavailable("decode_failed", src_path, str(e)) from e
+
+
 def ensure_thumb(src_path: str, thumb_path: str, size=(512, 512)):
     """
     Always create a JPG thumbnail even for RAW images.
     Uses high-quality resampling and JPEG settings for better quality.
-    Raises exception on failure instead of silently failing.
+
+    Raises `ThumbnailUnavailable` when the *source* cannot be turned into an
+    image, and an ordinary exception when writing the thumbnail fails.
     """
+    img = _decode_for_thumbnail(src_path, size)
+
+    thumb_path_obj = Path(thumb_path)
     try:
-        img = load_image(Path(src_path))
-        if img is None:
-            raise Exception(f"Failed to load image from {src_path}")
-        
-        # Use LANCZOS resampling for better quality (explicit resampling method)
-        img.thumbnail(size, Image.Resampling.LANCZOS)
-        
         # Ensure parent directory exists
-        thumb_path_obj = Path(thumb_path)
         thumb_path_obj.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Save with maximum quality settings for better RAW thumbnail quality
         img.save(
-            thumb_path, 
-            "JPEG", 
-            quality=100, 
+            thumb_path,
+            "JPEG",
+            quality=100,
             optimize=False,  # Don't optimize (faster, better quality)
             subsampling=0    # No chroma subsampling (4:4:4, best quality)
         )
-        
+
         # Verify file was created
-        if not Path(thumb_path).exists():
-            raise Exception(f"Thumbnail file was not created at {thumb_path}")
+        if not thumb_path_obj.exists():
+            raise RuntimeError(f"Thumbnail file was not created at {thumb_path}")
     except Exception as e:
-        # Re-raise with more context
-        raise Exception(f"Thumbnail generation failed for {src_path}: {str(e)}") from e
+        raise RuntimeError(
+            f"Thumbnail write failed for {thumb_path} (from {src_path}): {e}"
+        ) from e
 
 
 def build_gallery(

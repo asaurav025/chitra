@@ -73,22 +73,82 @@ def _load_raw_as_rgb(path: Path) -> np.ndarray | None:
         return None
 
 
+# Magic-number prefixes for the container formats PIL can actually open here.
+# Deliberately does NOT include TIFF: ARW, CR2, NEF and DNG are all TIFF-based,
+# so sniffing a TIFF header proves nothing about whether rawpy or PIL should
+# handle the file.
+_MAGIC = (
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+)
+
+# Enough bytes for the longest test below (the ISO-BMFF brand at offset 8:12).
+_SNIFF_BYTES = 16
+
+
+def sniff_extension(data: bytes) -> str | None:
+    """The extension the *bytes* deserve, or None if they are not recognised.
+
+    Shared with `scripts/reembed.py`, which needs the same judgement about
+    already-downloaded bytes. One implementation, deliberately: two copies of a
+    magic-number table drift.
+    """
+    for prefix, ext in _MAGIC:
+        if data.startswith(prefix):
+            return ext
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"heic", b"heix", b"heim", b"heis", b"hevc", b"mif1", b"msf1"):
+            return ".heic"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def sniff_file_extension(path: str | Path) -> str | None:
+    """`sniff_extension` for a path. None if the header is inconclusive; read
+    errors are left to the caller, which will hit them again immediately."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(_SNIFF_BYTES)
+    except OSError:
+        return None
+    return sniff_extension(head)
+
+
 def load_image(path: Path) -> Image.Image:
     """
-    Load image from JPG/PNG/TIFF or RAW (ARW/CR2/NEF...).
+    Load image from JPG/PNG/TIFF/HEIC or RAW (ARW/CR2/NEF...).
     Always returns a RGB PIL.Image.
-    """
-    ext = path.suffix.lower()
-    path_str = str(path)
 
-    # RAW path
+    Dispatch is on the file's *bytes*, not its name. The extension lies: 63
+    photos in this library are named `.arw`/`.ARW` and begin `FF D8 FF E0 JFIF`
+    — they are JPEGs. Trusting `path.suffix` sent them to rawpy, which answered
+    `LibRawFileUnsupportedError`; `_load_raw_as_rgb` swallowed that and returned
+    None, so all that surfaced was `RuntimeError("Failed to decode RAW image")`
+    and every one of the 63 lost both its thumbnail and its embedding.
+
+    Only a confident sniff overrides the name. Inconclusive bytes fall back to
+    the extension, which keeps genuine RAW on the rawpy path — a TIFF header is
+    not evidence either way, since every Sony/Canon/Nikon RAW is TIFF-based.
+    """
+    path_str = str(path)
+    declared = path.suffix.lower()
+    sniffed = sniff_file_extension(path)
+    ext = sniffed if sniffed is not None else declared
+
+    # RAW path. Reachable only via `declared`: `sniff_extension` never returns a
+    # RAW extension, by design.
     if ext in RAW_EXTS:
         rgb = _load_raw_as_rgb(path)
         if rgb is None:
             raise RuntimeError(f"Failed to decode RAW image {path_str}")
         return Image.fromarray(rgb).convert("RGB")
 
-    # Normal path
+    # Normal path. PIL sniffs the container itself, so it needs no help from us
+    # beyond not being handed the file only after rawpy has refused it.
     img = Image.open(path_str)
     return img.convert("RGB")
 

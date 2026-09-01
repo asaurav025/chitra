@@ -93,6 +93,12 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Se
 # as `scripts.reembed` by the test suite.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# The one exception to this file's lazy-import rule (see `_load_embedder`):
+# `core.extractor` costs ~0.1 s and ~38 MB and pulls no torch, and the
+# magic-number sniffing below has to be the *same* code that `load_image`
+# dispatches on, or the two drift.
+from core.extractor import sniff_extension  # noqa: E402
+
 DB_DEFAULT_PATH = os.environ.get("CHITRA_DB_PATH", "photo.db")
 DEFAULT_JOURNAL = "reembed_state.jsonl"
 
@@ -598,50 +604,29 @@ class Result(NamedTuple):
     decisions: List[Decision]
 
 
-# Magic-number prefixes for the container formats `core.extractor.load_image`
-# can actually open through PIL. Deliberately does NOT include TIFF: ARW, CR2,
-# NEF and DNG are all TIFF-based, so sniffing a TIFF header proves nothing about
-# whether rawpy or PIL should handle the file.
-_MAGIC = (
-    (b"\xff\xd8\xff", ".jpg"),
-    (b"\x89PNG\r\n\x1a\n", ".png"),
-    (b"GIF87a", ".gif"),
-    (b"GIF89a", ".gif"),
-)
-
-def _sniff_extension(data: bytes) -> Optional[str]:
-    """The extension the *bytes* deserve, or None if they are not recognised."""
-    for prefix, ext in _MAGIC:
-        if data.startswith(prefix):
-            return ext
-    if len(data) >= 12 and data[4:8] == b"ftyp":
-        brand = data[8:12]
-        if brand in (b"heic", b"heix", b"heim", b"heis", b"hevc", b"mif1", b"msf1"):
-            return ".heic"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return ".webp"
-    return None
+# The magic-number table this script used to carry now lives in
+# `core.extractor`, next to the `load_image` dispatch that has to agree with it.
+# Imported rather than copied so the two can never disagree.
+_sniff_extension = sniff_extension
 
 
 def effective_filename(key: str, data: bytes) -> str:
     """The filename to hand the embedder, corrected when the key lies.
 
-    `core.extractor.load_image` dispatches on the extension: anything in
-    `RAW_EXTS` goes to rawpy, everything else to PIL. That is fine until the
-    extension is wrong — and here it is wrong for 63 of the 65 photos that have
-    no thumbnail. They are named `.arw`/`.ARW`, their bytes start
-    `FF D8 FF E0 JFIF`, and rawpy answers `LibRawFileUnsupportedError`. Both
-    their thumbnail generation and their embedding failed for that reason, and
-    the disk had nothing to do with it: the reads succeed.
+    The extension lies for 63 of the 65 photos that have no thumbnail: they are
+    named `.arw`/`.ARW`, their bytes start `FF D8 FF E0 JFIF`, and rawpy answers
+    `LibRawFileUnsupportedError`. Both their thumbnail generation and their
+    embedding failed for that reason, and the disk had nothing to do with it:
+    the reads succeed.
 
-    Since the bytes are already in hand, the fix here is one line — send a name
-    that matches the content. Only a confident mismatch is corrected; anything
-    unrecognised keeps the name it came with, and a TIFF header is deliberately
-    not treated as evidence (every Sony/Canon/Nikon RAW is a TIFF).
+    Since the bytes are already in hand, the correction here is one line — send
+    a name that matches the content. Only a confident mismatch is corrected;
+    anything unrecognised keeps the name it came with, and a TIFF header is
+    deliberately not treated as evidence (every Sony/Canon/Nikon RAW is a TIFF).
 
-    Correcting `load_image` itself is the real fix and belongs to whoever owns
-    `core/extractor.py`; the same 63 files are invisible to thumbnails and to
-    the upload path until then.
+    `core.extractor.load_image` now sniffs the same way, so this no longer
+    papers over a defect there; it stays because the sidecar is handed a
+    filename, not a file, and that name still has to be honest.
     """
     name = os.path.basename(key)
     declared = os.path.splitext(name)[1].lower()
