@@ -8,7 +8,7 @@ built the embedding sidecar. This plan makes the *worker* side fast, makes the
 tag vocabulary useful, and exposes the search surfaces that are already
 computable from data on disk.
 
-## The constraint that shapes this plan
+## Storage risk (accepted by the owner — do not re-litigate)
 
 `/dev/sda` is failing — 1,950+ unrecovered read errors, still climbing, 11 bad
 sectors across four regions.
@@ -23,9 +23,39 @@ All originals, thumbnails, posters and face crops are on the failing disk.
 healthy NVMe. Anything reading only SQLite/Redis/model-cache touches `/dev/sda`
 zero times.
 
-**Phases 0-4 are doable today. Phases 5-8 are blocked on storage.** Do not
-promote a task across the gate; if a task turns out to need a media read it moves
-down, not sideways.
+**The owner has accepted this risk and chosen to proceed.** Consequences folded
+into the plan, not used to block it:
+
+* The re-embed reads **thumbnails, not originals** (`scripts/reembed.py`'s
+  design) — ~100x less I/O. Coverage measured: **1,971 of 2,040 rows (96.6%)**,
+  and **every one of the 1,694 currently-embedded photos has a thumbnail**, so
+  the thumbnail path covers the whole existing corpus with no fallback.
+* `scripts/reembed.py` carries a disk-health guard that aborts if kernel read
+  errors climb mid-run. **Do not add overrides, and do not re-run past an abort
+  without reporting it.** An abort is data, not an obstacle.
+* Phase ordering puts every zero-media-read task first anyway — that is what
+  value / risk gives on its own, not a gate.
+
+The evacuation remains the highest-value owner action and is listed there.
+
+## Concurrent work — read this first
+
+**Agent A — face-clustering trigger (committed `4383ff0`).** Owns
+`app_fastapi.py` `:63-65`, `:803+`, `:1167`, `:1302-1311`, `:1387-1395`; and in
+`core/jobs.py` the new `FACE_MATCH_THRESHOLD = 0.60`, the
+`_auto_match_face_to_person` signature and its call sites at `:303` / `:461`.
+**It does not touch `process_photo_embedding_job` or
+`_process_single_embedding`**, so Phase 2 — the largest change here — is
+conflict-free.
+
+**Agent B — `scripts/reembed.py` and the duplicate-insert fix. Nothing landed
+yet** (verified: no `scripts/reembed.py` committed; `embeddings` still
+`(id, photo_id, dim, vector)`; `put_embedding` still a plain INSERT at
+`core/db.py:279`). **This plan treats Agent B's work as a dependency with a
+contract, not as existing code** — Task 0.3 verifies what actually landed.
+**Do not implement the uniqueness fix; Agent B owns it.**
+
+Re-check `git log --oneline -5` at the start of every phase.
 
 ## What we measured
 
@@ -112,10 +142,21 @@ All-pairs Hamming over 1,715 hashes: `<=0`: 15 pairs, `<=4`: 112, `<=8`: 242,
 `ValueError: all input arrays must have the same shape`.
 **One 768-d row makes every search request 500 for every user.**
 
-### Not coupled to embedding dimension
-`core/faiss_index.py` reads `dim = vectors.shape[1]`; both persisted indexes hold
-**buffalo_l 512-d face vectors**. **No persisted FAISS index needs rebuilding for
-a CLIP -> SigLIP change.** The coupling is entirely in `search_photos`.
+### There is NO photo-embedding FAISS index to rebuild
+This corrects a natural assumption, because "768-d means rebuild the FAISS
+indexes" is exactly what a reader expects — and acting on it would discard 549
+assigned faces for nothing. Verified:
+
+* `core/faiss_index.py:47` reads `dim = vectors.shape[1]` — dimension-agnostic.
+* The only two persisted indexes (`existing_person_faces.index` 406 KB,
+  `unmatched_faces_cluster.index` 25 KB) are built from **`faces.embedding`** —
+  `core/jobs.py:726` is literally `SELECT f.id, f.embedding ... FROM faces f`.
+  These are **buffalo_l 512-d face vectors, not CLIP photo vectors.**
+* `core/cluster.py` builds a CLIP index but in memory, per invocation, CLI-only.
+* **Photo search uses no FAISS at all** — brute-force numpy GEMV over 3.31 MiB.
+
+**So the 512->768 transition requires no FAISS rebuild.** The dimension coupling
+is entirely `search_photos`'s `np.stack`. Task 1.4 pins this with a test.
 
 ### Dependency state
 `transformers==4.35.0` installed and **absent from `requirements.txt`** — a clean
@@ -291,20 +332,12 @@ media reads. Phase 3 third: biggest user-visible win available today.
 Phase 4 fourth. SigLIP dependency work last on the green side — riskiest, and the
 only green task safely abandonable.
 
-## GATE — everything below reads media at scale
+## Read cost, for reference
 
-**Exit condition, all three:**
-1. MinIO's data directory served from a device that is not `/dev/sda`, and Chitra
-   reading from it.
-2. The old copy still present, or a verified second copy exists — **an evacuation
-   is not a migration until there are two copies.**
-3. A checksum spot-check passes (`photos.checksum` holds SHA-1 already).
-
-**Until all three hold, do not run any gated task, and do not "just try a few
-photos".** Reading 20 originals to test is still 20 reads off a failing disk.
-
-Below the gate, by ascending read cost: video posters (~64 MB) -> the 84
-stragglers (~3 GB) -> full SigLIP re-embed (~69 GB, or ~424 MB from thumbnails).
+Phases 0-5 read **zero** MinIO objects (one single-object exception: Task 0.2's
+timing baseline). Phase 6 is the only bulk-read phase, and the thumbnail path
+keeps it to ~424 MB rather than ~69 GB. Phase 7's videos ride the same pass at
+**zero additional I/O** if sequenced together — which is the recommendation.
 
 ## Tasks
 
@@ -327,8 +360,24 @@ re-check `git log --oneline -5` at the start of each phase.
   and four data counts from a read-only connection
   (`sqlite3 'file:photo.db?mode=ro&immutable=1'`).
 - **0.2** Time one real embedding job and one real face job on an
-  already-uploaded photo. **The only MinIO read in Phases 0-4** — a single
-  object, and the baseline every later "Nx faster" claim is measured against.
+  already-uploaded photo. **The only MinIO read before Phase 6** — a single
+  object, and the baseline every later "Nx faster" claim measures against.
+- **0.3 — Verify what Agent B landed, and check the contract.** THE HIGHEST-VALUE
+  CHECK IN THIS PLAN. Record, from schema and code rather than expectation:
+  1. **The unique key on `embeddings`.** If `(photo_id, model)` — proceed. **If
+     `(photo_id)` alone, STOP AND RAISE IT.** A bare `photo_id` key means the
+     first SigLIP row *evicts* the CLIP row it is meant to run alongside —
+     coexistence and rollback both vanish, on a disk where an interrupted run is
+     the expected case. Do not drop and recreate their index underneath them.
+  2. Whether `embeddings.model` already exists (if so, Phase 1 shrinks to the
+     search-handler half).
+  3. Whether `scripts/reembed.py` accepts **`--model`** and populates that
+     column. If not, request it — Phase 6's cutover and rollback have nothing to
+     key on without it.
+  4. Its flags: `--apply`, `--force`, `--limit`, resumability, guard behaviour.
+  5. Whether it loads the model in-process or calls the sidecar. In-process
+     alongside the sidecar is 1,670 + 2,054 = **~3.7 GB concurrently** in a
+     cgroup capped at 8G — fits, but worth knowing before the run.
 
 ### Phase 1 — Make re-indexing safe (SQLite only)
 - **1.1** Red tests: double `put_embedding` for same `(photo_id, model)` leaves
@@ -347,6 +396,13 @@ re-check `git log --oneline -5` at the start of each phase.
   and ranks only the active model. **Watch it fail with the real
   `ValueError`** — that traceback is the production bug. Then add a `model`
   filter driven by `CHITRA_ACTIVE_EMBED_MODEL`.
+- **1.4 — Pin that the face FAISS indexes are untouched by a CLIP model change.**
+  Assert `existing_person_faces.index` is built from `faces.embedding`
+  (buffalo_l 512-d), not `embeddings.vector`, and that `build_hnsw_index` derives
+  `dim` from its input. Write the rationale into the docstring: "768-d means
+  rebuild the indexes" is the natural assumption and it is **wrong here** —
+  acting on it would discard 549 assigned faces for nothing. Record the finding
+  in `.claude/rules/ml-pipeline.md`.
 - **1.6** Guard `POST /api/index/embeddings`: prove a double non-incremental run
   leaves counts unchanged, and skip videos (`COALESCE(media_type,'photo')`).
 
@@ -410,27 +466,78 @@ re-check `git log --oneline -5` at the start of each phase.
   behind the same flag. **Changes the documented baseline** — update `AGENTS.md`
   in the same commit or skip.
 
-### Phase 5 — Video posters (BLOCKED, ~64 MB)
-Read `thumb_path`, **not `file_path`** — the latter reads the whole video.
-Enqueue for the 257 that have a poster. Update
-`.claude/rules/ml-pipeline.md`'s "videos get no ML" in the same commit — a stale
-scoped rule is worse than none.
+### Phase 5 — transformers upgrade and SigLIP staging (no media reads)
 
-### Phase 6 — The 84 stragglers (BLOCKED, ~3 GB)
-`POST /api/index/embeddings {"incremental": true}`, then re-run the re-tag.
+- **5.1 — Red test for CLIP stability across the bump.** Embed a **fixed-seed
+  synthetic PIL gradient generated in the test** (no photo, no MinIO) against a
+  checked-in reference vector, tolerance 1e-4, behind `CHITRA_TEST_LOAD_MODELS=1`.
+  **Done when it PASSES on 4.35.0**, establishing the reference. This is the
+  entire safety net for 5.2.
+- **5.2 — Fix the dependency chain.** **Add `transformers>=4.50,<5`** (currently
+  absent — a clean install cannot embed), relax `huggingface_hub` `<0.18` ->
+  `>=0.30`, add `tokenizers>=0.21`, remove `open-clip-torch` (unimported).
+  **Scratch venv first.** Re-run 5.1. **If it fails, STOP** — drift converts a
+  dependency bump into a forced full re-embed on a failing disk.
+- **5.3 — Measure SigLIP's footprint.** Isolated processes, **`VmHWM`, not
+  `ru_maxrss`** (a subprocess child inherits the parent's peak). Table: vision-only
+  fp32/fp16, full fp32, text-tower fp16, and **co-resident with CLIP + buffalo_l**.
+  Re-measure the thread curve — **the 3-thread optimum is a CLIP result and may
+  not transfer**; patch16-224 has 4x the tokens. **If the text tower cannot fit
+  alongside buffalo_l, say so and STOP** — vision-only breaks free-text search,
+  and that is a finding, not a failure.
+- **5.4 — `SiglipEmbedder` behind `CHITRA_EMBED_MODEL`**, same interface as
+  `ClipEmbedder` so sidecar, sync client and tagger need no changes. 768-d.
+- **5.5 — Red test for the dual-model sidecar.** `CHITRA_EMBED_MODEL` and
+  `CHITRA_ACTIVE_EMBED_MODEL` must be **separable** — that is what lets the
+  sidecar serve SigLIP while search still answers from CLIP.
+- **5.6 — Optional:** gate `tests/test_search.py:setUpClass`'s real
+  `ClipEmbedder` behind the same flag. **Changes the documented baseline** —
+  update `AGENTS.md` in the same commit or skip.
 
-### Phase 7 — SigLIP migration (BLOCKED, ~69 GB or ~424 MB from thumbnails)
-Decide the tower from 4.3's table — **if free-text search cannot be served within
-budget, SigLIP does not land.** `SiglipEmbedder` behind `CHITRA_EMBED_MODEL`,
-same interface so sidecar/client/tagger need no changes. Re-embed batched,
-resumable (the `(photo_id, model)` index makes done photos skip by construction),
-with a hard stop on repeated read errors. Cut over only when coverage matches.
-**Keep the 512-d rows for a week — 3.31 MiB, and they are the rollback.**
-Re-tag under sigmoid scoring, where D5's calibration hack goes away. Retire the
-old rows last.
+### Phase 6 — Re-embed and cut over (uses `scripts/reembed.py`)
 
-### Phase 8 — Follow-on (BLOCKED)
-Face re-detection at higher resolution; re-clustering under the unified threshold.
+This plan does **not** specify a competing pipeline. Agent B owns the mechanism.
+
+- **6.1 — Pilot on 50 photos.** `--limit 50 --apply`. Confirm rows land with
+  `model` populated and `dim=768`, **the 512-d rows are still present** (if they
+  were evicted, the unique key is wrong and Task 0.3 missed it), and search is
+  unaffected throughout.
+- **6.2 — Full pass.** `--force --apply`. ~7.3 min of compute; the reads are the
+  cost, mitigated by the thumbnail path. **If the disk guard aborts, STOP AND
+  REPORT** — resumability means an abort costs progress, not correctness.
+- **6.3 — Verify coverage before cutting over.** SigLIP row count must match
+  CLIP's. **Do not flip on partial coverage** — search would silently lose every
+  photo not yet re-embedded, with no error.
+- **6.4 — Cut over.** Flip `CHITRA_ACTIVE_EMBED_MODEL` and `CHITRA_EMBED_MODEL`.
+  One config change, because Phase 1 did the work.
+- **6.5 — Soak, then retire.** **Keep the 512-d rows a week** — 3.31 MiB, and they
+  are the rollback. Then one `DELETE ... WHERE model = 'openai/clip-vit-base-patch32'`.
+- **6.6 — Re-tag under sigmoid scoring.** Where D5's calibration hack goes away:
+  SigLIP's sigmoid loss makes scores comparable *across* images, so an absolute
+  threshold finally means something. Mechanically 3.6 re-run. **Zero MinIO reads.**
+
+**Rollback in full:** flip `CHITRA_ACTIVE_EMBED_MODEL` back. Search returns to the
+512-d rows instantly, the 768-d rows sit inert, tags revert with
+`DELETE FROM tags WHERE source LIKE 'siglip%'` plus a re-run of 3.6 under CLIP.
+Nothing needs re-embedding and no FAISS index is involved. This survives an
+interrupted or abandoned migration — the case worth designing for here.
+
+### Phase 7 — Videos and the tails (mostly free)
+
+**258 videos already have a poster**, and `scripts/reembed.py` reads `thumb_path`
+— so they are **already in its input set**. The only thing excluding them is the
+`_is_video` skip.
+
+- **7.1/7.2 — Lift the skip for the poster path only.** `_is_video` must keep
+  blocking ML on the **original**; assert a video embedding job reads
+  `thumb_path`, not `file_path` (the latter pulls gigabytes instead of ~250 KB).
+  **Zero additional disk I/O if this rides Phase 6's pass** — the recommendation.
+- **7.3 — Update `.claude/rules/ml-pipeline.md`**: "videos get no ML" becomes
+  "videos get no ML from the original; posters are embedded", same commit. A
+  stale scoped rule is worse than none.
+- **7.4 — The tails.** 19 photos with a thumb but no embedding (free, same path);
+  65 with neither (generate thumbnails first); 5 videos with no poster
+  (`generate_video_poster_job`, reads the original).
 
 ## Owner actions (sudo)
 
@@ -451,7 +558,10 @@ Face re-detection at higher resolution; re-clustering under the unified threshol
 
 | risk | mitigation |
 |---|---|
-| A gated task gets run "just to test" | The gate names this. 20 test reads are still 20 reads off a failing disk. |
+| **Agent B's unique key is `(photo_id)`, not `(photo_id, model)`** | Task 0.3 checks it BEFORE anything builds on it. A bare key makes coexistence and rollback impossible. Raise it; do not work around it. |
+| **`scripts/reembed.py` does not populate `embeddings.model`** | Task 0.3 checks; `--model` is the one addition Phase 6 depends on. Without it the cutover and rollback have nothing to key on. |
+| Disk-health guard aborts mid-run | Stop and report. Resumability means an abort costs progress, not correctness. Do not add an override. |
+| Cutover on partial coverage silently hides photos | Task 6.3 gates the flip on a row-count match. |
 | Sidecar down -> embedding and face jobs fail | Deliberate. Jobs re-raise, RQ shows failed, `/api/health` reports it. A silent fallback would restore the 58 s path invisibly. |
 | Sidecar = SPOF for three subsystems | `Restart=always`; own unit; 113 ms worst-case queueing on a 14 ms baseline. |
 | Unique index fails on pre-existing duplicates | `scripts/dedupe_embeddings.py` first; production measured clean. |
@@ -472,7 +582,7 @@ column is for. Phase 4 endpoints additive. Phase 7 reverts by flipping
 
 ## Explicitly out of scope
 
-VLM captioning via Ollama (ruled out on measurement: 7.7-10 tok/s at 534% CPU,
+**The `put_embedding`/`add_tag` uniqueness fix and `scripts/reembed.py` — Agent B owns both.** VLM captioning via Ollama (ruled out on measurement: 7.7-10 tok/s at 534% CPU,
 10-24 h backlog, 7.6x API latency degradation — **do not reintroduce**);
 pre-existing baseline failures; `app_fastapi.py:1524-1913` dead code; the
 face-clustering `depends_on` change and threshold unification (another agent);
