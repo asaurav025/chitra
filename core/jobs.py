@@ -65,11 +65,47 @@ _EMBED_CLIENT = None
 
 
 def _is_video(conn, photo_id: int) -> bool:
-    """True if the photo row is a video (image-only ML jobs must skip these)."""
+    """True if the photo row is a video (image-only ML jobs must skip these).
+
+    This is still the gate for **face detection**, which has no poster path and
+    must not grow one by accident. Embedding uses `_embed_source_key` instead:
+    it runs on the poster, never on the original.
+    """
     cur = conn.cursor()
     cur.execute("SELECT media_type FROM photos WHERE id=?", (photo_id,))
     row = cur.fetchone()
     return bool(row and row["media_type"] == "video")
+
+
+def _embed_source_key(conn, photo_id: int, file_path: str):
+    """The object key to embed for this photo, or None if there is nothing to.
+
+    For a video that is the **poster** in `thumb_path`, and never `file_path`.
+    258 of the 262 videos already have one: a 512x512 JPEG of ~250 KB, ~64 MB
+    for the whole set, already generated and already sitting next to every
+    photo thumbnail. The original is a multi-gigabyte MOV on a disk with 3,000+
+    unrecovered read errors, and CLIP consumes 224x224 of one frame regardless
+    — so reading it would cost four orders of magnitude more for a worse
+    vector. That is why videos were excluded in the first place; the poster
+    removes the reason rather than the exclusion.
+
+    The 4 videos with no poster return None and read nothing. Falling back to
+    `file_path` for them would be strictly worse than doing nothing:
+    `generate_video_poster_job` is the way to fix those, and it is the only
+    thing that should ever open a video original.
+
+    `media_type` is NULL on 766 of the 2,040 rows, which means photo.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(media_type, 'photo') AS media_type, thumb_path "
+        "FROM photos WHERE id=?",
+        (photo_id,),
+    )
+    row = cur.fetchone()
+    if row is None or row["media_type"] != "video":
+        return file_path
+    return row["thumb_path"] or None
 
 
 #: The persistent index over every face already assigned to a person.
@@ -421,13 +457,14 @@ def process_photo_embedding_job(photo_id: int, file_path: str, db_path: str):
     conn = db.connect(db_path)
 
     try:
-        if _is_video(conn, photo_id):
-            print(f"Skipping embedding for video photo {photo_id}")
+        key = _embed_source_key(conn, photo_id, file_path)
+        if key is None:
+            print(f"Skipping embedding for video photo {photo_id}: no poster")
             return True
         # One download, straight to the sidecar. The disk under MinIO has 3,000+
         # unrecovered read errors; a second read per photo buys nothing.
-        file_data = _get_storage_client().download_file(file_path)
-        _embed_and_tag(conn, photo_id, file_path, file_data)
+        file_data = _get_storage_client().download_file(key)
+        _embed_and_tag(conn, photo_id, key, file_data)
         return True
     except Exception as e:
         print(f"Error processing embedding for photo {photo_id}: {e}")
@@ -546,11 +583,12 @@ def _process_single_embedding(pid: int, file_path: str, db_path: str) -> bool:
     conn = db.connect(db_path)
 
     try:
-        if _is_video(conn, pid):
-            print(f"Skipping embedding for video photo {pid}")
+        key = _embed_source_key(conn, pid, file_path)
+        if key is None:
+            print(f"Skipping embedding for video photo {pid}: no poster")
             return False
-        file_data = _get_storage_client().download_file(file_path)
-        _embed_and_tag(conn, pid, file_path, file_data)
+        file_data = _get_storage_client().download_file(key)
+        _embed_and_tag(conn, pid, key, file_data)
         return True
     except Exception as e:
         print(f"Error processing embedding for photo {pid}: {e}")
