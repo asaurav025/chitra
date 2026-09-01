@@ -577,3 +577,110 @@ FAILED (failures=10, errors=4, skipped=2)
 guard lands as **3 failures, not 1 error** (7 -> 10 failures; errors unchanged at
 4), because the probe subprocess succeeds and it is the assertions that fail —
 an error would mean the probe itself crashed. Intended and temporary.
+
+### Phase 1 — Break the ML import chain
+
+**Task 1.1 — `core/jobs.py` ML imports made lazy.**
+
+Removed from module scope: `core.embedder.ClipEmbedder`, `core.face.face_encodings`,
+`core.tagger.auto_tags`. Left at module scope as measured-cheap: `core.db`,
+`core.video`, `core.extractor`, `core.storage_client`, `core.gallery`.
+
+Moved into the five call sites (`core/jobs.py`):
+
+| line | function | import |
+|---|---|---|
+| 132 | `_get_embedder` | `from core.embedder import ClipEmbedder` |
+| 149 | `process_photo_embedding_job` | `from core.tagger import auto_tags` |
+| 196 | `process_photo_faces_job` | `from core.face import face_encodings` |
+| 287 | `_process_single_embedding` | `from core.tagger import auto_tags` |
+| 355 | `_process_single_face` | `from core.face import face_encodings` |
+
+A comment block at `core/jobs.py:17-22` records *why* they are lazy, so the next
+reader does not tidy them back to module scope.
+
+Diff scope respected — `git diff -U0` hunk headers touch only the import block
+and those five functions. `process_video_transcode_job` and everything
+`transcode_status`-related are untouched (concurrent transcode work was in
+flight).
+
+Done-check:
+
+```
+$ .venv/bin/python -c "import core.jobs, sys; assert 'torch' not in sys.modules"
+PASS: core.jobs imported, torch not in sys.modules
+```
+
+**F821 check — note: `ruff` is not installed** in the venv or on PATH (AGENTS.md
+already records that no linter is configured), so the plan's "ruff reports no
+F821" done-check could not be run as written. Substituted an AST check that
+proves every reference to the three lazily-imported symbols is bound in the
+scope that uses it — precisely the NameError risk the plan flags:
+
+```
+  ok: ClipEmbedder   @ line 136 bound locally in _get_embedder()
+  ok: auto_tags      @ line 172 bound locally in process_photo_embedding_job()
+  ok: face_encodings @ line 212 bound locally in process_photo_faces_job()
+  ok: auto_tags      @ line 310 bound locally in _process_single_embedding()
+  ok: face_encodings @ line 371 bound locally in _process_single_face()
+
+PASS: all 5 references resolve; 0 F821-equivalent problems
+```
+
+**Task 1.2 — deleted the two unused ML imports from `app_fastapi.py`.** Verified
+unreferenced first: `grep -n` returned exactly one hit each, the import line
+itself (`:48 from core.face import face_encodings`, `:49 from core.tagger import
+auto_tags`).
+
+**Task 1.3 — re-measure.**
+
+```
+                 before                                    after
+core.jobs        519 MB  ['torch','transformers','rawpy']   53 MB  ['rawpy']
+app_fastapi      557 MB  ['torch','transformers','faiss','rawpy']
+                                                           557 MB  (unchanged)
+```
+
+**`core.jobs` drops 519 -> 53 MB, a 466 MB reduction**, and no longer resides
+torch/transformers. `app_fastapi` is unchanged at 557 MB, exactly as the plan
+predicts — `:46 from core.embedder import ClipEmbedder` is still a direct
+import and only Task 3.2 removes it.
+
+Per-module probe confirming `core.embedder` is now the **sole** remaining torch
+source in the API's chain:
+
+```
+  core.auth              rss=  31 MB  heavy=[]
+  core.cache             rss=  11 MB  heavy=[]
+  core.db                rss=  13 MB  heavy=[]
+  core.db_async          rss=  21 MB  heavy=[]
+  core.embedder          rss= 511 MB  heavy=['torch', 'transformers']
+  core.extractor         rss=  38 MB  heavy=[]
+  core.faiss_index       rss=  35 MB  heavy=[]
+  core.gallery           rss=  39 MB  heavy=[]
+  core.jobs              rss=  53 MB  heavy=[]
+  core.schemas           rss=  31 MB  heavy=[]
+  core.storage_client    rss=  32 MB  heavy=[]
+  core.video             rss=  14 MB  heavy=[]
+  core.worker            rss=  29 MB  heavy=[]
+```
+
+Every module except `core.embedder` is at or under 53 MB, which supports the
+plan's projection that the API lands near ~97 MB once Task 3.2 lands — well
+inside the 200 MB budget.
+
+Suite after Phase 1:
+
+```
+Ran 84 tests in 5.723s
+FAILED (failures=9, errors=4, skipped=2)
+```
+
+That is the 7 pre-existing `test_endpoints` auth failures + 4 pre-existing
+errors (3 `test_db_async`, 1 `test_search`) + **2 intentionally-red guard
+assertions**. `TestJobsImportIsMLFree` went green. No regression.
+
+**Phase 1 ends with the guard test still red by design** — the two
+`TestApiImportIsMLFree` assertions (`heavy=['torch','transformers']`,
+`rss_mb=557`) stay red until Phase 3 Task 3.2 removes `app_fastapi.py:46`. That
+is the plan's expected state, not a defect.

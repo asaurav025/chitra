@@ -11,12 +11,16 @@ import numpy as np
 
 from core import db
 from core import video
-from core.embedder import ClipEmbedder
 from core.extractor import load_image
-from core.face import face_encodings
 from core.storage_client import MinIOStorageClient
 from core.gallery import ensure_thumb
-from core.tagger import auto_tags
+
+# core.embedder, core.face and core.tagger are imported lazily inside the jobs
+# that use them. app_fastapi imports this module only to enqueue jobs by
+# reference, and a module-scope import here costs every uvicorn worker a full
+# torch/transformers import (~450 MB) with no model loaded — which is what
+# OOM-killed chitra-api. Keep these imports inside the functions.
+# Guarded by tests/test_api_memory_budget.py.
 
 
 # Global instances (will be initialized per worker)
@@ -125,6 +129,8 @@ def _get_storage_client():
 
 def _get_embedder():
     """Get or create embedder instance."""
+    from core.embedder import ClipEmbedder  # lazy: keeps torch out of the API
+
     global _EMBEDDER
     if _EMBEDDER is None:
         _EMBEDDER = ClipEmbedder()
@@ -140,6 +146,8 @@ def process_photo_embedding_job(photo_id: int, file_path: str, db_path: str):
         file_path: MinIO object key to the photo file
         db_path: Path to SQLite database
     """
+    from core.tagger import auto_tags  # lazy: keeps torch out of the API
+
     conn = db.connect(db_path)
     storage_client = _get_storage_client()
 
@@ -185,6 +193,8 @@ def process_photo_faces_job(photo_id: int, file_path: str, db_path: str, min_sco
         min_score: Minimum face detection score
         thumb_size: Thumbnail size
     """
+    from core.face import face_encodings  # lazy: keeps onnxruntime out of the API
+
     conn = db.connect(db_path)
     storage_client = _get_storage_client()
 
@@ -274,6 +284,8 @@ def process_photo_faces_job(photo_id: int, file_path: str, db_path: str, min_sco
 
 def _process_single_embedding(pid: int, file_path: str, db_path: str) -> bool:
     """Process embedding for a single photo (used in parallel processing)."""
+    from core.tagger import auto_tags  # lazy: keeps torch out of the API
+
     conn = db.connect(db_path)
     storage_client = _get_storage_client()
     em = _get_embedder()
@@ -340,6 +352,8 @@ def index_embeddings_batch_job(photo_ids_and_paths: list, db_path: str, incremen
 
 def _process_single_face(pid: int, file_path: str, db_path: str, min_score: float, thumb_size: int) -> bool:
     """Process faces for a single photo (used in parallel processing)."""
+    from core.face import face_encodings  # lazy: keeps onnxruntime out of the API
+
     conn = db.connect(db_path)
     storage_client = _get_storage_client()
 

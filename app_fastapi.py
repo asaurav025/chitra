@@ -45,8 +45,6 @@ from core import auth
 from core import video
 from core.embedder import ClipEmbedder
 from core.extractor import collect_metadata, load_image, iter_images, is_video, RAW_EXTS, _normalize_exif_date
-from core.face import face_encodings
-from core.tagger import auto_tags
 from core.gallery import ensure_thumb
 from core.cache import get_cached_thumbnail, cache_thumbnail
 from core.worker import get_queue
