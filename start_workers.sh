@@ -38,6 +38,41 @@ else
     PYTHON_CMD="python3"
 fi
 
+# ---------------------------------------------------------------------------
+# CLIP embedding sidecar
+#
+# One CLIP for the whole box instead of one per uvicorn worker. The API used to
+# import core.embedder in all four workers — ~450 MB each of torch import
+# weight with no model loaded, ~1.14 GB each once search touched it — against a
+# 4 GB cap that OOM-killed the service six times in two days.
+#
+# It lives here rather than in its own unit only because unit files need sudo.
+# The target state is chitra-embed.service; set CHITRA_EMBED_SELF_START=0 in
+# .env.production the moment that unit exists, and this block stands down.
+#
+# --workers 1 is not a tuning knob: a second uvicorn worker would load a second
+# copy of the model, which is the exact bug this process exists to fix.
+# ---------------------------------------------------------------------------
+CHITRA_EMBED_SELF_START="${CHITRA_EMBED_SELF_START:-1}"
+CHITRA_EMBED_HOST="${CHITRA_EMBED_HOST:-127.0.0.1}"
+CHITRA_EMBED_PORT="${CHITRA_EMBED_PORT:-5101}"
+
+if [ "$CHITRA_EMBED_SELF_START" = "1" ]; then
+    if [ -f logs/embed.pid ] && ps -p "$(cat logs/embed.pid)" > /dev/null 2>&1; then
+        echo "Embedding sidecar already running with PID $(cat logs/embed.pid)"
+    else
+        echo "Starting CLIP embedding sidecar on $CHITRA_EMBED_HOST:$CHITRA_EMBED_PORT..."
+        $PYTHON_CMD -m uvicorn embed_service:app \
+            --host "$CHITRA_EMBED_HOST" --port "$CHITRA_EMBED_PORT" \
+            --workers 1 > logs/embed.log 2>&1 &
+        echo $! > logs/embed.pid
+        echo "Embedding sidecar started with PID $(cat logs/embed.pid)"
+        echo "  (search 503s until CLIP finishes loading, ~10s)"
+    fi
+else
+    echo "CHITRA_EMBED_SELF_START=0 — leaving the sidecar to chitra-embed.service"
+fi
+
 echo "Starting $WORKER_COUNT Chitra RQ workers (default queue)..."
 
 # Start default-queue workers in background and save PIDs

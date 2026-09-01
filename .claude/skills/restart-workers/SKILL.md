@@ -10,6 +10,16 @@ that way leaves the video permanently `transcode_status="failed"` with no
 requeue endpoint — recovery is manual SQL. So the whole procedure is: **prove
 the video queue is idle, then stop, then let systemd respawn.**
 
+**A worker restart also restarts search.** `start_workers.sh` launches the CLIP
+embedding sidecar (`embed_service.py`) alongside the six RQ workers, because
+unit files need sudo and this script is the only ExecStart in the repo. While
+it is down — the stop, the ~10 s systemd respawn, plus ~10 s to load CLIP —
+`/api/search/photos` returns `503 search_unavailable`. That is deliberate: the
+API carries no model and has no in-process fallback, since a fallback would
+re-create the OOM this split exists to fix. Warn the owner before restarting
+during use. Once `chitra-embed.service` exists and `CHITRA_EMBED_SELF_START=0`
+is set, this coupling disappears.
+
 ## 1. Check both queues are idle
 
 ```bash
@@ -48,9 +58,17 @@ with two sets of workers competing for the same queues.
 
 ```bash
 pgrep -af 'worker.py' | wc -l     # expect 6: 4 default + 2 video
+pgrep -af embed_service           # expect 1 — 7 processes in total
+curl -s localhost:5101/health     # {"status":"ok", ...} once CLIP has loaded
 tail -20 logs/worker_1.log
 tail -20 logs/worker_video_1.log
+tail -20 logs/embed.log
 ```
+
+The sidecar answers `/health` with `"status":"loading"`-shaped output only if
+it is mid-startup; a connection refused for more than ~20 s means it failed to
+bind — check `logs/embed.log` for a port clash with an orphan from the previous
+run.
 
 Worker logs are truncated on every restart, so anything you needed from the
 previous run must be captured before step 2.

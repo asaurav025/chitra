@@ -923,3 +923,72 @@ text-only, so it gains nothing above 3 — `CHITRA_ML_THREADS=3` costs the searc
 path 0.7 ms against the best-ever number while keeping image embedding at its
 optimum. The 13.0 ms text figure also matches the 12.7 ms the plan assumes for
 search.
+
+### Phase 2 — Embedding sidecar
+
+**Task 2.1 — red test for the client.** New `tests/test_embed_client.py`, 15
+tests over `httpx.MockTransport`. Watched fail:
+
+```
+ImportError: Failed to import test module: test_embed_client
+  File "tests/test_embed_client.py", line 27, in <module>
+    from core.embed_client import EmbeddingClient
+ModuleNotFoundError: No module named 'core.embed_client'
+```
+
+**Task 2.2 — `core/embed_client.py`.** `EmbeddingClient.text_embedding(text)` is
+a coroutine returning an L2-normalised float32 vector.
+
+- Wire format exactly as planned: `POST /embed/text {"text": ...}` ->
+  `{"dim":512,"dtype":"float32","vector_b64":...}`.
+- Every failure mode — `ConnectError`, `ReadTimeout`, non-200, unparseable body,
+  and a `dim` that disagrees with the payload length — becomes
+  `HTTPException(503, "search_unavailable: ...")`. The dim check was not in the
+  plan; without it a truncated response silently becomes a shorter vector that
+  still ranks, just wrongly.
+- No new dependency: `httpx==0.28.1` was already pinned.
+- Accepts an injected `httpx.AsyncClient` (what Task 3.2 shares from `lifespan`)
+  and only closes what it created.
+
+**Task 2.3 — red test for the service.** New `tests/test_embed_service.py`.
+Watched fail: `ModuleNotFoundError: No module named 'embed_service'`.
+
+**Task 2.4 — `embed_service.py`.** `create_app(embedder_factory=...)` — the
+factory is the seam the tests use, so all 24 service tests run against a stub
+and the suite never loads CLIP. `lifespan` calls `configure_threads()` (which
+imports torch *inside the function*, keeping `import embed_service` cheap) and
+then builds the embedder, logging resident size. Both endpoints go through a
+`ThreadPoolExecutor(max_workers=1)`: off the event loop, and serialised so the
+3-thread cap is the real parallelism rather than a per-request multiple.
+`POST /embed/image` is exposed but unused, as planned.
+
+**Task 2.5 — launcher wiring.** `start_workers.sh` starts the sidecar before
+the RQ workers under `CHITRA_EMBED_SELF_START` (default 1), binds
+`127.0.0.1:5101`, hard-codes `--workers 1`, and writes `logs/embed.pid`.
+`stop_workers.sh` stops it by pid file *before* its `pkill -f worker.py` — that
+pattern never matches `embed_service`, so an orphan would hold the port and
+1.14 GB and the next start would fail to bind silently. Both documented in
+`.env.example` and pinned by 8 launcher-wiring tests.
+
+`.claude/skills/restart-workers/SKILL.md` updated: 7 processes now, and a
+worker restart takes search down for ~20 s (stop + respawn + CLIP load), which
+the owner should be warned about before restarting during use.
+
+**One test of mine was wrong and got fixed, not weakened.** The client's
+"never falls back to an in-process model" assertion was written in-process and
+failed in the full suite (9 -> 10 failures) because `test_search` constructs a
+real `ClipEmbedder` into the same interpreter — exactly the pollution Task 0.2
+warns about. Rewritten to probe a fresh subprocess against a dead port
+(`127.0.0.1:1`), which is strictly stronger: it proves a *real* `ConnectError`
+gives 503 and that neither torch, transformers, nor `core.embedder` is resident
+afterwards.
+
+Suite after Phase 2:
+
+```
+Ran 132 tests in 6.534s
+FAILED (failures=9, errors=4, skipped=2)
+```
+
+39 tests added, all green; failures and errors unchanged at the baseline 9/4
+(7 pre-existing auth + 2 guard assertions still red by design until Phase 3).
