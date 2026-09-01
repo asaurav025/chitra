@@ -60,3 +60,6 @@ faiss_indexes/
 *.db-wal
 *.db-shm
 photo.db.bak-*
+
+# reembed progress journal (scripts/reembed.py)
+reembed_state.jsonl
