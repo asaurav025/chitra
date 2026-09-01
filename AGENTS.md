@@ -9,8 +9,9 @@ Clients live in sibling repos: `../chitra_ui_next` (web) and `../chitra_ios` (iO
 
 ## Commands
 
-All Python runs through the committed-out virtualenv at `.venv` (never the
-system interpreter — the ML stack is only installed there).
+All Python runs through the virtualenv at `.venv` — git-ignored, created by
+`make install`. Never use the system interpreter; the ML stack (torch, CLIP,
+InsightFace, FAISS) is installed only in the venv.
 
 ```bash
 # Full test suite (~3s)
