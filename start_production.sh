@@ -8,9 +8,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Load environment variables
+# Load environment variables.
+# `set -a` marks everything the file defines for export, so sourcing it is
+# enough. The previous `export $(cat ... | xargs)` form word-split values on
+# spaces, mangled quotes, truncated any value containing a '#', and leaked the
+# secrets into the process table where `ps` could read them.
 if [ -f .env.production ]; then
-    export $(cat .env.production | grep -v '^#' | xargs)
+    set -a; . ./.env.production; set +a
 fi
 
 # Default values
