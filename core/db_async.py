@@ -28,6 +28,14 @@ async def connect_async(db_path: str = DB_DEFAULT_PATH) -> AsyncIterator[aiosqli
     conn = await aiosqlite.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
 
+    # Foreign key enforcement is per-connection and OFF by default in SQLite.
+    # Without it every ON DELETE CASCADE in the schema (tags, embeddings,
+    # clusters, faces, face_thumbs) is silently a no-op and deleting a photo
+    # leaves its child rows behind as orphans. Deliberately NOT wrapped in a
+    # swallowing try/except: this is a correctness pragma, not a perf tuning
+    # one, and a silent failure here would reintroduce the bug invisibly.
+    await conn.execute("PRAGMA foreign_keys=ON")
+
     # PRAGMA setup
     try:
         await conn.execute("PRAGMA journal_mode=WAL")

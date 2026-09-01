@@ -17,7 +17,15 @@ def connect(db_path: str = DB_DEFAULT_PATH) -> sqlite3.Connection:
     """
     conn = sqlite3.connect(db_path, timeout=30.0)  # 30 second timeout for busy connections
     conn.row_factory = sqlite3.Row
-    
+
+    # Foreign key enforcement is per-connection and OFF by default in SQLite.
+    # Without it every ON DELETE CASCADE in the schema (tags, embeddings,
+    # clusters, faces, face_thumbs) is silently a no-op and deleting a photo
+    # leaves its child rows behind as orphans. Deliberately NOT wrapped in a
+    # swallowing try/except: this is a correctness pragma, not a perf tuning
+    # one, and a silent failure here would reintroduce the bug invisibly.
+    conn.execute("PRAGMA foreign_keys=ON")
+
     # Enable WAL mode for better concurrency (allows concurrent reads)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
