@@ -31,7 +31,10 @@ core/
   jobs.py             All RQ jobs: embedding, faces, transcode, clustering.
   embedder.py         CLIP (transformers, ViT-B/32). CPU.
   face.py             InsightFace buffalo_l. CPU, forced ctx_id=-1.
-  tagger.py           Zero-shot tagging over 17 hardcoded labels.
+  tagger.py           Zero-shot tagging. Pure scorers + corpus-relative
+                      calibration; the label list lives in vocabulary.py.
+  vocabulary.py       345 tag labels across nine facets, versioned and
+                      fingerprinted. No ML imports.
   faiss_index.py      Persistent HNSW index for person faces.
   cluster.py          Photo-level clustering — reachable only from the CLI.
   extractor.py        EXIF, GPS, SHA-1, pHash, ffprobe metadata.
