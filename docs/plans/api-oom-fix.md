@@ -992,3 +992,113 @@ FAILED (failures=9, errors=4, skipped=2)
 
 39 tests added, all green; failures and errors unchanged at the baseline 9/4
 (7 pre-existing auth + 2 guard assertions still red by design until Phase 3).
+
+### Phase 3 — Cut the API over
+
+**Task 3.1 — red test for the search handler.** New
+`tests/test_search_endpoint.py`, 11 tests injecting a fake client via
+`app.dependency_overrides` (also overriding `get_current_active_user` and
+`get_db_async`, so none of these join the 7 known auth failures). Watched fail:
+
+```
+ERROR: test_ranks_results_by_similarity
+AttributeError: module 'app_fastapi' has no attribute 'get_embedding_client'
+   (x9, plus 2 failures from the "no embedder dependency remains" guard)
+```
+
+**Tasks 3.2-3.4 — the cutover.**
+
+| location | change |
+|---|---|
+| `app_fastapi.py:46` | `from core.embedder import ClipEmbedder` -> `from core.embed_client import EmbeddingClient` |
+| `app_fastapi.py:25` | `import httpx` added |
+| `app_fastapi.py:75-80` | `_EMBEDDER` -> `_EMBED_HTTP` + `_EMBED_CLIENT` |
+| `app_fastapi.py:117-127` | `lifespan` builds one shared `httpx.AsyncClient`, `aclose()`s it on shutdown |
+| `app_fastapi.py:207-221` | `get_embedder()` -> `get_embedding_client()` |
+| `app_fastapi.py:1975-1985` | `q_vec = await embed_client.text_embedding(query)` |
+| `app_fastapi.py:294-296, 356-366` | `/api/health` gains `embed_status` + `embed_url` |
+| `core/schemas.py:221-222` | `HealthResponse.embed_status` / `.embed_url` |
+
+The health endpoint marks itself `degraded` when the sidecar is down but still
+returns 200 — that pre-existing behaviour is deliberately untouched, as the
+plan's scope note requires.
+
+**One test of mine was too strict and was made *more precise*, not weaker.**
+`test_module_does_not_reference_clip_embedder` grepped for the bare string
+`ClipEmbedder`, which also forbids the docstring on `get_embedding_client()`
+explaining what it replaced — documentation worth keeping. Replaced with
+assertions on what actually matters: no `from core.embedder`, no
+`import core.embedder`, no `ClipEmbedder(` construction. The authoritative
+check remains the subprocess memory probe, which cannot be argued with.
+
+**Task 3.5 — the memory-budget test goes green. This is the headline.**
+
+```
+                     before (Task 0.1)                               after
+rss_mb               557                                             98.4
+heavy modules        ['torch','transformers','faiss','rawpy']        ['faiss','rawpy']
+```
+
+**A 458 MB reduction per uvicorn worker — ~1.8 GB across the four — and torch
+and transformers are no longer resident in the API at all.** 98.4 MB lands
+almost exactly on the ~97 MB the Task 1.3 per-module probe projected, and is
+half the 200 MB budget.
+
+**A defect in the guard's own measurement, found and fixed.** After the
+cutover, `test_import_rss_within_budget` passed standalone (98 MB) but failed
+inside the full suite claiming 564 MB — with `heavy` correctly empty, which
+made no sense. Cause: **`ru_maxrss` in a `subprocess.run` child inherits the
+parent's peak RSS.** Demonstrated directly:
+
+```
+parent RSS before torch:  11 MB  ->  child ru_maxrss= 98.4  VmHWM=98.6
+parent RSS after  torch: 486 MB  ->  child ru_maxrss=485.6  VmHWM=98.8
+```
+
+`tests/run_tests.py` loads torch into the parent (`test_search` builds a real
+`ClipEmbedder`), so the guard was measuring the test runner. The probe now
+reads `VmHWM` from `/proc/self/status` — the child's own high-water mark, reset
+at `exec` — with `ru_maxrss` kept in the payload and a fourth test asserting it
+is still reported, so a silent regression to the wrong metric is itself caught.
+Note the error was always in the *conservative* direction (it can only
+over-report, never hide a real regression), and the standalone numbers recorded
+in Phases 0 and 1 were taken from a small parent and are unaffected.
+
+**Task 3.6 — suite back to baseline, and better than it started:**
+
+```
+Ran 144 tests in 4.908s
+FAILED (failures=7, errors=4, skipped=2)
+```
+
+**7 failures, down from 9** — the two by-design guard assertions are green.
+All 7 remaining are the documented pre-existing `test_endpoints` 401s; errors
+unchanged at 4. 51 tests added across Phases 2-3.
+
+**Task 3.7 — live sidecar integration check.** Scratch port 5199, scratch DB,
+no production process involved (both 5199 and 5101 confirmed free first).
+
+```
+{"status":"ok","model":"openai/clip-vit-base-patch32","threads":3,"rss_mb":1699.2}
+
+  'a dog on a beach'            dim=512 max_abs_diff=0.000e+00  OK
+  'sunset over mountains'       dim=512 max_abs_diff=0.000e+00  OK
+  'birthday cake with candles'  dim=512 max_abs_diff=0.000e+00  OK
+
+20 sequential /embed/text calls (ms):
+  min=13.9  median=14.2  mean=14.3  p95=14.6  max=15.1
+```
+
+**Bit-identical to a direct `ClipEmbedder` call** — max abs diff is exactly
+zero, not merely under the 1e-5 tolerance. **Median 14.2 ms against the plan's
+predicted ~15 ms and the 12.7 ms in-process baseline: a ~1.5 ms regression to
+remove ~1.8 GB of API residency.** The sidecar's own 1,699 MB peak matches the
+1,670 MB the plan measured for CLIP alone.
+
+Killed afterwards; pid gone, both ports free.
+
+**Task 3.8 (optional Redis cache) — deliberately not done.** Search is now
+14 ms end to end; a cache would add a Redis round-trip, an invalidation story
+tied to the model name, and a second failure mode, to save single-digit
+milliseconds. Left as a documented option in case sidecar restarts prove
+disruptive.

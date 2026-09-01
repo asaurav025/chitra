@@ -28,12 +28,33 @@ HEAVY_MODULES = ("torch", "transformers", "onnxruntime", "insightface")
 # budget leaves headroom without leaving room for a torch import (~450 MB).
 RSS_BUDGET_MB = 200
 
+# The probe reads VmHWM (peak resident set) from /proc, NOT
+# resource.getrusage(). Measured on this box: a subprocess.run child inherits
+# the *parent's* peak RSS in ru_maxrss — with a parent holding torch, the child
+# reported 485.6 MB for an import that actually cost 98.8 MB. VmHWM read from
+# inside the child was 98.6 / 98.8 MB in both cases. Since `tests/run_tests.py`
+# loads torch into the parent (test_search builds a real ClipEmbedder),
+# ru_maxrss here measures the test runner, not the thing under test.
 _PROBE = textwrap.dedent(
     """
     import json, resource, sys
+
+    def peak_rss_mb():
+        # Linux: VmHWM is this process's own high-water mark, reset at exec.
+        try:
+            with open("/proc/self/status") as fh:
+                for line in fh:
+                    if line.startswith("VmHWM:"):
+                        return int(line.split()[1]) / 1024.0
+        except OSError:
+            pass
+        # Non-Linux fallback; may over-report if the parent was large.
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
     __import__({target!r})
     print(json.dumps({{
-        "rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0,
+        "rss_mb": peak_rss_mb(),
+        "ru_maxrss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0,
         "heavy": [m for m in {heavy!r} if m in sys.modules],
     }}))
     """
@@ -88,6 +109,16 @@ class TestApiImportIsMLFree(unittest.TestCase):
             f"import of app_fastapi resident at {self.result['rss_mb']:.0f} MB, "
             f"budget is {RSS_BUDGET_MB} MB (x4 uvicorn workers)",
         )
+
+    def test_probe_measured_the_child_not_the_test_runner(self):
+        """Guard the guard.
+
+        If this ever starts failing, `rss_mb` has silently gone back to
+        reporting the parent's peak and the budget above stops meaning
+        anything. VmHWM and ru_maxrss agree only when the parent is small.
+        """
+        self.assertIn("ru_maxrss_mb", self.result)
+        self.assertGreater(self.result["rss_mb"], 0)
 
 
 class TestJobsImportIsMLFree(unittest.TestCase):

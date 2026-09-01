@@ -218,6 +218,8 @@ class HealthResponse(BaseModel):
     storage_endpoint: Optional[str] = Field(None, description="Storage endpoint")
     storage_bucket: Optional[str] = Field(None, description="Storage bucket name")
     storage_note: Optional[str] = Field(None, description="Storage note")
+    embed_status: Optional[str] = Field(None, description="Embedding sidecar status")
+    embed_url: Optional[str] = Field(None, description="Embedding sidecar URL")
 
 
 class RootResponse(BaseModel):

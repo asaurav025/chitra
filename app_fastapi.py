@@ -21,6 +21,7 @@ from starlette.requests import Request
 
 import aiosqlite
 import asyncio
+import httpx
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
@@ -43,7 +44,7 @@ from core.schemas import (
 )
 from core import auth
 from core import video
-from core.embedder import ClipEmbedder
+from core.embed_client import EmbeddingClient
 from core.extractor import collect_metadata, load_image, iter_images, is_video, RAW_EXTS, _normalize_exif_date
 from core.gallery import ensure_thumb
 from core.cache import get_cached_thumbnail, cache_thumbnail
@@ -72,7 +73,12 @@ except ImportError:
 
 # Global instances
 _STORAGE_CLIENT: MinIOStorageClient | None = None
-_EMBEDDER: ClipEmbedder | None = None
+
+# The API holds no ML model. Text embeddings for search come from the
+# embedding sidecar (embed_service.py) over loopback — see
+# docs/plans/api-oom-fix.md. One shared connection pool, built in lifespan.
+_EMBED_HTTP: "httpx.AsyncClient | None" = None
+_EMBED_CLIENT: EmbeddingClient | None = None
 
 # Database path
 DB_PATH = os.environ.get("CHITRA_DB_PATH", db_async.DB_DEFAULT_PATH)
@@ -85,7 +91,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown."""
     # Startup
-    global _STORAGE_CLIENT, _EMBEDDER
+    global _STORAGE_CLIENT, _EMBED_HTTP, _EMBED_CLIENT
     
     # Initialize storage client (lazy - will connect when needed)
     try:
@@ -110,11 +116,20 @@ async def lifespan(app: FastAPI):
     else:
         print("Warning: ffmpeg/ffprobe NOT found — video posters and transcoding will fail")
 
+    # One AsyncClient for the whole process: connection reuse turns the
+    # loopback hop into ~2 ms on top of a ~13 ms embed.
+    _EMBED_HTTP = httpx.AsyncClient()
+    _EMBED_CLIENT = EmbeddingClient(http=_EMBED_HTTP)
+    print(f"✓ embedding sidecar client -> {_EMBED_CLIENT.base_url}")
+
     yield
-    
+
     # Shutdown
     _STORAGE_CLIENT = None
-    _EMBEDDER = None
+    if _EMBED_HTTP is not None:
+        await _EMBED_HTTP.aclose()
+    _EMBED_HTTP = None
+    _EMBED_CLIENT = None
 
 
 # Create FastAPI app
@@ -192,12 +207,19 @@ def get_storage_client() -> MinIOStorageClient:
     return _STORAGE_CLIENT
 
 
-def get_embedder() -> ClipEmbedder:
-    """Dependency: Get CLIP embedder (sync, use in thread pool)."""
-    global _EMBEDDER
-    if _EMBEDDER is None:
-        _EMBEDDER = ClipEmbedder()
-    return _EMBEDDER
+def get_embedding_client() -> EmbeddingClient:
+    """Dependency: the embedding sidecar client.
+
+    Replaces the old `get_embedder()`, which constructed a `ClipEmbedder` —
+    ~1.14 GB resident — inside every uvicorn worker. There is deliberately no
+    in-process fallback: if the sidecar is down, search 503s. See
+    core/embed_client.py for why a fallback would be worse than an outage.
+    """
+    global _EMBED_CLIENT
+    if _EMBED_CLIENT is None:
+        # Outside the app lifespan (tests, scripts): own transport.
+        _EMBED_CLIENT = EmbeddingClient()
+    return _EMBED_CLIENT
 
 
 # -----------------------------------------------------------------------------
@@ -290,7 +312,9 @@ def row_to_user_dto(row: aiosqlite.Row) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 @app.get("/api/health")
-async def health_check() -> HealthResponse:
+async def health_check(
+    embed_client: EmbeddingClient = Depends(get_embedding_client)
+) -> HealthResponse:
     """
     Health check endpoint.
     Tests database and MinIO connectivity.
@@ -330,7 +354,17 @@ async def health_check() -> HealthResponse:
         health_info["storage_status"] = f"error: {str(e)[:100]}"
         health_info["status"] = "degraded"
     
-    # Return 200 even if degraded (service is still functional)
+    # Embedding sidecar: search is the only thing that needs it, and it is
+    # the one dependency whose absence is otherwise invisible — the API starts
+    # fine and only 503s when someone searches.
+    embed_status = await embed_client.health()
+    health_info["embed_status"] = embed_status
+    health_info["embed_url"] = embed_client.base_url
+    if embed_status != "ok":
+        health_info["status"] = "degraded"
+
+    # Return 200 even if degraded (service is still functional).
+    # Known issue, deliberately not changed here — see the plan's scope note.
     return JSONResponse(content=health_info, status_code=200)
 
 
@@ -1953,15 +1987,18 @@ async def search_photos(
     min_score: float = Query(0.2, ge=0.0, le=1.0, description="Minimum similarity score (0.0-1.0)"),
     current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async),
-    embedder: ClipEmbedder = Depends(get_embedder)
+    embed_client: EmbeddingClient = Depends(get_embedding_client)
 ):
     """Search photos by text query using embeddings."""
     query = q
     if not query:
         raise HTTPException(status_code=400, detail="missing_query")
-    
-    # Get text embedding
-    q_vec = embedder.text_embedding(query)  # 1D float32
+
+    # Text embedding comes from the sidecar. Genuinely awaited: the old
+    # in-process call blocked the event loop for the whole forward pass.
+    # Raises HTTPException(503) if the sidecar is unreachable.
+    q_vec = await embed_client.text_embedding(query)  # 1D float32, unit norm
+    # Defensive: the ranking below is a bare dot product.
     q_vec = q_vec / (np.linalg.norm(q_vec) + 1e-9)
     
     rows = await db_async.get_embeddings_async(conn)
