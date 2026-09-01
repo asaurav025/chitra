@@ -709,6 +709,17 @@ def row_to_photo_dto(row) -> Dict[str, Any]:
     }
 
 
+# Thumbnails, photo and face alike, are immutable derivatives keyed by a
+# never-reused AUTOINCREMENT id, so they are safe to cache hard and cheap to
+# revalidate with an ETag. 7 days is what the photo grid has always sent.
+THUMBNAIL_CACHE_CONTROL = "public, max-age=604800"
+
+
+def thumbnail_etag(item_id: int, thumb_path: str) -> str:
+    """Stable ETag for a thumbnail: the row identity plus its object key."""
+    return '"%s"' % hashlib.md5(f"{item_id}:{thumb_path}".encode()).hexdigest()
+
+
 async def ensure_photo_thumb_async(
     file_path: str,
     photo_id: int,
@@ -1096,19 +1107,17 @@ async def get_photo_thumbnail(
         await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
         await conn.commit()
     
-    # Generate ETag based on photo_id and thumb_path (stable identifier)
-    etag_value = hashlib.md5(f"{photo_id}:{thumb_path}".encode()).hexdigest()
-    etag = f'"{etag_value}"'
-    
+    # ETag over the stable identifier: photo id plus object key.
+    etag = thumbnail_etag(photo_id, thumb_path)
+
     # Check If-None-Match header for conditional request
-    if_none_match = request.headers.get("If-None-Match")
-    if if_none_match == etag:
+    if request.headers.get("If-None-Match") == etag:
         # Client has cached version, return 304 Not Modified
         return Response(
             status_code=304,
             headers={
                 "ETag": etag,
-                "Cache-Control": "public, max-age=604800",  # 7 days
+                "Cache-Control": THUMBNAIL_CACHE_CONTROL,
             }
         )
     
@@ -1131,7 +1140,7 @@ async def get_photo_thumbnail(
         media_type='image/jpeg',
         headers={
             "ETag": etag,
-            "Cache-Control": "public, max-age=604800",  # Cache for 7 days (604800 seconds)
+            "Cache-Control": THUMBNAIL_CACHE_CONTROL,
             "Vary": "Authorization",  # Cache varies by auth token
         }
     )
@@ -2151,11 +2160,20 @@ async def search_by_person(
 @app.get("/api/faces/{face_id}/thumbnail")
 async def get_face_thumbnail(
     face_id: int,
+    request: Request,
     current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async),
     storage: MinIOStorageClient = Depends(get_storage_client)
 ):
-    """Serve face thumbnail image."""
+    """Serve face thumbnail image, with browser caching support.
+
+    A face crop is an immutable 160x160 JPEG at thumbnails/faces/face_{id}.jpg,
+    and faces.id is AUTOINCREMENT so the key is never reused. This used to send
+    `no-cache, no-store, must-revalidate` with no ETag, so every visit to the
+    People route re-downloaded all ~2,000 crops from storage — face thumbnails
+    failed at 51.2% against 3.5% for photo thumbnails. Same treatment as the
+    photo thumbnail now: hard cache, ETag, 304.
+    """
     cur = await conn.cursor()
     await cur.execute(
         """
@@ -2171,7 +2189,19 @@ async def get_face_thumbnail(
         raise HTTPException(status_code=404, detail="face_thumb_not_found")
     
     thumb_path = row["thumb_path"]
-    
+
+    etag = thumbnail_etag(face_id, thumb_path)
+
+    if request.headers.get("If-None-Match") == etag:
+        # Client already holds this crop: revalidate without touching storage.
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": THUMBNAIL_CACHE_CONTROL,
+            }
+        )
+
     # Check cache first
     thumb_data = get_cached_thumbnail(thumb_path)
     
@@ -2189,7 +2219,11 @@ async def get_face_thumbnail(
     return Response(
         content=thumb_data,
         media_type='image/jpeg',
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+        headers={
+            "ETag": etag,
+            "Cache-Control": THUMBNAIL_CACHE_CONTROL,
+            "Vary": "Authorization",  # Cache varies by auth token
+        }
     )
 
 
