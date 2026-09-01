@@ -47,7 +47,7 @@ from core import auth
 from core import video
 from core.embed_client import EmbeddingClient
 from core.extractor import collect_metadata, load_image, iter_images, is_video, RAW_EXTS, _normalize_exif_date
-from core.gallery import ensure_thumb
+from core.gallery import ensure_thumb, ThumbnailUnavailable
 from core.cache import get_cached_thumbnail, cache_thumbnail
 from core.worker import get_queue, get_redis_connection
 from core.faiss_index import FAISSIndexManager
@@ -746,6 +746,10 @@ async def ensure_photo_thumb_async(
 ) -> str:
     """
     Ensure thumbnail exists on MinIO. Returns MinIO object key.
+
+    Propagates `ThumbnailUnavailable` from core.gallery when the *source* cannot
+    be turned into an image; callers in the HTTP layer go through
+    `regenerate_thumb_or_fail`, which maps it to a status instead of a 500.
     """
     thumb_path = storage.generate_thumbnail_path(photo_id, "photo")
     
@@ -786,6 +790,105 @@ async def ensure_photo_thumb_async(
             if os.path.exists(thumb_file_path):
                 os.unlink(thumb_file_path)
     
+    return thumb_path
+
+
+# What each ThumbnailUnavailable reason means over HTTP.
+#
+# `decode_failed` is deterministic — these bytes are not an image this build can
+# decode, and the next request will reach the same conclusion — so it is a 422
+# and it is remembered. `source_unreadable` may be the disk rather than the
+# bytes, so it is a 404 and stays retryable. An unrecognised reason gets the
+# conservative 422 and is not remembered.
+THUMB_UNAVAILABLE_STATUS = {"decode_failed": 422, "source_unreadable": 404}
+
+# A source that cannot be decoded cannot be decoded on the next request either.
+# 63 photos are `.arw`-named files that are actually JPEGs, and every request
+# for one re-downloaded the multi-MB original before failing. An hour is long
+# enough to stop the hammering, short enough that a reprocess heals itself.
+# Redis, not a column: the schema is another agent's territory.
+THUMB_UNAVAILABLE_TTL_SECONDS = 3600
+
+
+def thumb_unavailable_key(photo_id: int) -> str:
+    return f"chitra:thumb:unavailable:{photo_id}"
+
+
+def recall_thumb_unavailable(photo_id: int) -> Optional[str]:
+    """The reason this photo's thumbnail failed recently, if it did.
+
+    Consulted only before a *regeneration*, never on the served path — a
+    thumbnail that exists must not pay a Redis round-trip. Never raises: Redis
+    being down just means we retry, which is what happened before this existed.
+    """
+    try:
+        marker = get_redis_connection().get(thumb_unavailable_key(photo_id))
+    except Exception as e:
+        logger.warning("thumbnail marker lookup failed for photo %s: %s", photo_id, e)
+        return None
+    if marker is None:
+        return None
+    return marker.decode() if isinstance(marker, bytes) else str(marker)
+
+
+def remember_thumb_unavailable(photo_id: int, reason: str) -> None:
+    """Record a deterministic thumbnail failure so it is not retried per request."""
+    try:
+        get_redis_connection().set(
+            thumb_unavailable_key(photo_id),
+            reason.encode(),
+            ex=THUMB_UNAVAILABLE_TTL_SECONDS,
+        )
+    except Exception as e:
+        logger.warning("thumbnail marker write failed for photo %s: %s", photo_id, e)
+
+
+def thumbnail_unavailable_http(photo_id: int, exc: ThumbnailUnavailable) -> HTTPException:
+    """Turn a typed thumbnail failure into an honest response.
+
+    An undecodable source used to raise out of core.gallery and propagate
+    uncaught out of the handler as a bare 500 with no detail — for a condition
+    that is not a server error. The client gets the machine-readable reason and
+    nothing else; the source path and the underlying message go to the log.
+    """
+    logger.warning(
+        "thumbnail unavailable for photo %s: %s (%s): %s",
+        photo_id, exc.reason, exc.src_path, exc.detail,
+    )
+    if exc.reason == "decode_failed":
+        remember_thumb_unavailable(photo_id, exc.reason)
+    return HTTPException(
+        status_code=THUMB_UNAVAILABLE_STATUS.get(exc.reason, 422),
+        detail=exc.reason,
+    )
+
+
+async def regenerate_thumb_or_fail(
+    file_path: str,
+    photo_id: int,
+    storage: MinIOStorageClient,
+    conn: aiosqlite.Connection,
+) -> str:
+    """Regenerate this photo's thumbnail and record the new key, or raise an
+    honest HTTPException.
+
+    Checks the recent-failure marker first: without it, a source that will never
+    decode costs a fresh multi-MB download on every single request for it.
+    """
+    remembered = recall_thumb_unavailable(photo_id)
+    if remembered:
+        raise HTTPException(
+            status_code=THUMB_UNAVAILABLE_STATUS.get(remembered, 422),
+            detail=remembered,
+        )
+
+    try:
+        thumb_path = await ensure_photo_thumb_async(file_path, photo_id, storage, conn)
+    except ThumbnailUnavailable as e:
+        raise thumbnail_unavailable_http(photo_id, e) from e
+
+    await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
+    await conn.commit()
     return thumb_path
 
 
@@ -1117,9 +1220,7 @@ async def get_photo_thumbnail(
         # Photo with no thumb_path yet: generate it lazily and store it. This
         # is the only path that keeps the 766 legacy NULL-media_type rows
         # working, which is why it stays in the API — PIL, not ffmpeg.
-        thumb_path = await ensure_photo_thumb_async(file_path, photo_id, storage, conn)
-        await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
-        await conn.commit()
+        thumb_path = await regenerate_thumb_or_fail(file_path, photo_id, storage, conn)
     # A recorded thumb_path is served straight away. It used to be checked with
     # file_exists_async first, doubling storage operations on every grid render
     # to catch the rare object that is in the DB but gone from MinIO; that miss
@@ -1151,9 +1252,7 @@ async def get_photo_thumbnail(
                 detail="poster_pending",
                 headers={"Retry-After": "3"},
             )
-        thumb_path = await ensure_photo_thumb_async(file_path, photo_id, storage, conn)
-        await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
-        await conn.commit()
+        thumb_path = await regenerate_thumb_or_fail(file_path, photo_id, storage, conn)
         # Regeneration may have landed on a different key than the DB recorded.
         etag = thumbnail_etag(photo_id, thumb_path)
         try:

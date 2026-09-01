@@ -114,7 +114,7 @@ class ThumbnailEndpointCase(unittest.TestCase):
             )
             await conn.commit()
 
-    def client_with(self, storage):
+    def client_with(self, storage, raise_server_exceptions=True):
         app = app_fastapi.app
 
         async def fake_db():
@@ -127,7 +127,7 @@ class ThumbnailEndpointCase(unittest.TestCase):
         )
         app.dependency_overrides[app_fastapi.get_storage_client] = lambda: storage
         self.addCleanup(app.dependency_overrides.clear)
-        return TestClient(app)
+        return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 class TestFaceThumbnailCaching(ThumbnailEndpointCase):
@@ -482,6 +482,211 @@ class TestStorageErrorsDoNotLeakInternals(ThumbnailEndpointCase):
         with open(os.path.join(repo_root, "app_fastapi.py")) as fh:
             source = fh.read()
         self.assertNotIn("storage_error: {str(e)}", source)
+
+
+class FakeRedis:
+    """Just enough of redis-py for the unavailable-thumbnail marker."""
+
+    def __init__(self, broken=False):
+        self.store = {}
+        self.broken = broken
+        self.sets = []
+
+    def _check(self):
+        if self.broken:
+            raise ConnectionError("Error 111 connecting to 127.0.0.1:6379")
+
+    def get(self, key):
+        self._check()
+        return self.store.get(key)
+
+    def set(self, key, value, nx=False, ex=None):
+        self._check()
+        self.sets.append((key, value, ex))
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
+
+class TestUndecodableSourceIsNot500(ThumbnailEndpointCase):
+    """63 photos are `.arw`-named files that are actually JPEGs.
+
+    Generating their thumbnail raised out of core.gallery and propagated
+    uncaught out of the handler as a bare 500 — and every single request
+    re-downloaded the multi-MB original first. core.gallery now raises the typed
+    `ThumbnailUnavailable` carrying a machine-readable reason; the HTTP layer's
+    job is to turn that into an honest status with that reason as the detail,
+    and to stop paying for the download over and over.
+    """
+
+    def raise_from_regeneration(self, exc):
+        async def fake_ensure(file_path, photo_id, storage_arg, conn):
+            raise exc
+
+        original = app_fastapi.ensure_photo_thumb_async
+        app_fastapi.ensure_photo_thumb_async = fake_ensure
+        self.addCleanup(setattr, app_fastapi, "ensure_photo_thumb_async", original)
+
+    def count_regenerations(self, exc):
+        calls = []
+
+        async def fake_ensure(file_path, photo_id, storage_arg, conn):
+            calls.append(photo_id)
+            raise exc
+
+        original = app_fastapi.ensure_photo_thumb_async
+        app_fastapi.ensure_photo_thumb_async = fake_ensure
+        self.addCleanup(setattr, app_fastapi, "ensure_photo_thumb_async", original)
+        return calls
+
+    def fake_redis(self, broken=False):
+        redis = FakeRedis(broken=broken)
+        original = app_fastapi.get_redis_connection
+        app_fastapi.get_redis_connection = lambda: redis
+        self.addCleanup(setattr, app_fastapi, "get_redis_connection", original)
+        return redis
+
+    def undecodable(self, reason="decode_failed"):
+        from core.gallery import ThumbnailUnavailable
+
+        return ThumbnailUnavailable(
+            reason, "photos/2026/09/b.arw", "cannot identify image file <_io.BytesIO>"
+        )
+
+    # -- status and detail ----------------------------------------------------
+    def test_an_undecodable_source_is_not_a_500(self):
+        self.fake_redis()
+        self.raise_from_regeneration(self.undecodable())
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        resp = client.get("/api/photos/2/thumbnail")
+
+        self.assertNotEqual(500, resp.status_code, "still a bare 500")
+        self.assertIn(resp.status_code, (404, 422))
+
+    def test_decode_failed_reports_the_reason_as_the_detail(self):
+        self.fake_redis()
+        self.raise_from_regeneration(self.undecodable("decode_failed"))
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        resp = client.get("/api/photos/2/thumbnail")
+
+        self.assertEqual(422, resp.status_code, resp.text)
+        self.assertEqual("decode_failed", resp.json()["detail"])
+
+    def test_source_unreadable_reports_the_reason_as_the_detail(self):
+        self.fake_redis()
+        self.raise_from_regeneration(self.undecodable("source_unreadable"))
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        resp = client.get("/api/photos/2/thumbnail")
+
+        self.assertEqual(404, resp.status_code, resp.text)
+        self.assertEqual("source_unreadable", resp.json()["detail"])
+
+    def test_the_underlying_message_stays_out_of_the_body(self):
+        self.fake_redis()
+        self.raise_from_regeneration(self.undecodable())
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        resp = client.get("/api/photos/2/thumbnail")
+
+        self.assertNotIn("BytesIO", resp.text)
+        self.assertNotIn("photos/2026/09", resp.text)
+
+    def test_the_failure_is_logged_with_the_source(self):
+        self.fake_redis()
+        self.raise_from_regeneration(self.undecodable())
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        with self.assertLogs("app_fastapi", level="WARNING") as logs:
+            client.get("/api/photos/2/thumbnail")
+
+        joined = " ".join(record.getMessage() for record in logs.records)
+        self.assertIn("decode_failed", joined)
+
+    def test_a_thumbnail_recorded_but_gone_and_undecodable_also_422s(self):
+        """The other regeneration site: object missing from storage."""
+        self.fake_redis()
+        self.raise_from_regeneration(self.undecodable())
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        resp = client.get("/api/photos/1/thumbnail")
+
+        self.assertEqual(422, resp.status_code, resp.text)
+        self.assertEqual("decode_failed", resp.json()["detail"])
+
+    # -- stop paying for it on every request ----------------------------------
+    def test_a_deterministic_failure_is_not_retried_on_the_next_request(self):
+        """Each retry re-downloads the multi-MB original before failing again."""
+        self.fake_redis()
+        calls = self.count_regenerations(self.undecodable("decode_failed"))
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        first = client.get("/api/photos/2/thumbnail")
+        second = client.get("/api/photos/2/thumbnail")
+
+        self.assertEqual(422, first.status_code)
+        self.assertEqual(422, second.status_code)
+        self.assertEqual("decode_failed", second.json()["detail"])
+        self.assertEqual([2], calls, "the second request paid for the download again")
+
+    def test_the_marker_expires(self):
+        redis = self.fake_redis()
+        self.raise_from_regeneration(self.undecodable("decode_failed"))
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        client.get("/api/photos/2/thumbnail")
+
+        self.assertEqual(1, len(redis.sets))
+        key, _value, ex = redis.sets[0]
+        self.assertIn("2", key)
+        self.assertIsNotNone(ex, "a permanent marker would outlive a reprocess")
+        self.assertGreater(ex, 0)
+
+    def test_a_transient_failure_is_not_marked(self):
+        """source_unreadable may be the disk, not the bytes — let it retry."""
+        redis = self.fake_redis()
+        calls = self.count_regenerations(self.undecodable("source_unreadable"))
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        client.get("/api/photos/2/thumbnail")
+        client.get("/api/photos/2/thumbnail")
+
+        self.assertEqual([], redis.sets)
+        self.assertEqual([2, 2], calls)
+
+    def test_a_dead_redis_does_not_turn_the_422_into_a_500(self):
+        self.fake_redis(broken=True)
+        self.raise_from_regeneration(self.undecodable("decode_failed"))
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        resp = client.get("/api/photos/2/thumbnail")
+
+        self.assertEqual(422, resp.status_code, resp.text)
+
+    def test_the_marker_never_touches_the_happy_path(self):
+        """A served thumbnail must not pay a Redis round-trip."""
+        redis = self.fake_redis()
+        client = self.client_with(FakeStorage({PHOTO_THUMB: JPEG}))
+
+        resp = client.get("/api/photos/1/thumbnail")
+
+        self.assertEqual(200, resp.status_code)
+        self.assertEqual([], redis.sets)
+
+    # -- a write failure is still a server fault ------------------------------
+    def test_an_unwritable_thumbnail_is_still_a_500(self):
+        """core.gallery raises ThumbnailUnavailable only for the *source*; a
+        thumbnail it cannot write is a genuine server fault."""
+        self.fake_redis()
+        self.raise_from_regeneration(RuntimeError("Thumbnail write failed for /tmp/x.jpg"))
+        client = self.client_with(FakeStorage({}), raise_server_exceptions=False)
+
+        resp = client.get("/api/photos/2/thumbnail")
+
+        self.assertEqual(500, resp.status_code)
 
 
 if __name__ == "__main__":
