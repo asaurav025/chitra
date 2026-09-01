@@ -43,6 +43,29 @@ matching stops working with no error.
 **Videos get no ML.** Jobs re-check `_is_video()` and bail. Poster frames exist
 but are not embedded, so videos are invisible to search.
 
-**`put_embedding` and `add_tag` are plain INSERTs with no unique constraint.**
-Re-running a non-incremental bulk index would duplicate every embedding and tag.
-Fix the constraint before any re-embedding campaign.
+**`embeddings` is unique on `(photo_id, model)` — not on `photo_id`.** All four
+writers (`db.put_embedding`, `db_async.put_embedding_async`, `db.add_tag`,
+`db_async.add_tag_async`) were plain INSERTs into tables with no constraint, so
+any bulk re-index duplicated every row; `search_photos` stacks whatever
+`get_embeddings` returns, so a duplicate gave one photo two result slots. They
+are upserts now. The key deliberately includes `model` so a SigLIP row lands
+*alongside* the CLIP row search is still answering from — a bare `photo_id` key
+would evict it and take rollback-by-config with it. `tags` is unique on
+`(photo_id, tag)`; `tags.source` is provenance and stays out of the key. The
+migration lives once, in `core/db.py`, and `db_async.py` imports it.
+
+**`load_image` dispatches on the file extension, and the extension lies.** 63
+photos are named `.arw`/`.ARW` whose bytes begin `FF D8 FF E0 JFIF` — they are
+JPEGs, so rawpy raises `LibRawFileUnsupportedError` and both thumbnail
+generation and embedding fail. This looks like a storage fault and is not: the
+reads succeed. `scripts/reembed.py` works around it by sniffing the magic
+number and renaming before it calls the sidecar; `core/extractor.py` itself
+still trusts `path.suffix`.
+
+**Embed from `photos.thumb_path`, not the original, for anything bulk.**
+Measured: 1,713 originals are 7,959 MB against 396 MB of thumbnails (mean
+237 KB) — 20.1x less data off a disk with 3,000+ unrecovered read errors, and
+no RAW/HEIC decode. Cosine against the original-derived vector over 60 photos:
+median 0.99914, mean 0.99676, min 0.97494; HEIC (the bulk of the library)
+averages 0.99930. The one weak class is PNG screenshots at 0.98288 mean.
+`scripts/reembed.py --source thumb|original|auto` is the switch.
