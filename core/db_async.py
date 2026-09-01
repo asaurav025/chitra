@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -378,10 +379,47 @@ async def put_embedding_async(
     await conn.commit()
 
 
-async def get_embeddings_async(conn: aiosqlite.Connection) -> List[Tuple[int, int, bytes]]:
-    async with conn.execute("SELECT photo_id, dim, vector FROM embeddings") as cur:
+async def get_embeddings_async(
+    conn: aiosqlite.Connection,
+    model: str | None = None,
+) -> List[Tuple[int, int, bytes]]:
+    """Read stored vectors, optionally restricted to one embedding model.
+
+    The table is keyed on `(photo_id, model)` so two generations can coexist
+    during a re-embed. Callers that stack the vectors into a matrix — search,
+    `/api/photos/{id}/similar` — MUST pass `model`: rows from two models have
+    different dimensions, and `np.stack` on a mixed list raises
+    `ValueError: all input arrays must have the same shape`, which turns one
+    768-d row into a 500 on every query. Filtering here rather than in the
+    caller means the mixed list never exists.
+
+    Scores from two models are not comparable anyway (CLIP cosine occupies
+    0.16-0.28; a sigmoid-trained model does not), so merging them would be
+    silently meaningless even where the shapes happened to agree.
+
+    `model=None` stays an unfiltered read for callers that genuinely want
+    every row — migration and coverage counting.
+    """
+    if model is None:
+        sql, params = "SELECT photo_id, dim, vector FROM embeddings", ()
+    else:
+        sql = "SELECT photo_id, dim, vector FROM embeddings WHERE model = ?"
+        params = (model,)
+    async with conn.execute(sql, params) as cur:
         rows = await cur.fetchall()
     return [(row["photo_id"], row["dim"], row["vector"]) for row in rows]
+
+
+def active_embed_model() -> str:
+    """The single model `/api/search/photos` ranks from.
+
+    Read at call time, not import time: the cutover in the re-embed plan is
+    one environment variable flip plus a restart, and the rollback is flipping
+    it back. Defaulting to the CLIP identifier means an unset variable keeps
+    answering from the rows every existing photo already has, rather than
+    from nothing.
+    """
+    return os.environ.get("CHITRA_ACTIVE_EMBED_MODEL", DEFAULT_EMBED_MODEL)
 
 
 # ----------------------------------------------------------------------

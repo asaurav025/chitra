@@ -2208,23 +2208,35 @@ async def search_photos(
     # Defensive: the ranking below is a bare dot product.
     q_vec = q_vec / (np.linalg.norm(q_vec) + 1e-9)
     
-    rows = await db_async.get_embeddings_async(conn)
+    # Rank one model's rows and one model's only. `embeddings` is keyed on
+    # (photo_id, model) so a re-embed can write the new generation alongside
+    # the old, which means this read can see two dimensions at once: the
+    # `np.stack` below then raises `ValueError: all input arrays must have the
+    # same shape` and every search request 500s, for every user, off a single
+    # foreign row. Even where the shapes agreed the merge would be wrong —
+    # scores from two models are not comparable.
+    active_model = db_async.active_embed_model()
+    rows = await db_async.get_embeddings_async(conn, model=active_model)
     if not rows:
-        return {"results": []}
-    
+        # No rows yet for the active model — mid-cutover, or a fresh library.
+        # Empty results, never an error.
+        return SearchResultsResponse(query=query, results=[])
+
     photo_ids: List[int] = []
     vecs: List[np.ndarray] = []
-    
+
     for photo_id, dim, vec_bytes in rows:
         v = np.frombuffer(vec_bytes, dtype="float32")
+        # Belt and braces behind the model filter: this catches a row whose
+        # blob and `dim` column disagree, which the filter cannot.
         if v.shape[0] != dim:
             continue
         photo_ids.append(photo_id)
         vecs.append(v)
-    
+
     if not vecs:
-        return {"results": []}
-    
+        return SearchResultsResponse(query=query, results=[])
+
     mat = np.stack(vecs, axis=0)
     mat = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
     
