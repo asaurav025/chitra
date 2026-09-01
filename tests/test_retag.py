@@ -362,8 +362,7 @@ class TestVectorLoading(unittest.TestCase):
             conn.close()
             os.unlink(path)
 
-    def test_videos_are_excluded(self):
-        """Videos have no vector today, but a poster embed is coming."""
+    def test_videos_are_excluded_by_default(self):
         path, conn = _make_db(n_photos=5, dim=32)
         try:
             conn.execute("UPDATE photos SET media_type='video' WHERE id=1")
@@ -373,6 +372,27 @@ class TestVectorLoading(unittest.TestCase):
         finally:
             conn.close()
             os.unlink(path)
+
+    def test_videos_can_be_included_explicitly(self):
+        """Poster embedding landed in 2b1b052, so videos will have vectors.
+
+        Skipping them silently would leave every video embedded and untagged
+        with nothing saying why. The exclusion stays the default because Phase 7
+        owns that cutover, but it is one flag, not a buried WHERE clause.
+        """
+        path, conn = _make_db(n_photos=5, dim=32)
+        try:
+            conn.execute("UPDATE photos SET media_type='video' WHERE id=1")
+            conn.commit()
+            ids, _ = retag.load_vectors(conn, MODEL, include_videos=True)
+            self.assertIn(1, ids)
+        finally:
+            conn.close()
+            os.unlink(path)
+
+    def test_include_videos_reaches_the_cli(self):
+        self.assertFalse(retag.build_parser().parse_args([]).include_videos)
+        self.assertTrue(retag.build_parser().parse_args(["--include-videos"]).include_videos)
 
 
 if __name__ == "__main__":

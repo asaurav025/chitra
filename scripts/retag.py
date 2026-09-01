@@ -267,7 +267,8 @@ def get_label_matrix(embedder, *, model: str, cache_dir=DEFAULT_CACHE_DIR,
 # ----------------------------------------------------------------------
 # THE CORPUS
 # ----------------------------------------------------------------------
-def load_vectors(conn: sqlite3.Connection, model: str) -> Tuple[List[int], np.ndarray]:
+def load_vectors(conn: sqlite3.Connection, model: str,
+                 include_videos: bool = False) -> Tuple[List[int], np.ndarray]:
     """Every stored image vector for one model, as (photo_ids, N x dim).
 
     Filtered to a single model on purpose. `embeddings` is unique on
@@ -275,16 +276,20 @@ def load_vectors(conn: sqlite3.Connection, model: str) -> Tuple[List[int], np.nd
     CLIP one — and stacking both is the `ValueError: all input arrays must have
     the same shape` that takes `/api/search/photos` down for every user.
 
-    Videos are excluded via `COALESCE(media_type,'photo')`; 766 rows have a NULL
-    media_type and are photos.
+    Videos are excluded by default via `COALESCE(media_type,'photo')` — 766 rows
+    have a NULL media_type and are photos. That default is a phase boundary, not
+    a judgement: poster embedding landed in 2b1b052, so videos will start having
+    vectors, and tagging their posters is Phase 7's cutover to make. It is a
+    flag rather than a buried WHERE clause so that flip is one argument, and so
+    a video that is embedded but untagged has a visible reason.
     """
     rows = conn.execute(
-        """
+        f"""
         SELECT e.photo_id AS photo_id, e.dim AS dim, e.vector AS vector
           FROM embeddings e
           JOIN photos p ON p.id = e.photo_id
          WHERE e.model = ?
-           AND COALESCE(p.media_type, 'photo') != 'video'
+           {"" if include_videos else "AND COALESCE(p.media_type, 'photo') != 'video'"}
          ORDER BY e.photo_id ASC
         """,
         (model,),
@@ -361,6 +366,7 @@ def retag(
     low_percentile: float = tagger.LOW_PERCENTILE,
     high_percentile: float = tagger.HIGH_PERCENTILE,
     refresh_cache: bool = False,
+    include_videos: bool = False,
     verbose: bool = False,
 ) -> RetagResult:
     """Score every stored vector against the vocabulary and (optionally) write.
@@ -374,7 +380,7 @@ def retag(
     source = vocabulary.tag_source(model)
     fingerprint = vocabulary.vocab_fingerprint(labels=labels)
 
-    ids, vecs = load_vectors(conn, model)
+    ids, vecs = load_vectors(conn, model, include_videos=include_videos)
     before = current_distribution(conn)
     if not ids:
         return RetagResult(model=model, source=source, fingerprint=fingerprint,
@@ -534,6 +540,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR,
                    help=f"where the label matrix is cached (default {DEFAULT_CACHE_DIR}/) "
                         "— on the NVMe, never MinIO")
+    p.add_argument("--include-videos", action="store_true",
+                   help="also tag videos that have a poster-derived vector "
+                        "(Phase 7; off while photos and videos are cut over "
+                        "separately)")
     p.add_argument("--refresh-cache", action="store_true",
                    help="re-embed the label prompts even if a valid cache exists")
     p.add_argument("--limit", type=int, default=None,
@@ -590,6 +600,7 @@ def main(argv: Optional[Sequence[str]] = None, embedder=None) -> int:
             low_percentile=args.low_percentile,
             high_percentile=args.high_percentile,
             refresh_cache=args.refresh_cache,
+            include_videos=args.include_videos,
             verbose=True,
         )
     finally:
