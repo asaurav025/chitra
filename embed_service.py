@@ -83,11 +83,33 @@ def configure_threads() -> int:
     return threads
 
 
-def _default_embedder():
-    """Build the real CLIP embedder. Imported lazily — see `configure_threads`."""
-    from core.embedder import ClipEmbedder
+def configured_model() -> str:
+    """The model identifier this sidecar should load.
 
-    return ClipEmbedder(os.environ.get("CHITRA_CLIP_MODEL", DEFAULT_MODEL))
+    `CHITRA_EMBED_MODEL` is the switch; `CHITRA_CLIP_MODEL` is honoured as the
+    legacy spelling so renaming the variable does not silently change which
+    model an already-deployed box loads on its next restart.
+
+    **`CHITRA_ACTIVE_EMBED_MODEL` is deliberately not consulted here.** That one
+    selects the rows `search_photos` ranks from
+    (`core.db_async.active_embed_model`), and the two have to move
+    independently: the re-embed needs a window where this process already
+    computes SigLIP 768-d vectors while search still answers from the complete
+    set of CLIP 512-d rows. If one variable drove both, the cutover would flip
+    the read side before a single photo had been converted.
+    """
+    return (
+        os.environ.get("CHITRA_EMBED_MODEL")
+        or os.environ.get("CHITRA_CLIP_MODEL")
+        or DEFAULT_MODEL
+    )
+
+
+def _default_embedder():
+    """Build the real embedder. Imported lazily — see `configure_threads`."""
+    from core.embedder import build_embedder
+
+    return build_embedder(configured_model())
 
 
 def _rss_mb() -> float:
@@ -126,14 +148,18 @@ def create_app(embedder_factory=_default_embedder) -> FastAPI:
         app.state.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed")
         before = _rss_mb()
         app.state.embedder = embedder_factory()
-        app.state.model = os.environ.get("CHITRA_CLIP_MODEL", DEFAULT_MODEL)
+        app.state.model = configured_model()
+        # Ask the loaded object, not the configured name: if the two ever
+        # disagree, the number that matters downstream is the width of the
+        # vectors this process actually produces.
+        app.state.dim = getattr(app.state.embedder, "dim", None)
         logger.info(
-            "CLIP embedder ready: model=%s threads=%d rss=%.0f MB (+%.0f MB to load)",
-            app.state.model, app.state.threads, _rss_mb(), _rss_mb() - before,
+            "embedder ready: model=%s dim=%s threads=%d rss=%.0f MB (+%.0f MB to load)",
+            app.state.model, app.state.dim, app.state.threads, _rss_mb(), _rss_mb() - before,
         )
         print(
-            f"embed_service ready: model={app.state.model} threads={app.state.threads} "
-            f"rss={_rss_mb():.0f} MB",
+            f"embed_service ready: model={app.state.model} dim={app.state.dim} "
+            f"threads={app.state.threads} rss={_rss_mb():.0f} MB",
             flush=True,
         )
         try:
@@ -155,6 +181,11 @@ def create_app(embedder_factory=_default_embedder) -> FastAPI:
         return {
             "status": "ok" if loaded else "loading",
             "model": getattr(app.state, "model", None),
+            # The dimension is how an operator confirms which model a running
+            # sidecar actually holds before flipping the read side. A sidecar
+            # serving 768-d while search expects 512-d raises nothing; it just
+            # returns wrong answers.
+            "dim": getattr(app.state, "dim", None),
             "threads": getattr(app.state, "threads", 0),
             "rss_mb": round(_rss_mb(), 1),
         }
