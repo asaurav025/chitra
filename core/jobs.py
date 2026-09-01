@@ -61,6 +61,7 @@ FACE_MATCH_THRESHOLD = 0.60
 # Global instances (will be initialized per worker)
 _STORAGE_CLIENT = None
 _EMBEDDER = None
+_EMBED_CLIENT = None
 
 
 def _is_video(conn, photo_id: int) -> bool:
@@ -327,7 +328,20 @@ def _get_storage_client():
 
 
 def _get_embedder():
-    """Get or create embedder instance."""
+    """Get or create an in-process embedder instance.
+
+    **Nothing on the job paths calls this any more** — `process_photo_embedding_job`
+    and `_process_single_embedding` both go through the sidecar now (see
+    `_get_embed_client`). It is kept for one release so the change is a pure
+    revert if the sidecar route turns out to have a problem in production, and
+    should be deleted once it has not.
+
+    Do not reintroduce a call to it as a fallback. RQ forks per job, so `_EMBEDDER`
+    is built in the child and dies with it: every call here is a full 1.1 GB CLIP
+    load, ~90% of the measured 58.5 s job. A fallback would restore that path and
+    1.67 GB of residency invisibly — the pipeline would simply become slow again
+    with nothing in the logs to say why.
+    """
     from core.embedder import ClipEmbedder  # lazy: keeps torch out of the API
 
     global _EMBEDDER
@@ -336,47 +350,88 @@ def _get_embedder():
     return _EMBEDDER
 
 
+def _get_embed_client():
+    """The shared sync client for the resident CLIP in `embed_service.py`.
+
+    One per process. In a single-photo job that is one client for one photo; in
+    `index_embeddings_batch_job` the five worker threads share it, so the label
+    vectors it caches are embedded once for the whole batch rather than once per
+    photo.
+    """
+    from core.embed_client_sync import SyncEmbeddingClient  # no torch, no fastapi model
+
+    global _EMBED_CLIENT
+    if _EMBED_CLIENT is None:
+        _EMBED_CLIENT = SyncEmbeddingClient()
+    return _EMBED_CLIENT
+
+
+#: Tags kept per photo by the embedding job. Unchanged from the `auto_tags(k=6)`
+#: it replaces — Phase 3's calibrated `core.tagger.tag_from_vector` is what
+#: makes this count vary per photo, and it needs a corpus calibration this job
+#: does not have.
+EMBED_JOB_TAG_COUNT = 6
+
+
+def _embed_and_tag(conn, photo_id: int, key: str, data: bytes) -> None:
+    """Store one photo's vector and its tags from a **single** sidecar embed.
+
+    The old path ran CLIP over the same bytes twice: once here for the stored
+    vector, and once more inside `auto_tags` -> `rank_labels`, which embeds the
+    image again and then recomputes the whole label text batch from scratch. The
+    score is a dot product between two already-normalised vectors, so with the
+    image vector in hand the tags cost no forward pass at all and the label
+    vectors are embedded once per process rather than once per photo.
+
+    `DEFAULT_LABELS` is imported here rather than at module scope because
+    `core/jobs.py` is imported by `app_fastapi` purely to enqueue jobs by
+    reference — see the note at the top of this file.
+    """
+    from core.tagger import DEFAULT_LABELS
+
+    client = _get_embed_client()
+    vec = np.asarray(client.image_embedding(os.path.basename(key), data), dtype="float32")
+    db.put_embedding(conn, photo_id, vec.tobytes(), int(vec.shape[0]))
+
+    for tag, score in client.rank_labels_for_vector(vec, DEFAULT_LABELS, EMBED_JOB_TAG_COUNT):
+        db.add_tag(conn, photo_id, tag, float(score))
+
+
 def process_photo_embedding_job(photo_id: int, file_path: str, db_path: str):
     """
     Background job to process photo embedding and auto-tags.
-    
+
+    The vector comes from the resident CLIP in `embed_service.py` over loopback,
+    not from a model loaded here. RQ forks per job, so an in-process model is
+    loaded and discarded every single time — ~90% of the measured 58.5 s this
+    job used to take, and 1.67 GB of peak RSS in a cgroup with a history of OOM
+    kills. The downloaded bytes go straight to the sidecar, so this also no
+    longer writes the whole original out to a temp file.
+
+    **It re-raises.** It used to swallow every exception and return `False`,
+    which makes RQ mark the job *successful* — a failed embedding was invisible.
+    There is deliberately no in-process fallback when the sidecar is down: see
+    `_get_embedder`.
+
     Args:
         photo_id: Photo ID in database
         file_path: MinIO object key to the photo file
         db_path: Path to SQLite database
     """
-    from core.tagger import auto_tags  # lazy: keeps torch out of the API
-
     conn = db.connect(db_path)
-    storage_client = _get_storage_client()
 
     try:
         if _is_video(conn, photo_id):
             print(f"Skipping embedding for video photo {photo_id}")
             return True
-        # Download from MinIO to temporary file
-        file_data = storage_client.download_file(file_path)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
-            tmp.write(file_data)
-            tmp_path = tmp.name
-
-        try:
-            em = _get_embedder()
-            img_vec = em.image_embedding(tmp_path)
-            vec_bytes = img_vec.tobytes()
-            dim = img_vec.shape[0]
-            db.put_embedding(conn, photo_id, vec_bytes, dim)
-            
-            # Auto tags
-            atags = auto_tags(em, tmp_path, k=6)
-            for tag, score in atags:
-                db.add_tag(conn, photo_id, tag, float(score))
-            return True
-        finally:
-            os.unlink(tmp_path)
+        # One download, straight to the sidecar. The disk under MinIO has 3,000+
+        # unrecovered read errors; a second read per photo buys nothing.
+        file_data = _get_storage_client().download_file(file_path)
+        _embed_and_tag(conn, photo_id, file_path, file_data)
+        return True
     except Exception as e:
         print(f"Error processing embedding for photo {photo_id}: {e}")
-        return False
+        raise
     finally:
         conn.close()
 
@@ -482,39 +537,24 @@ def process_photo_faces_job(photo_id: int, file_path: str, db_path: str, min_sco
 
 
 def _process_single_embedding(pid: int, file_path: str, db_path: str) -> bool:
-    """Process embedding for a single photo (used in parallel processing)."""
-    from core.tagger import auto_tags  # lazy: keeps torch out of the API
+    """Process embedding for a single photo (used in parallel processing).
 
+    Same sidecar route as `process_photo_embedding_job`, and it re-raises for
+    the same reason. `index_embeddings_batch_job` catches per photo, so one
+    failure costs one photo rather than the batch.
+    """
     conn = db.connect(db_path)
-    storage_client = _get_storage_client()
-    em = _get_embedder()
 
     try:
         if _is_video(conn, pid):
             print(f"Skipping embedding for video photo {pid}")
             return False
-        # Download from MinIO to temporary file
-        file_data = storage_client.download_file(file_path)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_path).suffix) as tmp:
-            tmp.write(file_data)
-            tmp_path = tmp.name
-        
-        try:
-            img_vec = em.image_embedding(tmp_path)
-            vec_bytes = img_vec.tobytes()
-            dim = img_vec.shape[0]
-            db.put_embedding(conn, pid, vec_bytes, dim)
-            
-            # Auto tags
-            atags = auto_tags(em, tmp_path, k=6)
-            for tag, score in atags:
-                db.add_tag(conn, pid, tag, float(score))
-            return True
-        finally:
-            os.unlink(tmp_path)
+        file_data = _get_storage_client().download_file(file_path)
+        _embed_and_tag(conn, pid, file_path, file_data)
+        return True
     except Exception as e:
         print(f"Error processing embedding for photo {pid}: {e}")
-        return False
+        raise
     finally:
         conn.close()
 
