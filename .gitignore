@@ -55,3 +55,8 @@ logs/
 # FAISS indexes
 faiss_indexes/
 *.index
+
+# SQLite sidecars (WAL mode) and manual backups
+*.db-wal
+*.db-shm
+photo.db.bak-*
