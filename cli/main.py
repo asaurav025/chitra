@@ -16,6 +16,7 @@ from core.extractor import iter_images, collect_metadata, load_image
 from core.embedder import ClipEmbedder
 from core.tagger import auto_tags
 from core.cluster import threshold_clusters
+from core.jobs import FACE_MATCH_THRESHOLD
 from core.gallery import build_gallery
 from core.face import face_encodings
 import asyncio
@@ -316,7 +317,9 @@ def faces_detect(
 @app.command("faces-cluster")
 def faces_cluster(
     db_path: str = typer.Option("photo.db", "--db"),
-    threshold: float = typer.Option(0.75, help="Cosine similarity threshold for same person"),
+    threshold: float = typer.Option(
+        FACE_MATCH_THRESHOLD, help="Cosine similarity threshold for same person"
+    ),
 ):
     """
     Cluster faces into persons using FAISS on face embeddings.

@@ -23,6 +23,41 @@ from core.gallery import ensure_thumb
 # Guarded by tests/test_api_memory_budget.py.
 
 
+# The one cosine-similarity threshold for "these two faces are the same person".
+#
+# Four copies of this number used to disagree: 0.75 in _auto_match_face_to_person
+# and cluster_faces_job, 0.6 at the upload trigger and in recluster_all.py, 0.75
+# in the `faces-cluster` CLI command. Everything that matches faces now reads
+# this. (core/cluster.py's 0.78 is deliberately NOT this value — it groups whole
+# photos by CLIP embedding, a different space and a different question.)
+#
+# 0.60 is measured, not guessed. Over the 549 faces already assigned to the 8
+# named persons in the live DB (buffalo_l 512-d embeddings, L2-normalised):
+#
+#   between-person pairs: mean 0.038, 99.99th pct 0.326, absolute max 0.366
+#   within-person pairs:  mean 0.629, median 0.644
+#   per-person average pairwise similarity: 0.590 - 0.809 (median 0.732)
+#
+# Two independent uses, both satisfied at 0.60 and neither at 0.75:
+#
+#   Phase 1, nearest-assigned-neighbour matching. Simulated on the labelled
+#   set, precision is 100% at every cut from 0.50 to 0.85 — the populations
+#   barely overlap — so the choice is pure recall: 98.2% at 0.60, 94.7% at
+#   0.75, 90.9% at 0.78. 0.60 still clears the worst observed impostor pair
+#   (0.366) by 0.23.
+#
+#   Phase 2, the HDBSCAN acceptance gate in cluster_faces_job, which keeps a
+#   cluster only if its *average* pairwise similarity >= this value. Real
+#   people here average 0.59-0.81, so a 0.75 gate rejects 5 of the 8 known
+#   persons (including both large ones: saurav 0.654, swati 0.590) and 0.78
+#   rejects 6 of 8. At those values Phase 2 could not have formed a correct
+#   cluster for this dataset at all — a second, independent reason the People
+#   feature stayed empty.
+#
+# Re-derive with the same query before changing this; a higher value silently
+# stops grouping people rather than failing loudly.
+FACE_MATCH_THRESHOLD = 0.60
+
 # Global instances (will be initialized per worker)
 _STORAGE_CLIENT = None
 _EMBEDDER = None
@@ -36,7 +71,8 @@ def _is_video(conn, photo_id: int) -> bool:
     return bool(row and row["media_type"] == "video")
 
 
-def _auto_match_face_to_person(conn, face_id: int, face_embedding: np.ndarray, threshold: float = 0.75):
+def _auto_match_face_to_person(conn, face_id: int, face_embedding: np.ndarray,
+                               threshold: float = FACE_MATCH_THRESHOLD):
     """
     Automatically match a newly detected face to an existing person.
     
@@ -44,7 +80,8 @@ def _auto_match_face_to_person(conn, face_id: int, face_embedding: np.ndarray, t
         conn: Database connection
         face_id: ID of the face to match
         face_embedding: Face embedding vector (numpy array)
-        threshold: Similarity threshold for matching (default 0.75)
+        threshold: Cosine similarity threshold for matching.
+                   Defaults to FACE_MATCH_THRESHOLD; see its derivation there.
     """
     try:
         import faiss
@@ -263,7 +300,7 @@ def process_photo_faces_job(photo_id: int, file_path: str, db_path: str, min_sco
                     
                     # Auto-match face to existing persons
                     try:
-                        _auto_match_face_to_person(conn, face_id, emb, threshold=0.75)
+                        _auto_match_face_to_person(conn, face_id, emb)
                     except Exception as e:
                         # Don't fail face processing if matching fails
                         print(f"Warning: Auto-matching face {face_id} failed: {e}")
@@ -421,7 +458,7 @@ def _process_single_face(pid: int, file_path: str, db_path: str, min_score: floa
                     
                     # Auto-match face to existing persons
                     try:
-                        _auto_match_face_to_person(conn, face_id, emb, threshold=0.75)
+                        _auto_match_face_to_person(conn, face_id, emb)
                     except Exception as e:
                         # Don't fail face processing if matching fails
                         print(f"Warning: Auto-matching face {face_id} failed: {e}")
@@ -608,7 +645,8 @@ def generate_video_poster_job(photo_id: int, file_path: str, db_path: str):
                     pass
 
 
-def cluster_faces_job(db_path: str, threshold: float = 0.75, photo_ids: list = None, reset: bool = False):
+def cluster_faces_job(db_path: str, threshold: float = FACE_MATCH_THRESHOLD,
+                      photo_ids: list = None, reset: bool = False):
     """
     Background job to cluster unassigned faces into persons using HDBSCAN.
     
@@ -617,7 +655,9 @@ def cluster_faces_job(db_path: str, threshold: float = 0.75, photo_ids: list = N
     
     Args:
         db_path: Path to SQLite database
-        threshold: Similarity threshold for clustering (default 0.75)
+        threshold: Cosine similarity threshold for both matching against
+                   existing persons and accepting a new HDBSCAN cluster.
+                   Defaults to FACE_MATCH_THRESHOLD; see its derivation there.
         photo_ids: Optional list of photo IDs to limit clustering to faces from these photos only.
                    If None, clusters all unassigned faces (less efficient for large databases).
         reset: If True, unassign all faces before clustering (re-cluster everything).

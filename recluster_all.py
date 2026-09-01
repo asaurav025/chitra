@@ -16,7 +16,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from core.worker import get_queue
-from core.jobs import cluster_faces_job
+from core.jobs import cluster_faces_job, FACE_MATCH_THRESHOLD
 from core import db
 
 # Database path
@@ -44,9 +44,15 @@ def main():
         print("Make sure Redis is running and REDIS_URL is set correctly")
         sys.exit(1)
     
-    # Queue clustering job with reset=True
-    # Lower threshold (0.6) for less strict matching - groups more similar faces together
-    threshold = 0.6
+    # Queue clustering job with reset=True.
+    #
+    # DESTRUCTIVE: reset=True sets person_id = NULL on *every* face first, so
+    # any person a human named and assigned by hand in the UI is wiped and has
+    # to be re-made from whatever the clusterer decides. cluster_faces_job with
+    # reset=False only ever touches faces where person_id IS NULL and is the
+    # right tool for catching up a backlog. Use this script only for a
+    # deliberate from-scratch re-cluster, with a DB backup in hand.
+    threshold = FACE_MATCH_THRESHOLD
     print(f"\nQueuing re-clustering job (reset=True, threshold={threshold})...")
     try:
         job = queue.enqueue(

@@ -60,8 +60,9 @@ from core.jobs import (
     cluster_faces_job,
     update_faiss_index_after_merge_job,
     rebuild_faiss_index_job,
+    FACE_MATCH_THRESHOLD,
 )
-from rq.job import Job
+from rq.job import Job, Dependency
 from PIL import Image
 
 # Register HEIC/HEIF support
@@ -799,6 +800,49 @@ def enqueue_video_poster(photo_id: int, file_path: str) -> bool:
         return False
 
 
+def _enqueue_cluster_after_faces(queue, photo_ids, face_jobs):
+    """Queue the face-clustering pass for one upload batch. Returns the job.
+
+    Gated on this batch's own face-detection jobs with RQ's ``depends_on``.
+    The previous form — ``queue.enqueue_in(timedelta(seconds=30), ...)`` — was
+    broken twice over:
+
+    1. Nothing dequeues delayed jobs here. ``worker.py`` builds its Worker
+       without ``with_scheduler=True`` and ``start_workers.sh`` starts no
+       ``rq scheduler`` daemon, so every delayed job landed in
+       ``rq:scheduled:default`` and stayed there. 1,485 of them accumulated
+       between 2025-12-07 and 2026-09-01 while 1,532 of 2,081 faces went
+       unassigned.
+    2. Even with a working scheduler, 30 s is a race. Face detection is ~37 s
+       per photo on this box (dominated by the per-job buffalo_l reload), so
+       any batch larger than one photo would have clustered against
+       partially-detected faces.
+
+    ``allow_failure=True`` because a dependency that ends in the failed
+    registry never releases its dependents: face jobs currently swallow their
+    own exceptions, but a hard crash in one photo must not strand the whole
+    batch's clustering as permanently deferred.
+
+    ``reset`` is deliberately left at its default of False. Passing True here
+    would ``UPDATE faces SET person_id = NULL`` across the table and destroy
+    the owner's hand-made assignments.
+    """
+    if not photo_ids:
+        return None
+
+    depends_on = (
+        Dependency(jobs=list(face_jobs), allow_failure=True) if face_jobs else None
+    )
+    return queue.enqueue(
+        cluster_faces_job,
+        DB_PATH,
+        FACE_MATCH_THRESHOLD,
+        photo_ids,
+        depends_on=depends_on,
+        job_timeout="5m",
+    )
+
+
 # -----------------------------------------------------------------------------
 # PHOTO ENDPOINTS
 # -----------------------------------------------------------------------------
@@ -1120,7 +1164,13 @@ async def upload_photos(
     valid_files = [f for f in files if f.filename]
     if not valid_files:
         raise HTTPException(status_code=400, detail="no_valid_files")
-    
+
+    # Face-detection jobs for this batch, collected so the clustering pass can
+    # depend on them. Appended to from the upload coroutines below; that is
+    # safe without a lock because they are asyncio tasks on one thread and
+    # list.append never awaits.
+    face_jobs = []
+
     async def upload_single_file_streaming(file: UploadFile) -> Dict[str, Any]:
         """Upload a single file asynchronously using streaming to avoid loading entire file into memory."""
         filename = file.filename
@@ -1249,14 +1299,16 @@ async def upload_photos(
                             DB_PATH,
                             job_timeout='10m'
                         )
-                        # Queue face processing job
-                        queue.enqueue(
+                        # Queue face processing job. Kept so the batch's
+                        # clustering pass can wait on it (see
+                        # _enqueue_cluster_after_faces).
+                        face_jobs.append(queue.enqueue(
                             process_photo_faces_job,
                             photo_id,
                             stored_path,
                             DB_PATH,
                             job_timeout='10m'
-                        )
+                        ))
                     except Exception as e:
                         # Don't fail upload if job queuing fails
                         print(f"Warning: Failed to queue processing jobs for {filename}: {e}")
@@ -1332,43 +1384,21 @@ async def upload_photos(
             else:
                 saved.append(result)
     
-    # Auto-trigger clustering after face detection completes
-    # Queue clustering job with a delay to allow face detection jobs to start
+    # Auto-trigger clustering once this batch's face detection has finished.
     if auto_process and saved:
         try:
-            # Extract photo IDs from successfully uploaded photos (videos have no faces to cluster)
+            # Videos carry no faces to cluster; duplicates were not re-detected.
             uploaded_photo_ids = [
                 result["id"] for result in saved
                 if "id" in result and not result.get("duplicate", False) and result.get("media_type") != "video"
             ]
-            
-            if uploaded_photo_ids:
-                queue = get_queue()
-                # Queue clustering job with 30 second delay to allow face detection to complete
-                # Pass photo_ids to only cluster faces from newly uploaded photos (more efficient)
-                try:
-                    # Try using enqueue_in if available (RQ scheduler)
-                    from datetime import timedelta
-                    queue.enqueue_in(
-                        timedelta(seconds=30),
-                        cluster_faces_job,
-                        DB_PATH,
-                        0.6,  # threshold (less strict matching)
-                        uploaded_photo_ids,  # Only cluster faces from these photos
-                        job_timeout='5m'
-                    )
-                    print(f"✓ Queued auto-clustering job for {len(uploaded_photo_ids)} photos (will run in 30 seconds)")
-                except AttributeError:
-                    # enqueue_in not available, use regular enqueue (will run immediately)
-                    # Face detection jobs will complete first due to their processing time
-                    queue.enqueue(
-                        cluster_faces_job,
-                        DB_PATH,
-                        0.6,  # threshold (less strict matching)
-                        uploaded_photo_ids,  # Only cluster faces from these photos
-                        job_timeout='5m'
-                    )
-                    print(f"✓ Queued auto-clustering job for {len(uploaded_photo_ids)} photos (will run after face detection completes)")
+
+            job = _enqueue_cluster_after_faces(get_queue(), uploaded_photo_ids, face_jobs)
+            if job is not None:
+                print(
+                    f"✓ Queued auto-clustering for {len(uploaded_photo_ids)} photos "
+                    f"(waits on {len(face_jobs)} face-detection jobs)"
+                )
         except Exception as e:
             # Don't fail upload if clustering job queuing fails
             print(f"Warning: Failed to queue auto-clustering job: {e}")
