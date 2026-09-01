@@ -63,3 +63,8 @@ photo.db.bak-*
 
 # reembed progress journal (scripts/reembed.py)
 reembed_state.jsonl
+
+# Cached tag label-vector matrices (scripts/retag.py). Derived data: ~700 KB
+# per (model, vocabulary fingerprint), rebuilt from the sidecar in one pass,
+# and invalidated automatically when core/vocabulary.py changes.
+models/
