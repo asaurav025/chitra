@@ -720,6 +720,21 @@ def thumbnail_etag(item_id: int, thumb_path: str) -> str:
     return '"%s"' % hashlib.md5(f"{item_id}:{thumb_path}".encode()).hexdigest()
 
 
+async def read_thumbnail_async(storage: MinIOStorageClient, thumb_path: str) -> bytes:
+    """Read a thumbnail through the in-process cache.
+
+    Raises FileNotFoundError if the object is not in storage. Callers recover
+    from that; they must not probe for it first — `file_exists_async` before
+    every serve is a whole extra storage round-trip per tile on a grid render,
+    paid to catch a rare miss.
+    """
+    thumb_data = get_cached_thumbnail(thumb_path)
+    if thumb_data is None:
+        thumb_data = await storage.download_file_async(thumb_path)
+        cache_thumbnail(thumb_path, thumb_data)
+    return thumb_data
+
+
 async def ensure_photo_thumb_async(
     file_path: str,
     photo_id: int,
@@ -1082,30 +1097,27 @@ async def get_photo_thumbnail(
     # keep using the lazy PIL path.
     is_vid = row["media_type"] == "video"
 
-    if is_vid:
+    if is_vid and not thumb_path:
         # A video poster is ffmpeg work, which never runs in the API. The old
         # code fell through to PIL, which downloaded the entire video and then
         # 500'd trying to open an mp4 as an image.
-        if not thumb_path or not await storage.file_exists_async(thumb_path):
-            enqueue_video_poster(photo_id, file_path)
-            raise HTTPException(
-                status_code=404,
-                detail="poster_pending",
-                headers={"Retry-After": "3"},
-            )
-        # A poster that already exists is served below like any other thumbnail.
-    elif not thumb_path:
+        enqueue_video_poster(photo_id, file_path)
+        raise HTTPException(
+            status_code=404,
+            detail="poster_pending",
+            headers={"Retry-After": "3"},
+        )
+    if not is_vid and not thumb_path:
         # Photo with no thumb_path yet: generate it lazily and store it. This
         # is the only path that keeps the 766 legacy NULL-media_type rows
         # working, which is why it stays in the API — PIL, not ffmpeg.
         thumb_path = await ensure_photo_thumb_async(file_path, photo_id, storage, conn)
         await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
         await conn.commit()
-    elif not await storage.file_exists_async(thumb_path):
-        # Recorded in the DB but gone from MinIO — regenerate.
-        thumb_path = await ensure_photo_thumb_async(file_path, photo_id, storage, conn)
-        await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
-        await conn.commit()
+    # A recorded thumb_path is served straight away. It used to be checked with
+    # file_exists_async first, doubling storage operations on every grid render
+    # to catch the rare object that is in the DB but gone from MinIO; that miss
+    # is now handled where it actually shows up, on the download below.
     
     # ETag over the stable identifier: photo id plus object key.
     etag = thumbnail_etag(photo_id, thumb_path)
@@ -1121,19 +1133,31 @@ async def get_photo_thumbnail(
             }
         )
     
-    # Check cache first
-    thumb_data = get_cached_thumbnail(thumb_path)
-    
-    if thumb_data is None:
-        # Download from MinIO
+    try:
+        thumb_data = await read_thumbnail_async(storage, thumb_path)
+    except FileNotFoundError:
+        # Recorded in the DB but gone from storage.
+        if is_vid:
+            # Posters are ffmpeg work: ask a worker, tell the client to retry.
+            enqueue_video_poster(photo_id, file_path)
+            raise HTTPException(
+                status_code=404,
+                detail="poster_pending",
+                headers={"Retry-After": "3"},
+            )
+        thumb_path = await ensure_photo_thumb_async(file_path, photo_id, storage, conn)
+        await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
+        await conn.commit()
+        # Regeneration may have landed on a different key than the DB recorded.
+        etag = thumbnail_etag(photo_id, thumb_path)
         try:
-            thumb_data = await storage.download_file_async(thumb_path)
-            # Cache for future requests
-            cache_thumbnail(thumb_path, thumb_data)
+            thumb_data = await read_thumbnail_async(storage, thumb_path)
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="thumbnail_not_found_on_storage")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"storage_error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"storage_error: {str(e)}")
     
     return Response(
         content=thumb_data,
@@ -2202,19 +2226,12 @@ async def get_face_thumbnail(
             }
         )
 
-    # Check cache first
-    thumb_data = get_cached_thumbnail(thumb_path)
-    
-    if thumb_data is None:
-        # Download from MinIO
-        try:
-            thumb_data = await storage.download_file_async(thumb_path)
-            # Cache for future requests
-            cache_thumbnail(thumb_path, thumb_data)
-        except FileNotFoundError:
-            raise HTTPException(status_code=404, detail="thumb_not_found_on_storage")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"storage_error: {str(e)}")
+    try:
+        thumb_data = await read_thumbnail_async(storage, thumb_path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="thumb_not_found_on_storage")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"storage_error: {str(e)}")
     
     return Response(
         content=thumb_data,
