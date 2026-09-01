@@ -12,8 +12,15 @@ from typing import (
 
 import aiosqlite
 
+from core import db
+
 
 DB_DEFAULT_PATH = "photo.db"
+
+# Re-exported so callers do not have to know which of the two duplicated schema
+# modules owns the constant. There is exactly one definition, in `core.db`.
+DEFAULT_EMBED_MODEL = db.DEFAULT_EMBED_MODEL
+DEFAULT_TAG_SOURCE = db.DEFAULT_TAG_SOURCE
 
 
 # ----------------------------------------------------------------------
@@ -231,6 +238,44 @@ async def init_db_async(db_path: str = DB_DEFAULT_PATH) -> None:
         except aiosqlite.OperationalError:
             pass
 
+        # Migration: per-row model/vocabulary provenance, and the uniqueness it
+        # keys. The statements are imported from `core.db` rather than retyped:
+        # these two modules already diverged once (the sync copy has no `users`
+        # table) and this migration must not become the second divergence.
+        #
+        # The `embeddings` key is (photo_id, model), NOT (photo_id) — a bare
+        # photo_id key would make the first SigLIP row evict the CLIP row that
+        # search is still answering from, destroying both coexistence during
+        # the migration and rollback-by-config.
+        for _ddl in db.MIGRATION_COLUMNS:
+            try:
+                await conn.execute(_ddl)
+            except aiosqlite.OperationalError:
+                pass
+        for _sql, _params in db.MIGRATION_BACKFILLS:
+            try:
+                await conn.execute(_sql, _params)
+            except aiosqlite.OperationalError:
+                pass
+        for _name, _ddl in db.MIGRATION_UNIQUE_INDEXES:
+            try:
+                await conn.execute(_ddl)
+            except aiosqlite.OperationalError as exc:
+                # Never swallowed: a missing unique index means the table holds
+                # duplicates and every writer's upsert will fail. Silence here
+                # would leave the constraint absent with nobody aware.
+                print(
+                    f"SCHEMA WARNING: could not create unique index {_name}: {exc}. "
+                    f"The table almost certainly holds duplicate rows — writers "
+                    f"will fail until they are removed.",
+                    flush=True,
+                )
+        for _ddl in db.MIGRATION_INDEXES:
+            try:
+                await conn.execute(_ddl)
+            except aiosqlite.OperationalError:
+                pass
+
         await conn.commit()
 
 
@@ -316,13 +361,19 @@ async def put_embedding_async(
     photo_id: int,
     vec_bytes: bytes,
     dim: int,
+    model: str | None = None,
 ) -> None:
+    """Async mirror of `db.put_embedding` — see that docstring for why the key
+    is `(photo_id, model)` rather than `(photo_id)`."""
     await conn.execute(
         """
-        INSERT INTO embeddings (photo_id, dim, vector)
-        VALUES (?, ?, ?)
+        INSERT INTO embeddings (photo_id, dim, vector, model)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(photo_id, model) DO UPDATE SET
+          dim = excluded.dim,
+          vector = excluded.vector
         """,
-        (photo_id, dim, vec_bytes),
+        (photo_id, dim, vec_bytes, model or DEFAULT_EMBED_MODEL),
     )
     await conn.commit()
 
@@ -336,10 +387,24 @@ async def get_embeddings_async(conn: aiosqlite.Connection) -> List[Tuple[int, in
 # ----------------------------------------------------------------------
 # TAGS (ASYNC)
 # ----------------------------------------------------------------------
-async def add_tag_async(conn: aiosqlite.Connection, photo_id: int, tag: str, score: float) -> None:
+async def add_tag_async(
+    conn: aiosqlite.Connection,
+    photo_id: int,
+    tag: str,
+    score: float,
+    source: str | None = None,
+) -> None:
+    """Async mirror of `db.add_tag`. Keyed on `(photo_id, tag)`; `source` is
+    provenance and deliberately not part of the key."""
     await conn.execute(
-        "INSERT INTO tags (photo_id, tag, score) VALUES (?, ?, ?)",
-        (photo_id, tag, score),
+        """
+        INSERT INTO tags (photo_id, tag, score, source)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(photo_id, tag) DO UPDATE SET
+          score = excluded.score,
+          source = excluded.source
+        """,
+        (photo_id, tag, score, source or DEFAULT_TAG_SOURCE),
     )
     await conn.commit()
 

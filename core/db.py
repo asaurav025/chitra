@@ -6,6 +6,16 @@ from typing import Iterable, List, Tuple, Dict, Optional, Any
 
 DB_DEFAULT_PATH = "photo.db"
 
+# Identifies which model produced a vector. Stored per row rather than assumed
+# globally, because the CLIP -> SigLIP migration needs both generations resident
+# in `embeddings` at once: search answers from one of them while the other is
+# still being written, and rollback is then a config change rather than a full
+# re-embed off a failing disk.
+DEFAULT_EMBED_MODEL = "openai/clip-vit-base-patch32"
+# Which model *and vocabulary* produced a tag. Provenance, not identity — it is
+# deliberately not part of the tags unique key.
+DEFAULT_TAG_SOURCE = "clip-vitb32/vocab-v1"
+
 
 # ----------------------------------------------------------------------
 # CONNECTION + INIT
@@ -184,8 +194,84 @@ def init_db(db_path: str = DB_DEFAULT_PATH):
         except sqlite3.OperationalError:
             pass
 
+    migrate_embeddings_and_tags(conn)
+
     conn.commit()
     conn.close()
+
+
+# Kept as data so `db_async.py` can mirror it verbatim. The two modules carry
+# duplicated DDL that has already diverged once (the sync copy has no `users`
+# table); this migration must not become the second divergence.
+MIGRATION_COLUMNS = (
+    "ALTER TABLE embeddings ADD COLUMN model TEXT",
+    "ALTER TABLE tags ADD COLUMN source TEXT",
+)
+MIGRATION_BACKFILLS = (
+    ("UPDATE embeddings SET model = ? WHERE model IS NULL", (DEFAULT_EMBED_MODEL,)),
+    ("UPDATE tags SET source = ? WHERE source IS NULL", (DEFAULT_TAG_SOURCE,)),
+)
+MIGRATION_UNIQUE_INDEXES = (
+    ("idx_embeddings_photo_model",
+     "CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_photo_model "
+     "ON embeddings(photo_id, model)"),
+    ("idx_tags_photo_tag",
+     "CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_photo_tag ON tags(photo_id, tag)"),
+)
+MIGRATION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag)",
+)
+
+
+def migrate_embeddings_and_tags(conn: sqlite3.Connection) -> None:
+    """Add the `model`/`source` columns and the uniqueness they key.
+
+    Additive and idempotent, like every other migration here — there is no
+    migration framework and no schema-version table, so this runs on every
+    startup and must be safe to run on an already-migrated database.
+
+    The unique index on `embeddings` is `(photo_id, model)` and **not**
+    `(photo_id)`. A bare `photo_id` key would make the first SigLIP row evict
+    the CLIP row it is meant to run alongside, which destroys both coexistence
+    during the migration and the ability to roll back by config.
+
+    A failed `ADD COLUMN` is expected (the column is already there) and
+    swallowed. A failed **unique index** is not: it means the table already
+    holds duplicates, the constraint is absent, and every writer's upsert will
+    then fail with "ON CONFLICT clause does not match any ... UNIQUE
+    constraint". That has to be loud — `scripts/dedupe_embeddings.py` is the
+    escape hatch, not silence.
+    """
+    for ddl in MIGRATION_COLUMNS:
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already present
+
+    for sql, params in MIGRATION_BACKFILLS:
+        try:
+            conn.execute(sql, params)
+        except sqlite3.OperationalError:
+            pass  # table not created yet on a partial schema
+
+    for name, ddl in MIGRATION_UNIQUE_INDEXES:
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError as exc:
+            print(
+                f"SCHEMA WARNING: could not create unique index {name}: {exc}. "
+                f"The table almost certainly holds duplicate rows — writers will "
+                f"fail until they are removed.",
+                flush=True,
+            )
+
+    for ddl in MIGRATION_INDEXES:
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
+
+    conn.commit()
 
 
 # ----------------------------------------------------------------------
@@ -276,13 +362,33 @@ def iter_photos(conn: sqlite3.Connection) -> Iterable[Tuple[int, str]]:
 # ----------------------------------------------------------------------
 # EMBEDDINGS
 # ----------------------------------------------------------------------
-def put_embedding(conn: sqlite3.Connection, photo_id: int, vec_bytes: bytes, dim: int):
+def put_embedding(
+    conn: sqlite3.Connection,
+    photo_id: int,
+    vec_bytes: bytes,
+    dim: int,
+    model: Optional[str] = None,
+):
+    """Store this photo's vector *for this model*, replacing any it already had.
+
+    This used to be a plain INSERT into a table with no unique constraint, so
+    embedding the same photo twice left two rows — and `search_photos` stacks
+    every row `get_embeddings` returns, so the photo would occupy two result
+    slots and score twice. Nothing noticed because nothing had ever re-embedded.
+
+    Scoped to `(photo_id, model)`: writing a SigLIP vector must **not** delete
+    the CLIP vector that search is still answering from. That is what makes the
+    512 -> 768 migration incremental and its rollback a config change.
+    """
     conn.execute(
         """
-        INSERT INTO embeddings (photo_id, dim, vector)
-        VALUES (?, ?, ?)
+        INSERT INTO embeddings (photo_id, dim, vector, model)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(photo_id, model) DO UPDATE SET
+          dim = excluded.dim,
+          vector = excluded.vector
         """,
-        (photo_id, dim, vec_bytes),
+        (photo_id, dim, vec_bytes, model or DEFAULT_EMBED_MODEL),
     )
     conn.commit()
 
@@ -296,12 +402,53 @@ def get_embeddings(conn: sqlite3.Connection) -> List[Tuple[int, int, bytes]]:
 # ----------------------------------------------------------------------
 # TAGS
 # ----------------------------------------------------------------------
-def add_tag(conn: sqlite3.Connection, photo_id: int, tag: str, score: float):
+def add_tag(
+    conn: sqlite3.Connection,
+    photo_id: int,
+    tag: str,
+    score: float,
+    source: Optional[str] = None,
+):
+    """Attach one tag, replacing that same tag on that photo if it exists.
+
+    Same hazard as `put_embedding`: `tags` had no unique constraint, so
+    re-tagging a photo appended a second copy of every label. Keyed on
+    `(photo_id, tag)` — `source` records which model and vocabulary produced
+    the label and is provenance, not identity, so re-scoring a photo under a
+    new vocabulary updates the label rather than duplicating it.
+    """
     conn.execute(
-        "INSERT INTO tags (photo_id, tag, score) VALUES (?, ?, ?)",
-        (photo_id, tag, score),
+        """
+        INSERT INTO tags (photo_id, tag, score, source)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(photo_id, tag) DO UPDATE SET
+          score = excluded.score,
+          source = excluded.source
+        """,
+        (photo_id, tag, score, source or DEFAULT_TAG_SOURCE),
     )
     conn.commit()
+
+
+def replace_tags(
+    conn: sqlite3.Connection,
+    photo_id: int,
+    tags: Iterable[Tuple[str, float]],
+    source: Optional[str] = None,
+):
+    """Swap a photo's entire tag set in one transaction.
+
+    `add_tag` in a loop cannot drop a label that the new vocabulary no longer
+    predicts, so a photo re-tagged after the label list changed would keep the
+    union of every list it was ever scored against.
+    """
+    with conn:
+        conn.execute("DELETE FROM tags WHERE photo_id = ?", (photo_id,))
+        conn.executemany(
+            "INSERT INTO tags (photo_id, tag, score, source) VALUES (?, ?, ?, ?)",
+            [(photo_id, tag, float(score), source or DEFAULT_TAG_SOURCE)
+             for tag, score in tags],
+        )
 
 
 # ----------------------------------------------------------------------
