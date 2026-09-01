@@ -34,7 +34,7 @@ carries a ruff config for when it is installed; nothing runs it automatically.
 ## Test baseline
 
 The suite is **not green**. As of 2026-09-01 a clean run is
-`53 tests, 7 failures, 4 errors, 2 skipped`. These are pre-existing:
+`66 tests, 7 failures, 4 errors, 2 skipped`. These are pre-existing:
 
 - `test_endpoints.py` — 7 failures, all `401 != 200/400/404`. The tests build a
   `TestClient` with no auth token and predate the auth layer.
