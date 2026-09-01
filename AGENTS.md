@@ -33,12 +33,27 @@ carries a ruff config for when it is installed; nothing runs it automatically.
 
 ## Test baseline
 
-The suite is **not green**. As of 2026-09-01 a clean run is
-`168 tests, 7 failures, 4 errors, 2 skipped`. These are pre-existing:
+The suite is **not green**. Measured 2026-09-01 on a clean checkout of `main`
+(no uncommitted work), twice, stable:
 
-- `test_endpoints.py` — 7 failures, all `401 != 200/400/404`. The tests build a
-  `TestClient` with no auth token and predate the auth layer.
-- `test_db_async.py` (3 errors), `test_search.py` (1 error).
+```
+182 tests, 7 failures, 5 errors, 2 skipped
+```
+
+Measure the baseline the same way before trusting it — a `git worktree add
+--detach <path> HEAD` gives a tree without local WIP, which is what this number
+describes. Running it in a dirty tree counts other people's in-progress tests.
+
+- `test_endpoints.py` — **7 failures**, all `401 != 200/400/404`. The tests build
+  a `TestClient` with no auth token and predate the auth layer. Fixable: give the
+  suite a token. Until then they are noise.
+- `test_db_async.py` (**3 errors**), `test_search.py` (**1 error**) — long-standing.
+- `test_endpoints.test_health_check` (**1 error**) — **order-dependent, not
+  environmental.** It passes in isolation (`run_tests.py test_endpoints` gives
+  10 tests / 7 failures / 0 errors) and errors only in a full run, with an
+  httpcore timeout. `/api/health` now probes the embedding sidecar for
+  `embed_status`; in a full run that async call times out. This one is ours and
+  is worth fixing properly rather than documenting forever.
 - 2 skips in `test_storage_client` / `test_background_jobs` when MinIO is down.
 
 Do not "fix" these as a side effect of unrelated work, and do not treat them as
