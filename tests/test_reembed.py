@@ -606,6 +606,73 @@ class TestRun(unittest.TestCase):
         self.assertNotIn("thumbnails/photos/1.jpg", self.storage.reads)
 
 
+class TestContentSniffing(unittest.TestCase):
+    """The extension on the object key is not always the truth.
+
+    63 of the 65 photos with no thumbnail are named `.arw`/`.ARW` but their
+    bytes begin `FF D8 FF E0 JFIF` — they are JPEGs. `core.extractor.load_image`
+    dispatches on the *extension*, so rawpy gets handed a JPEG and raises
+    `LibRawFileUnsupportedError`. That is why those rows have no thumbnail and
+    no embedding, and it is not a disk fault: the reads succeed.
+
+    The bytes are already in hand by the time the filename is chosen, so the
+    script sends the sidecar a name matching the real content and the PIL path
+    handles it. Fixing `load_image` itself belongs to whoever owns
+    `core/extractor.py`.
+    """
+
+    def test_a_jpeg_wearing_an_arw_extension_is_renamed(self):
+        name = reembed.effective_filename("photos/2026/04/Snapseed.arw",
+                                          b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + b"\x00" * 40)
+        self.assertTrue(name.endswith(".jpg"), name)
+
+    def test_a_real_raw_file_keeps_its_extension(self):
+        """ARW is TIFF-based; sniffing must not rename a genuine RAW to .tif
+        and send it down the PIL path, which would decode it wrongly or not
+        at all."""
+        name = reembed.effective_filename("photos/a.arw", b"II*\x00" + b"\x00" * 40)
+        self.assertTrue(name.endswith(".arw"), name)
+
+    def test_a_correctly_named_jpeg_is_left_alone(self):
+        name = reembed.effective_filename("thumbnails/photos/1.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 40)
+        self.assertEqual(name, "1.jpg")
+
+    def test_a_png_wearing_a_jpg_extension_is_renamed(self):
+        name = reembed.effective_filename("photos/x.jpg", b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
+        self.assertTrue(name.endswith(".png"), name)
+
+    def test_unrecognised_bytes_keep_the_declared_name(self):
+        """Sniffing only ever corrects a mismatch it is sure about."""
+        name = reembed.effective_filename("photos/x.heic", b"garbage" * 8)
+        self.assertEqual(name, "x.heic")
+
+    def test_heic_bytes_under_a_raw_extension_are_renamed(self):
+        data = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00" + b"\x00" * 40
+        name = reembed.effective_filename("photos/x.arw", data)
+        self.assertTrue(name.endswith(".heic"), name)
+
+    def test_the_run_sends_the_corrected_name_to_the_embedder(self):
+        conn, path = make_db([photo(1, thumb=False, ext="arw")])
+        storage = FakeStorage({
+            "photos/2026/01/p1.arw": b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + b"\x00" * 40,
+        })
+        embedder = FakeEmbedder()
+        fd, journal = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        os.unlink(journal)
+        try:
+            reembed.run(conn, storage, embedder, apply=True, delay=0.0, tags=False,
+                        journal_path=journal,
+                        guard=reembed.DiskGuard(threshold=10,
+                                                reader=lambda: {"kern": 0, "ioerr": 0}))
+            self.assertEqual(embedder.calls, ["p1.jpg"])
+        finally:
+            conn.close()
+            os.unlink(path)
+            if os.path.exists(journal):
+                os.unlink(journal)
+
+
 class TestArgParsing(unittest.TestCase):
     def test_dry_run_is_the_default(self):
         args = reembed.build_parser().parse_args([])

@@ -598,6 +598,61 @@ class Result(NamedTuple):
     decisions: List[Decision]
 
 
+# Magic-number prefixes for the container formats `core.extractor.load_image`
+# can actually open through PIL. Deliberately does NOT include TIFF: ARW, CR2,
+# NEF and DNG are all TIFF-based, so sniffing a TIFF header proves nothing about
+# whether rawpy or PIL should handle the file.
+_MAGIC = (
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+)
+
+def _sniff_extension(data: bytes) -> Optional[str]:
+    """The extension the *bytes* deserve, or None if they are not recognised."""
+    for prefix, ext in _MAGIC:
+        if data.startswith(prefix):
+            return ext
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"heic", b"heix", b"heim", b"heis", b"hevc", b"mif1", b"msf1"):
+            return ".heic"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def effective_filename(key: str, data: bytes) -> str:
+    """The filename to hand the embedder, corrected when the key lies.
+
+    `core.extractor.load_image` dispatches on the extension: anything in
+    `RAW_EXTS` goes to rawpy, everything else to PIL. That is fine until the
+    extension is wrong — and here it is wrong for 63 of the 65 photos that have
+    no thumbnail. They are named `.arw`/`.ARW`, their bytes start
+    `FF D8 FF E0 JFIF`, and rawpy answers `LibRawFileUnsupportedError`. Both
+    their thumbnail generation and their embedding failed for that reason, and
+    the disk had nothing to do with it: the reads succeed.
+
+    Since the bytes are already in hand, the fix here is one line — send a name
+    that matches the content. Only a confident mismatch is corrected; anything
+    unrecognised keeps the name it came with, and a TIFF header is deliberately
+    not treated as evidence (every Sony/Canon/Nikon RAW is a TIFF).
+
+    Correcting `load_image` itself is the real fix and belongs to whoever owns
+    `core/extractor.py`; the same 63 files are invisible to thumbnails and to
+    the upload path until then.
+    """
+    name = os.path.basename(key)
+    declared = os.path.splitext(name)[1].lower()
+    sniffed = _sniff_extension(data)
+    if sniffed is None or sniffed == declared:
+        return name
+    if declared in (".jpg", ".jpeg") and sniffed == ".jpg":
+        return name  # .jpeg is not a mismatch
+    return os.path.splitext(name)[0] + sniffed
+
+
 def _iter_fetched(todo: Sequence[Decision], storage: Any, concurrency: int):
     """Yield `(decision, data_or_exception)` in plan order.
 
@@ -730,7 +785,7 @@ def run(
                 if isinstance(fetched, BaseException):
                     raise fetched
                 data = fetched
-                filename = os.path.basename(d.key)
+                filename = effective_filename(d.key, data)
                 vec = embedder.image_embedding(filename, data)
 
                 tag_pairs = None
@@ -925,7 +980,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if result.aborted:
             print(f"ABORTED: {result.abort_reason}")
         if result.failed:
-            print("\nUnreadable / unembeddable photos (likely on bad sectors):")
+            print("\nUnreadable / unembeddable photos:")
             for pid, reason in result.failed:
                 print(f"    {pid}: {reason[:180]}")
             print("\n  Re-run with --retry-failed to attempt these again.")
