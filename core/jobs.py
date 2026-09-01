@@ -71,11 +71,198 @@ def _is_video(conn, photo_id: int) -> bool:
     return bool(row and row["media_type"] == "video")
 
 
+#: The persistent index over every face already assigned to a person.
+PERSON_INDEX_NAME = "existing_person_faces"
+
+#: One predicate for "belongs in the person index", used by *both* the
+#: freshness count and the rebuild, so the two can never disagree about what
+#: the index is supposed to contain.
+_INDEXABLE_FACES = "person_id IS NOT NULL AND embedding IS NOT NULL"
+
+#: Neighbours to ask the index for. More than one because the nearest hit may
+#: have been unassigned since it was indexed — the next hit is then still a
+#: legitimate match — and small enough that resolving them stays one bounded
+#: query regardless of how many faces are assigned.
+_MATCH_NEIGHBOURS = 5
+
+#: An index further behind the database than this is rebuilt rather than
+#: caught up: a handful of missing vectors is cheaper to append than a full
+#: HNSW rebuild, a thousand is not.
+_INDEX_CATCHUP_LIMIT = 64
+
+
+def _clustering_result(matched=0, newly_clustered=0, persons_created=0,
+                       left_as_noise=0):
+    """The shape every ``cluster_faces_job`` return takes."""
+    return {
+        "clustered": matched + newly_clustered,
+        "persons_created": persons_created,
+        "matched_to_existing": matched,
+        "newly_clustered": newly_clustered,
+        "left_as_noise": left_as_noise,
+    }
+
+
+def _indexable_face_count(conn) -> int:
+    """How many faces the person index should contain right now."""
+    cur = conn.cursor()
+    cur.execute(f"SELECT COUNT(*) FROM faces WHERE {_INDEXABLE_FACES}")
+    return int(cur.fetchone()[0])
+
+
+def _read_face_vectors(conn, face_ids=None):
+    """
+    ``(ids, matrix)`` for indexable faces, ids and rows in the same order.
+
+    This is the O(N) read. Only cold paths — a rebuild, a catch-up, a batch
+    job — may call it. Doing it once per *detected face* is the O(N*M) defect
+    this module used to have.
+    """
+    cur = conn.cursor()
+    if face_ids is None:
+        cur.execute(
+            f"SELECT id, embedding FROM faces WHERE {_INDEXABLE_FACES} ORDER BY id"
+        )
+    else:
+        face_ids = list(face_ids)
+        if not face_ids:
+            return [], None
+        placeholders = ",".join("?" * len(face_ids))
+        cur.execute(
+            f"SELECT id, embedding FROM faces "
+            f"WHERE {_INDEXABLE_FACES} AND id IN ({placeholders}) ORDER BY id",
+            face_ids,
+        )
+
+    ids, vecs, dim = [], [], None
+    for row in cur.fetchall():
+        fid, emb_bytes = row[0], row[1]
+        if not emb_bytes:
+            continue
+        v = np.frombuffer(emb_bytes, dtype=np.float32)
+        if v.size == 0:
+            continue
+        if dim is None:
+            dim = v.size
+        elif v.size != dim:
+            # A stray odd-sized embedding would make np.stack raise and take
+            # the whole index with it. Skip it and keep matching working.
+            print(f"Warning: face {fid} embedding is {v.size}-d, expected {dim}; skipped")
+            continue
+        ids.append(int(fid))
+        vecs.append(v)
+
+    if not vecs:
+        return [], None
+    return ids, np.stack(vecs).astype("float32")
+
+
+def _person_face_index(conn, index_manager):
+    """
+    The persistent index over every assigned face: ID-mapped, and in step with
+    the database.
+
+    Rebuilt — never trusted — when it is missing or carries no id map. Without
+    an id map the caller has to assume index position *i* is row *i* of some
+    later query; that assumption is what rotted, and the live index was found
+    mis-attributing 715 of its 1,044 positions while still passing a count
+    check. With ids, a search returns real ``faces.id`` values and the person
+    is looked up from the database, so a stale index costs recall and can
+    never cost correctness. That is what makes the cheap freshness rule below
+    safe.
+
+    Returns None when there is nothing to match against.
+    """
+    from core.faiss_index import index_ids, is_id_mapped
+
+    db_count = _indexable_face_count(conn)
+    if db_count == 0:
+        return None
+
+    index = index_manager.load_index(PERSON_INDEX_NAME)
+
+    if index is not None and is_id_mapped(index):
+        behind = db_count - index.ntotal
+        if behind <= 0:
+            # Level with the database, or holding ids it no longer agrees
+            # with — those are dropped when the match is resolved.
+            if behind >= -_INDEX_CATCHUP_LIMIT:
+                return index
+        elif behind <= _INDEX_CATCHUP_LIMIT:
+            known = set(index_ids(index))
+            cur = conn.cursor()
+            cur.execute(f"SELECT id FROM faces WHERE {_INDEXABLE_FACES}")
+            absent = [int(r[0]) for r in cur.fetchall() if int(r[0]) not in known]
+            ids, xb = _read_face_vectors(conn, absent)
+            if ids:
+                return index_manager.update_index(PERSON_INDEX_NAME, xb, ids)
+            return index
+
+    ids, xb = _read_face_vectors(conn)
+    if not ids:
+        return None
+    return index_manager.build_hnsw_index(xb, PERSON_INDEX_NAME, ids=ids)
+
+
+def _resolve_person(conn, face_ids, cosines, threshold, exclude=None):
+    """
+    The best ``(person_id, person_name, similarity)`` among index hits.
+
+    The index supplies candidate ``faces.id`` values and their similarity;
+    *who* those faces belong to is read from the database every time. A hit
+    whose face has since been unassigned, or whose person has been deleted, is
+    skipped rather than trusted — so an index running slightly ahead of the
+    database is a recall question, not a correctness one.
+    """
+    candidates = {}
+    for fid, cos in zip(face_ids, cosines):
+        fid, cos = int(fid), float(cos)
+        if fid < 0 or fid == exclude or cos < threshold:
+            continue
+        candidates[fid] = max(cos, candidates.get(fid, -1.0))
+    if not candidates:
+        return None
+
+    cur = conn.cursor()
+    placeholders = ",".join("?" * len(candidates))
+    cur.execute(
+        f"SELECT id, person_id FROM faces WHERE id IN ({placeholders})",
+        list(candidates),
+    )
+    owner = {int(r[0]): int(r[1]) for r in cur.fetchall() if r[1] is not None}
+    if not owner:
+        return None
+
+    person_ids = sorted(set(owner.values()))
+    placeholders = ",".join("?" * len(person_ids))
+    cur.execute(
+        f"SELECT id, name FROM persons WHERE id IN ({placeholders})", person_ids
+    )
+    names = {int(r[0]): r[1] for r in cur.fetchall()}
+
+    for fid, cos in sorted(candidates.items(), key=lambda kv: -kv[1]):
+        person_id = owner.get(fid)
+        if person_id is None or person_id not in names:
+            continue
+        return person_id, names[person_id], cos
+    return None
+
+
 def _auto_match_face_to_person(conn, face_id: int, face_embedding: np.ndarray,
                                threshold: float = FACE_MATCH_THRESHOLD):
     """
-    Automatically match a newly detected face to an existing person.
-    
+    Assign a newly detected face to an existing person, if one is close enough.
+
+    Goes through the persistent index. This used to select *every*
+    person-assigned embedding out of SQLite and build a fresh ``IndexFlatIP``
+    for every single detected face — O(N) reads plus a full index build per
+    face, O(N*M) for a batch, against the 1,000+ assigned faces this library
+    now has. The persistent index exists precisely to avoid that.
+
+    The face it assigns is appended to the index immediately, so the *next*
+    face in the same batch can match through it. Without that, matching
+    quietly degrades over the course of a run.
+
     Args:
         conn: Database connection
         face_id: ID of the face to match
@@ -84,73 +271,48 @@ def _auto_match_face_to_person(conn, face_id: int, face_embedding: np.ndarray,
                    Defaults to FACE_MATCH_THRESHOLD; see its derivation there.
     """
     try:
-        import faiss
+        from core.faiss_index import FAISSIndexManager, scores_to_cosine
     except ImportError:
         # FAISS not available, skip matching
         return
-    
-    # Get all existing person faces with embeddings
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT f.id, f.embedding, f.person_id, p.name as person_name
-        FROM faces f
-        JOIN persons p ON f.person_id = p.id
-        WHERE f.embedding IS NOT NULL AND f.id != ?
-    """, (face_id,))
-    
-    existing_faces = cur.fetchall()
-    
-    if not existing_faces:
-        # No existing faces to match against
-        return
-    
-    # Build vectors for comparison
-    existing_vecs = []
-    existing_face_ids = []
-    existing_person_map = {}  # face_id -> (person_id, person_name)
-    
-    for row in existing_faces:
-        emb_bytes = row[1]  # embedding column
-        if not emb_bytes:
-            continue
-        v = np.frombuffer(emb_bytes, dtype=np.float32)
-        if v.size == 0:
-            continue
-        
-        existing_vecs.append(v)
-        existing_face_ids.append(row[0])  # face id
-        existing_person_map[row[0]] = (row[2], row[3])  # (person_id, person_name)
-    
-    if not existing_vecs:
-        return
-    
-    # Normalize and compare
-    face_vec = face_embedding.astype("float32")
-    existing_xb = np.stack(existing_vecs).astype("float32")
-    
-    # Normalize for cosine similarity
-    faiss.normalize_L2(face_vec.reshape(1, -1))
-    faiss.normalize_L2(existing_xb)
-    
-    # Build index and search
+
     try:
-        index = faiss.IndexFlatIP(existing_xb.shape[1])
-        index.add(existing_xb)
-        
-        # Search for best match
-        distances, indices = index.search(face_vec.reshape(1, -1), 1)
-        
-        if distances[0, 0] >= threshold:
-            # Match found! Assign to existing person
-            matched_face_idx = indices[0, 0]
-            matched_face_id = existing_face_ids[matched_face_idx]
-            person_id, person_name = existing_person_map[matched_face_id]
-            
-            # Assign face to person
-            cur.execute("UPDATE faces SET person_id=? WHERE id=?", (person_id, face_id))
-            conn.commit()
-            
-            print(f"Auto-matched face {face_id} to existing person '{person_name}' (similarity: {distances[0, 0]:.3f})")
+        index_manager = FAISSIndexManager()
+        index = _person_face_index(conn, index_manager)
+        if index is None or index.ntotal == 0:
+            # No existing faces to match against
+            return
+
+        query = np.array(face_embedding, dtype="float32", copy=True).reshape(1, -1)
+        if query.shape[1] != index.d:
+            print(f"Warning: face {face_id} is {query.shape[1]}-d but the person "
+                  f"index is {index.d}-d; skipping match")
+            return
+
+        scores, ids = index_manager.search(
+            index, query, k=min(_MATCH_NEIGHBOURS, index.ntotal)
+        )
+        # Ask the index for its metric instead of guessing from the scores.
+        cosines = scores_to_cosine(scores[0], index_manager.metric_of(index))
+
+        match = _resolve_person(conn, ids[0], cosines, threshold, exclude=face_id)
+        if match is None:
+            return
+        person_id, person_name, similarity = match
+
+        cur = conn.cursor()
+        cur.execute("UPDATE faces SET person_id=? WHERE id=?", (person_id, face_id))
+        conn.commit()
+
+        # Same-batch visibility: the face just assigned has to be in the index
+        # before the next face is matched.
+        try:
+            index_manager.update_index(PERSON_INDEX_NAME, query.copy(), [face_id])
+        except Exception as exc:
+            print(f"Warning: face {face_id} assigned but not added to the index: {exc}")
+
+        print(f"Auto-matched face {face_id} to existing person '{person_name}' "
+              f"(similarity: {similarity:.3f})")
     except Exception as e:
         # If FAISS fails, skip matching
         print(f"Warning: Face matching failed: {e}")
@@ -663,7 +825,7 @@ def cluster_faces_job(db_path: str, threshold: float = FACE_MATCH_THRESHOLD,
         reset: If True, unassign all faces before clustering (re-cluster everything).
     """
     import faiss
-    from core.faiss_index import FAISSIndexManager
+    from core.faiss_index import FAISSIndexManager, scores_to_cosine
     
     conn = db.connect(db_path)
     index_manager = FAISSIndexManager()
@@ -675,6 +837,10 @@ def cluster_faces_job(db_path: str, threshold: float = FACE_MATCH_THRESHOLD,
             cur.execute("UPDATE faces SET person_id = NULL WHERE person_id IS NOT NULL")
             conn.commit()
             print(f"✓ Reset all face assignments - re-clustering all {cur.rowcount} faces")
+            # Every id in the index now points at an unassigned face. Left in
+            # place it would never be rebuilt (it only *grows* relative to the
+            # database) and every search would hit dead ids.
+            index_manager.delete_index(PERSON_INDEX_NAME)
         # Get unassigned faces with embeddings
         # If photo_ids provided, only cluster faces from those photos (more efficient)
         cur = conn.cursor()
@@ -701,7 +867,7 @@ def cluster_faces_job(db_path: str, threshold: float = FACE_MATCH_THRESHOLD,
         
         if not unassigned_faces:
             print("No unassigned faces to cluster")
-            return {"clustered": 0, "persons_created": 0}
+            return _clustering_result()
         
         # Process unassigned faces
         unassigned_face_ids = []
@@ -719,102 +885,43 @@ def cluster_faces_job(db_path: str, threshold: float = FACE_MATCH_THRESHOLD,
         
         if not unassigned_vecs:
             print("No valid embeddings in unassigned faces")
-            return {"clustered": 0, "persons_created": 0}
+            return _clustering_result()
         
-        # Get existing person faces for matching
-        cur.execute("""
-            SELECT f.id, f.embedding, f.person_id, p.name as person_name
-            FROM faces f
-            JOIN persons p ON f.person_id = p.id
-            WHERE f.embedding IS NOT NULL
-        """)
-        existing_person_faces = cur.fetchall()
-        
-        # Build index of existing person faces
-        existing_person_vecs = []
-        existing_person_face_ids = []
-        existing_person_map = {}
-        
-        for row in existing_person_faces:
-            fid, emb_bytes, person_id, person_name = row
-            if not emb_bytes:
-                continue
-            v = np.frombuffer(emb_bytes, dtype=np.float32)
-            if v.size == 0:
-                continue
-            existing_person_vecs.append(v)
-            existing_person_face_ids.append(fid)
-            existing_person_map[fid] = (person_id, person_name)
-        
-        # Phase 1: Match unassigned faces to existing persons
+        # Phase 1: match unassigned faces against every face already assigned.
+        #
+        # The index is ID-mapped, so a hit is a real ``faces.id`` and the
+        # person it belongs to is read from the database. The old code took the
+        # hit's *position* and used it to index its own query results — correct
+        # only if the index had been built from that same unordered query, in
+        # that same order, and never appended to since. It had not been.
         matched_assignments = []
         unmatched_indices = []
-        existing_index = None  # Initialize for Phase 2 access
-        existing_index_name = "existing_person_faces"
-        
-        if existing_person_vecs:
-            existing_xb = np.stack(existing_person_vecs).astype("float32")
-            
-            # Load or build index
-            existing_index = index_manager.load_index(existing_index_name)
-            index_needs_rebuild = False
-            
-            if existing_index is None:
-                index_needs_rebuild = True
-            else:
-                try:
-                    if hasattr(existing_index, 'ntotal') and existing_index.ntotal != len(existing_person_vecs):
-                        index_needs_rebuild = True
-                except Exception:
-                    index_needs_rebuild = True
-            
-            if index_needs_rebuild:
-                try:
-                    existing_index = index_manager.build_hnsw_index(
-                        existing_xb, existing_index_name, m=32, ef_construction=200
-                    )
-                except Exception as e:
-                    print(f"Warning: HNSW build failed, using IndexFlatIP: {e}")
-                    faiss.normalize_L2(existing_xb)
-                    existing_dim = existing_xb.shape[1]
-                    existing_index = faiss.IndexFlatIP(existing_dim)
-                    existing_index.add(existing_xb)
-            
-            # Match unassigned faces to existing persons
+        existing_index = _person_face_index(conn, index_manager)
+
+        if existing_index is not None and existing_index.ntotal > 0:
             batch_xb = np.stack(unassigned_vecs).astype("float32")
-            
-            try:
-                D_match, I_match = index_manager.search(existing_index, batch_xb, k=1, ef_search=50)
-            except Exception as e:
-                print(f"Warning: Search failed, using direct search: {e}")
-                faiss.normalize_L2(batch_xb)
-                D_match, I_match = existing_index.search(batch_xb, 1)
-            
-            # Convert L2 distances to cosine similarity if needed
-            if D_match.max() > 1.0:
-                # L2 distances - convert to cosine similarity
-                max_l2 = D_match.max()
-                if max_l2 > 2.0:
-                    D_match = 1.0 - (D_match / 2.0)
-                else:
-                    D_match = 1.0 - ((D_match ** 2) / 2.0)
-                D_match = np.clip(D_match, 0.0, 1.0)
-            
+            k = min(_MATCH_NEIGHBOURS, existing_index.ntotal)
+            D_match, I_match = index_manager.search(
+                existing_index, batch_xb, k=k, ef_search=50
+            )
+            # Ask the index for its metric rather than guessing from the
+            # batch's own maximum; that guess dropped good matches.
+            D_match = scores_to_cosine(D_match, index_manager.metric_of(existing_index))
+
             for i, face_id in enumerate(unassigned_face_ids):
                 # Check if face is still unassigned
                 cur.execute("SELECT person_id FROM faces WHERE id=?", (face_id,))
                 face_row = cur.fetchone()
                 if face_row and face_row[0] is not None:
                     continue
-                
-                similarity = float(D_match[i, 0]) if D_match[i, 0] > 0 else 0
-                if similarity >= threshold:
-                    matched_existing_face_idx = I_match[i, 0]
-                    matched_existing_face_id = existing_person_face_ids[matched_existing_face_idx]
-                    person_id, person_name = existing_person_map[matched_existing_face_id]
-                    matched_assignments.append((face_id, person_id))
-                else:
+
+                match = _resolve_person(
+                    conn, I_match[i], D_match[i], threshold, exclude=face_id
+                )
+                if match is None:
                     unmatched_indices.append(i)
+                else:
+                    matched_assignments.append((face_id, match[0]))
         else:
             unmatched_indices = list(range(len(unassigned_face_ids)))
         
@@ -825,38 +932,25 @@ def cluster_faces_job(db_path: str, threshold: float = FACE_MATCH_THRESHOLD,
             conn.commit()
         matched_count = len(matched_assignments)
         
-        # Update FAISS index with matched faces (Phase 1)
-        if matched_assignments and existing_index is not None:
+        # Keep the persistent index in step with what Phase 1 just assigned,
+        # with ids, so the next run (and the per-face path) can see them.
+        if matched_assignments:
             try:
-                # Get embeddings for matched faces
-                matched_face_ids = [face_id for face_id, _ in matched_assignments]
-                placeholders = ','.join(['?'] * len(matched_face_ids))
-                cur.execute(f"""
-                    SELECT embedding FROM faces WHERE id IN ({placeholders})
-                """, matched_face_ids)
-                matched_embeddings = cur.fetchall()
-                
-                if matched_embeddings:
-                    # Prepare embeddings for index
-                    matched_vecs = []
-                    for (emb_bytes,) in matched_embeddings:
-                        if emb_bytes:
-                            v = np.frombuffer(emb_bytes, dtype=np.float32)
-                            if v.size > 0:
-                                matched_vecs.append(v)
-                    
-                    if matched_vecs:
-                        matched_xb = np.stack(matched_vecs).astype("float32")
-                        faiss.normalize_L2(matched_xb)
-                        existing_index.add(matched_xb)
-                        index_manager.save_index(existing_index, existing_index_name)
-                        print(f"✓ Updated FAISS index: Added {len(matched_vecs)} matched faces to existing persons index")
+                ids, matched_xb = _read_face_vectors(
+                    conn, [fid for fid, _ in matched_assignments]
+                )
+                if ids:
+                    existing_index = index_manager.update_index(
+                        PERSON_INDEX_NAME, matched_xb, ids
+                    )
+                    print(f"✓ Updated FAISS index: added {len(ids)} matched faces")
             except Exception as e:
                 print(f"Warning: Failed to update FAISS index with matched faces: {e}")
-                # Continue - index will be rebuilt on next clustering
+                # Continue - the index is rebuilt when it falls behind.
         
         # Phase 2: Cluster unmatched faces into new persons using HDBSCAN
         persons_created = 0
+        newly_clustered = 0
         if unmatched_indices:
             unmatched_face_ids = [unassigned_face_ids[i] for i in unmatched_indices]
             unmatched_vecs = [unassigned_vecs[i] for i in unmatched_indices]
@@ -885,6 +979,15 @@ def cluster_faces_job(db_path: str, threshold: float = FACE_MATCH_THRESHOLD,
             # Lower threshold = more permissive clustering
             min_cluster_size = max(2, int(n * 0.01))  # At least 2, or 1% of faces
             min_samples = max(1, int(min_cluster_size * 0.5))  # Half of min_cluster_size
+
+            # HDBSCAN asks its kd-tree for min_samples + 1 neighbours, so a
+            # batch smaller than that raises "k must be less than or equal to
+            # the number of training points" and takes the whole job down with
+            # it — six failed clustering jobs in half an hour of live logs,
+            # one for every upload that produced a single unrecognised face.
+            # Too few faces to form a cluster is not an error; it is noise,
+            # and it is now reported as noise.
+            too_small_to_cluster = n < max(min_cluster_size, min_samples + 1)
             
             # Use euclidean metric on normalized vectors (equivalent to cosine distance)
             # For L2-normalized vectors, euclidean distance = sqrt(2 * (1 - cosine_similarity))
@@ -902,7 +1005,24 @@ def cluster_faces_job(db_path: str, threshold: float = FACE_MATCH_THRESHOLD,
                 'min_samples': min_samples,
                 'metric': 'euclidean',  # Use euclidean on normalized vectors (equivalent to cosine)
                 'cluster_selection_method': 'eom',  # Excess of Mass
-                'prediction_data': True  # Enable approximate_predict for future matching
+                'prediction_data': True,  # Enable approximate_predict for future matching
+                # HDBSCAN refuses to select the root of its condensed tree
+                # unless asked, and a batch of "one person plus strangers" has
+                # nothing *but* a root: the strangers fall out one at a time,
+                # which is never a binary split, so no child cluster is ever
+                # formed. Measured on a 6-tight-faces + 15-strangers fixture:
+                # the default returns 21 noise points and zero clusters; with
+                # this it returns the 6 as one cluster and the 15 as noise. On
+                # 10 + 20 it returns the 10 intact instead of splitting them
+                # into 5 and 4. That degenerate shape is the *common* one for
+                # an incremental run over a few photos of one family member,
+                # and it silently produced no people at all.
+                #
+                # The risk this takes on — one sprawling cluster of everybody
+                # — is what the average-pairwise-similarity gate below is for:
+                # a cluster is only kept if it averages >= threshold, and a
+                # cluster of unrelated faces averages far below it.
+                'allow_single_cluster': True,
             }
             
             # Only add epsilon if it's positive and reasonable
@@ -912,7 +1032,13 @@ def cluster_faces_job(db_path: str, threshold: float = FACE_MATCH_THRESHOLD,
             clusterer = hdbscan.HDBSCAN(**clusterer_kwargs)
             
             # Perform clustering
-            cluster_labels = clusterer.fit_predict(xb_normalized)
+            if too_small_to_cluster:
+                print(f"Debug: Phase 2 - {n} unmatched face(s) is fewer than HDBSCAN "
+                      f"can cluster (needs {max(min_cluster_size, min_samples + 1)}); "
+                      f"leaving them as noise")
+                cluster_labels = np.full(n, -1, dtype=int)
+            else:
+                cluster_labels = clusterer.fit_predict(xb_normalized)
             
             # Filter clusters based on average similarity within cluster
             # Collect valid clusters (exclude noise points with label -1)
@@ -987,54 +1113,50 @@ def cluster_faces_job(db_path: str, threshold: float = FACE_MATCH_THRESHOLD,
                     conn.commit()
                     print(f"✓ Successfully assigned {len(cluster_assignments)} faces to {persons_created} new persons")
                     
-                    # Update FAISS index with newly assigned faces (Phase 2)
+                    newly_clustered = len(cluster_assignments)
+
+                    # Keep the persistent index in step, *with ids*. The old
+                    # code re-selected the embeddings without their ids and
+                    # appended them positionally, which is how position stopped
+                    # meaning identity in the first place.
                     try:
-                        # Get embeddings for cluster-assigned faces
-                        cluster_face_ids = [face_id for face_id, _ in cluster_assignments]
-                        placeholders = ','.join(['?'] * len(cluster_face_ids))
-                        cur.execute(f"""
-                            SELECT embedding FROM faces WHERE id IN ({placeholders})
-                        """, cluster_face_ids)
-                        cluster_embeddings = cur.fetchall()
-                        
-                        if cluster_embeddings:
-                            # Prepare embeddings for index
-                            cluster_vecs = []
-                            for (emb_bytes,) in cluster_embeddings:
-                                if emb_bytes:
-                                    v = np.frombuffer(emb_bytes, dtype=np.float32)
-                                    if v.size > 0:
-                                        cluster_vecs.append(v)
-                            
-                            if cluster_vecs:
-                                cluster_xb = np.stack(cluster_vecs).astype("float32")
-                                faiss.normalize_L2(cluster_xb)
-                                
-                                # Add to existing index if it exists, otherwise create new one
-                                if existing_index is not None:
-                                    # Add to existing index
-                                    existing_index.add(cluster_xb)
-                                    index_manager.save_index(existing_index, existing_index_name)
-                                    print(f"✓ Updated FAISS index: Added {len(cluster_vecs)} newly clustered faces to index")
-                                else:
-                                    # No existing index - create new one with these faces
-                                    # This will be rebuilt properly on next clustering, but create it for now
-                                    try:
-                                        new_index = index_manager.build_hnsw_index(
-                                            cluster_xb, existing_index_name, m=32, ef_construction=200
-                                        )
-                                        print(f"✓ Created new FAISS index with {len(cluster_vecs)} faces")
-                                    except Exception as e:
-                                        print(f"Warning: Could not create new index: {e}")
-                                        # Index will be built on next clustering
+                        ids, cluster_xb = _read_face_vectors(
+                            conn, [fid for fid, _ in cluster_assignments]
+                        )
+                        if ids:
+                            existing_index = index_manager.update_index(
+                                PERSON_INDEX_NAME, cluster_xb, ids
+                            )
+                            print(f"✓ Updated FAISS index: added {len(ids)} newly clustered faces")
                     except Exception as e:
                         print(f"Warning: Failed to update FAISS index with clustered faces: {e}")
-                        # Continue - index will be rebuilt on next clustering
+                        # Continue - the index is rebuilt when it falls behind.
         
-        total_clustered = matched_count + len(unmatched_indices) if unmatched_indices else matched_count
-        print(f"✓ Clustering complete: {total_clustered} faces clustered, {persons_created} persons created")
-        
-        return {"clustered": total_clustered, "persons_created": persons_created}
+        # Report what was actually assigned.
+        #
+        # The old total was ``matched_count + len(unmatched_indices)``, which
+        # added every face that went *into* HDBSCAN — including the ones it
+        # left as noise and never assigned to anybody. The catch-up run
+        # reported 1532 clustered while assigning 495. That is the same class
+        # of metric that hid the dead scheduler: a pipeline that fails and
+        # reports success. The three outcomes are now separate numbers, and
+        # ``clustered`` counts only faces that came out of this job with a
+        # person on them.
+        left_as_noise = len(unmatched_indices) - newly_clustered
+        total_clustered = matched_count + newly_clustered
+        print(
+            f"✓ Clustering complete: {total_clustered} faces assigned "
+            f"({matched_count} to existing persons, {newly_clustered} into "
+            f"{persons_created} new persons), {left_as_noise} left as noise"
+        )
+
+        return {
+            "clustered": total_clustered,
+            "persons_created": persons_created,
+            "matched_to_existing": matched_count,
+            "newly_clustered": newly_clustered,
+            "left_as_noise": left_as_noise,
+        }
         
     except Exception as e:
         print(f"Error in cluster_faces_job: {e}")
@@ -1073,66 +1195,51 @@ def update_faiss_index_after_merge_job(
         person_row = cur.fetchone()
         target_person_name = person_row["name"] if person_row else f"Person #{target_person_id}"
         
-        # Get all faces that were merged (now assigned to target_person_id)
-        # Query faces that were recently merged - we can identify them by checking
-        # if they exist in the target person (they were just merged)
+        # A merge does not change *which* faces are indexed — the ids are the
+        # same faces — only which person they belong to, and that is read from
+        # the database when a match is resolved. So the only work here is to
+        # add any of the target person's faces the index does not already
+        # hold, with their ids.
+        from core.faiss_index import index_ids, is_id_mapped
+
         cur.execute(
-            """
-            SELECT id, embedding 
-            FROM faces 
-            WHERE person_id = ? AND embedding IS NOT NULL
-            """,
-            (target_person_id,)
+            f"SELECT id FROM faces WHERE person_id = ? AND {_INDEXABLE_FACES}",
+            (target_person_id,),
         )
-        merged_faces = cur.fetchall()
-        
-        if not merged_faces:
+        target_face_ids = [int(r[0]) for r in cur.fetchall()]
+
+        if not target_face_ids:
             print(f"ℹ No faces with embeddings found for person {target_person_id} after merge")
             return {"updated": 0, "message": "No faces to update"}
-        
-        # Load existing FAISS index
-        existing_index_name = "existing_person_faces"
-        existing_index = index_manager.load_index(existing_index_name)
-        
-        if existing_index is None:
-            print(f"ℹ FAISS index not found - will be built on next clustering. Merged {len(merged_faces)} faces to person {target_person_id} ({target_person_name})")
-            return {"updated": 0, "message": "Index not found, will be built on next clustering"}
-        
-        # Prepare embeddings for batch update
-        merged_embeddings = []
-        face_ids = []
-        
-        for face_row in merged_faces:
-            face_id = face_row[0]  # id
-            face_embedding_bytes = face_row[1]  # embedding
-            
-            if face_embedding_bytes:
-                face_embedding = np.frombuffer(face_embedding_bytes, dtype=np.float32)
-                face_embedding = face_embedding.reshape(1, -1).astype(np.float32)
-                merged_embeddings.append(face_embedding)
-                face_ids.append(face_id)
-        
-        if not merged_embeddings:
-            print(f"ℹ No valid embeddings found for merged faces")
+
+        existing_index = index_manager.load_index(PERSON_INDEX_NAME)
+        if existing_index is None or not is_id_mapped(existing_index):
+            # A missing or legacy index is rebuilt from scratch the next time
+            # anything matches; appending to it here would only entrench it.
+            print(f"ℹ FAISS index absent or unmapped - it is rebuilt on next match. "
+                  f"Merged {len(target_face_ids)} faces to person {target_person_id} ({target_person_name})")
+            return {"updated": 0, "message": "Index will be rebuilt on next match"}
+
+        known = set(index_ids(existing_index))
+        absent = [fid for fid in target_face_ids if fid not in known]
+        if not absent:
+            print(f"✓ FAISS index already holds all {len(target_face_ids)} faces of "
+                  f"person {target_person_id} ({target_person_name})")
+            return {"updated": 0, "message": "Index already up to date"}
+
+        ids, merged_xb = _read_face_vectors(conn, absent)
+        if not ids:
+            print("ℹ No valid embeddings found for merged faces")
             return {"updated": 0, "message": "No valid embeddings"}
-        
-        # Stack all embeddings into a single array
-        merged_xb = np.vstack(merged_embeddings)
-        
-        # Normalize embeddings for cosine similarity
-        faiss.normalize_L2(merged_xb)
-        
-        # Add to existing index
-        existing_index.add(merged_xb)
-        
-        # Save updated index
-        index_manager.save_index(existing_index, existing_index_name)
-        
-        print(f"✓ Updated FAISS index: Added {len(merged_embeddings)} merged faces from person {source_person_id} to person {target_person_id} ({target_person_name})")
-        
+
+        index_manager.update_index(PERSON_INDEX_NAME, merged_xb, ids)
+
+        print(f"✓ Updated FAISS index: Added {len(ids)} merged faces from person "
+              f"{source_person_id} to person {target_person_id} ({target_person_name})")
+
         return {
-            "updated": len(merged_embeddings),
-            "message": f"Successfully updated FAISS index with {len(merged_embeddings)} face embeddings"
+            "updated": len(ids),
+            "message": f"Successfully updated FAISS index with {len(ids)} face embeddings"
         }
         
     except Exception as e:
@@ -1163,82 +1270,31 @@ def rebuild_faiss_index_job(db_path: str):
     try:
         cur = conn.cursor()
         
-        # Get all faces assigned to persons with embeddings
-        cur.execute(
-            """
-            SELECT f.id, f.embedding, f.person_id, p.name as person_name
-            FROM faces f
-            JOIN persons p ON f.person_id = p.id
-            WHERE f.embedding IS NOT NULL
-            ORDER BY f.person_id, f.id
-            """
-        )
-        person_faces = cur.fetchall()
-        
-        if not person_faces:
+        # Rebuild from the database, *with* ids. An index built without them
+        # is the legacy shape: position i means row i of whatever unordered
+        # query happened to build it, which is the mis-attribution this whole
+        # path exists to end. _person_face_index throws such an index away on
+        # sight, so building one here would just guarantee another rebuild.
+        ids, xb = _read_face_vectors(conn)
+        if not ids:
             print("ℹ No faces with embeddings found for any person")
-            # Delete existing index if it exists
-            existing_index_name = "existing_person_faces"
-            index_path = index_manager.index_dir / f"{existing_index_name}.index"
-            if index_path.exists():
-                index_path.unlink()
-                print("✓ Deleted empty FAISS index")
+            index_manager.delete_index(PERSON_INDEX_NAME)
             return {"updated": 0, "message": "No faces to index"}
-        
-        # Prepare embeddings
-        embeddings = []
-        face_ids = []
-        person_ids = []
-        
-        for row in person_faces:
-            face_id = row[0]  # id
-            embedding_bytes = row[1]  # embedding
-            person_id = row[2]  # person_id
-            person_name = row[3]  # person_name
-            
-            if embedding_bytes:
-                face_embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
-                face_embedding = face_embedding.reshape(1, -1).astype(np.float32)
-                embeddings.append(face_embedding)
-                face_ids.append(face_id)
-                person_ids.append(person_id)
-        
-        if not embeddings:
-            print("ℹ No valid embeddings found")
-            return {"updated": 0, "message": "No valid embeddings"}
-        
-        # Stack all embeddings into a single array
-        xb = np.vstack(embeddings)
-        
-        # Normalize embeddings for cosine similarity
-        faiss.normalize_L2(xb)
-        
-        # Build new index
-        existing_index_name = "existing_person_faces"
-        dim = xb.shape[1]
-        
-        try:
-            # Try to build HNSW index for faster search
-            new_index = index_manager.build_hnsw_index(
-                xb,
-                existing_index_name,
-                m=32,  # Connections per node
-                ef_construction=200
-            )
-            print(f"✓ Rebuilt HNSW FAISS index with {len(embeddings)} faces from {len(set(person_ids))} persons")
-        except Exception as e:
-            # Fall back to IndexFlatIP if HNSW fails
-            print(f"Warning: HNSW index build failed, using IndexFlatIP: {e}")
-            faiss.normalize_L2(xb)
-            new_index = faiss.IndexFlatIP(dim)
-            new_index.add(xb)
-            index_manager.save_index(new_index, existing_index_name)
-            print(f"✓ Rebuilt FAISS index (IndexFlatIP) with {len(embeddings)} faces from {len(set(person_ids))} persons")
-        
+
+        cur.execute(
+            f"SELECT COUNT(DISTINCT person_id) FROM faces WHERE {_INDEXABLE_FACES}"
+        )
+        person_count = int(cur.fetchone()[0])
+
+        index_manager.build_hnsw_index(
+            xb, PERSON_INDEX_NAME, m=32, ef_construction=200, ids=ids
+        )
+        print(f"✓ Rebuilt HNSW FAISS index with {len(ids)} faces from {person_count} persons")
+
         return {
-            "updated": len(embeddings),
-            "persons": len(set(person_ids)),
-            "message": f"Successfully rebuilt FAISS index with {len(embeddings)} face embeddings from {len(set(person_ids))} persons"
+            "updated": len(ids),
+            "persons": person_count,
+            "message": f"Successfully rebuilt FAISS index with {len(ids)} face embeddings from {person_count} persons"
         }
         
     except Exception as e:

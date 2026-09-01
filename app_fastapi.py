@@ -62,6 +62,7 @@ from core.jobs import (
     update_faiss_index_after_merge_job,
     rebuild_faiss_index_job,
     FACE_MATCH_THRESHOLD,
+    PERSON_INDEX_NAME,
 )
 from rq.job import Job, Dependency
 from PIL import Image
@@ -2384,7 +2385,6 @@ async def assign_face_person(
     conn: aiosqlite.Connection = Depends(get_db_async)
 ):
     """Assign a person to a face and update matching index for future auto-matching."""
-    import faiss
     import numpy as np
     
     person_id = data.person_id
@@ -2412,29 +2412,17 @@ async def assign_face_person(
     if face_embedding_bytes:
         try:
             index_manager = FAISSIndexManager()
-            existing_index_name = "existing_person_faces"
-            
-            # Load existing index
-            existing_index = index_manager.load_index(existing_index_name)
-            
-            if existing_index is not None:
-                # Index exists - update it incrementally with new face
-                face_embedding = np.frombuffer(face_embedding_bytes, dtype=np.float32)
-                face_embedding = face_embedding.reshape(1, -1).astype(np.float32)
-                
-                # Normalize embedding for cosine similarity
-                faiss.normalize_L2(face_embedding)
-                
-                # Add to existing index
-                existing_index.add(face_embedding)
-                
-                # Save updated index
-                index_manager.save_index(existing_index, existing_index_name)
-                print(f"✓ Updated FAISS index: Added face {face_id} to person {person_id} ({person_name}) for future matching")
-            else:
-                # Index doesn't exist yet - will be built on next clustering
-                # This is fine, the face will be included when index is built
-                print(f"ℹ FAISS index not found - will be built on next clustering. Face {face_id} assigned to person {person_id} ({person_name})")
+
+            # Append *with* the face id. The index is ID-mapped so that a
+            # search returns real faces.id values instead of positions that
+            # stop meaning anything the moment something appends; an idless
+            # add is rejected outright by add_to_index. update_index does the
+            # load-append-save under the index lock, so a concurrent worker
+            # cannot clobber this.
+            face_embedding = np.frombuffer(face_embedding_bytes, dtype=np.float32)
+            face_embedding = face_embedding.reshape(1, -1).astype(np.float32)
+            index_manager.update_index(PERSON_INDEX_NAME, face_embedding, [face_id])
+            print(f"✓ Updated FAISS index: Added face {face_id} to person {person_id} ({person_name}) for future matching")
         except Exception as e:
             # Don't fail the assignment if index update fails
             print(f"Warning: Failed to update FAISS index after manual assignment: {e}")
