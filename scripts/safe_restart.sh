@@ -38,18 +38,18 @@ say "2/4  Stopping workers (systemd Restart=always respawns them)"
 echo "     waiting for respawn..."
 for i in $(seq 1 30); do
   sleep 2
-  n=$(pgrep -fc 'worker.py' 2>/dev/null || echo 0)
+  n=$(pgrep -f 'worker.py' 2>/dev/null | wc -l)
   [ "$n" -ge 6 ] && break
 done
-echo "     worker processes: $(pgrep -fc 'worker.py' 2>/dev/null || echo 0) (expect 6)"
+echo "     worker processes: $(pgrep -f 'worker.py' 2>/dev/null | wc -l) (expect 6)"
 
 say "3/4  Restarting the API (sudo — will prompt for your password)"
 sudo systemctl restart chitra-api || { red "     API restart failed"; exit 1; }
 sleep 5
 
 say "4/4  Verifying"
-echo "     workers:  $(pgrep -fc 'worker.py' 2>/dev/null || echo 0)  (expect 6)"
-echo "     sidecar:  $(pgrep -fc embed_service 2>/dev/null || echo 0)  (expect 1)"
+echo "     workers:  $(pgrep -f 'worker.py' 2>/dev/null | wc -l)  (expect 6)"
+echo "     sidecar:  $(pgrep -f embed_service 2>/dev/null | wc -l)  (expect 1)"
 echo "     services: $(systemctl is-active chitra-api chitra-workers | tr '\n' ' ')"
 echo "     sidecar health: $(curl -s --max-time 20 localhost:5101/health 2>/dev/null || echo 'not up yet — CLIP still loading, recheck in 20s')"
 echo "     api health:     $(curl -s --max-time 10 localhost:5000/api/health 2>/dev/null | head -c 200)"
