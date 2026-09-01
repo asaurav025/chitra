@@ -602,3 +602,84 @@ the health endpoint returning 200 while degraded; client changes.
 ## Evidence
 
 _(Appended by the executing agent as tasks complete.)_
+
+### Phase 3 — vocabulary and re-tag (complete, not applied)
+
+Commits `c8856d4`, `a1857b7`, `808d7f9`, `8351d55`, `94f0317`. Zero MinIO reads.
+
+**Vocabulary.** 345 labels over nine facets — scene 52, place 57, activity 53,
+object 71, people 27, occasion 30, photo_style 32, time_of_day 12, season 11.
+All 17 legacy labels retained; `core/vocabulary.py` refuses to import if one is
+ever dropped. `vocab_fingerprint()` = `dd82e956e98f8e77` over labels, order,
+version and `PROMPT_TEMPLATE`.
+
+**Calibration.** Per-label percentiles learned from the whole corpus: p90 floor,
+p98.5 keep, per-photo 3-8. Per-label coverage is then structurally bounded by
+`100 - low_percentile`, which is the mechanism — not a tuning accident — that
+prevents another `travel`.
+
+**Dry run, copy of production (`/tmp/retag_test.db`), 1,930 vectors, dim 512:**
+
+```
+tags/photo   min 0  median 3.0  mean 4.39  max 8   (was: exactly 6.0, always)
+             0:12  1:12  2:33  3:1103  4:131  5:109  6:79  7:60  8:391
+worst label  wedding 3.6%                          (was: travel 80.9%)
+```
+
+| legacy label | before | after | | legacy label | before | after |
+|---|---|---|---|---|---|---|
+| travel | **80.9%** | **1.8%** | | wedding | 32.5% | 3.6% |
+| outdoors | 46.8% | 1.0% | | family | 31.2% | 2.0% |
+| portrait | 45.3% | 1.5% | | sports | 30.9% | 1.1% |
+| food | 39.7% | 1.9% | | indoors | 30.6% | 1.2% |
+| landscape | 38.8% | 1.2% | | party | 29.9% | 1.1% |
+| selfie | 38.3% | 2.1% | | night | 22.1% | 1.3% |
+| group photo | 36.9% | 2.4% | | pets | 13.6% | 1.1% |
+| friends | 36.3% | 1.7% | | sunset | 10.9% | 1.0% |
+| city | 35.1% | 1.0% | | | | |
+
+Distribution alone does not prove the tags are *right*, so a random sample was
+read back (filenames only, still no media). Old vs new on the same photo:
+
+```
+IMG_20260822_154139  old: food, indoors, night, portrait, selfie, travel
+                     new: studying, reading, library, working on a laptop, book
+IMG_5344             old: family, food, friends, outdoors, portrait, travel
+                     new: bird, monkey, wildlife
+IMG_5303             old: city, indoors, party, sports, travel, wedding
+                     new: nightclub, concert, concert hall
+```
+
+**Sensitivity**, so tuning needs no code change (`--high-percentile`):
+
+| p | mean tags | median | at floor (3) | at cap (8) | travel |
+|---|---|---|---|---|---|
+| 99.0 | 3.93 | 3.0 | 1,313 | 245 | 1.5% |
+| **98.5 (default)** | **4.39** | **3.0** | **1,103** | **391** | **1.8%** |
+| 97.0 | 5.50 | 5.5 | 653 | 783 | 1.9% |
+| 96.0 | 6.07 | 8.0 | 447 | 994 | 2.2% |
+
+The count distribution is bimodal at the floor and the cap, which is real
+structure rather than an artefact: label scores are strongly correlated, so a
+photo is either generically unlike everything or distinctively like a cluster of
+related labels. 57 photos (3%) fall below p90 on all 345 labels and get 0-2
+tags. Top-k could not express that, and it is the honest answer for them.
+
+**Not applied.** Production `photo.db` is untouched — still 17 distinct tags,
+one source, `travel` on 1,562 photos. Task 3.8 is the owner's to run:
+
+```bash
+cp photo.db photo.db.bak-$(date +%F)
+CHITRA_DB_PATH=/tmp/chitra_test.db .venv/bin/python scripts/retag.py --db photo.db --apply
+```
+
+Rollback: `DELETE FROM tags WHERE source = 'clip-vitb32/vocab-v2';` then re-run
+the legacy path. Label matrix is cached at
+`models/tag_vectors_clip-vitb32_dd82e956e98f8e77.npy` (706 KB, NVMe), so the
+apply run skips the ~21 min of text embedding this dry run paid — that time was
+sidecar contention from concurrent agents, not the ~4.5 s the work costs on an
+idle box. The GEMM itself is milliseconds.
+
+**Not done, deliberately:** `POST /api/index/retag` (3.7). `app_fastapi.py` is
+owned by another agent this session, and a standalone script is the safer entry
+point for an 11k-row rewrite anyway — it cannot be triggered by a stray request.
