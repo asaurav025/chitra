@@ -51,9 +51,21 @@ is whether *your* change added a failure.
   `requirements.txt` only mentions them in a comment. Video upload, poster
   generation, and transcoding all shell out to them.
 - **Never run `stop_workers.sh` while a transcode is in flight.** It sends two
-  SIGTERMs and cold-kills the job; the video is left permanently
-  `transcode_status="failed"` with no requeue path. Check the video queue is
-  idle first. systemd `Restart=always` respawns workers ~10s after a stop.
+  SIGTERMs and cold-kills the job. `process_video_transcode_job` sets
+  `transcode_status="processing"` on entry and only leaves that state from
+  inside its own try/except, which a SIGTERM never reaches — so the row is
+  stranded in `processing` (not `failed`), nothing retries it, and
+  `/api/photos/{id}/video` answers 409 `transcode_in_progress` forever. Check
+  the video queue is idle first. systemd `Restart=always` respawns workers ~10s
+  after a stop. To clean up afterwards:
+  `python scripts/requeue_transcodes.py --stuck` (dry run; `--apply` to fix).
+  Keep `--limit` at 1 for 4K sources — see the transcode cost note below.
+
+- **Transcoding is VA-API hardware-accelerated but decode stays on CPU.**
+  `core/video.py` encodes via `h264_vaapi` on `/dev/dri/renderD128` (the service
+  user must be in the `render` group) and falls back to libx264. Because the
+  HEVC decode half is still software, two concurrent 4K transcodes push the
+  1-minute load average past 12 on this box. Requeue 4K work one at a time.
 - **Schema migrations are additive `ALTER TABLE ADD COLUMN` calls run at
   startup** (`core/db_async.py`), wrapped in try/except. There is no migration
   framework and no schema-version table — renames, backfills and type changes
