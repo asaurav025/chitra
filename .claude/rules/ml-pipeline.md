@@ -33,6 +33,68 @@ calls `image_embedding` again. Anything holding a vector already should score
 labels with `SyncEmbeddingClient.rank_labels_for_vector` — both vectors are
 normalised, so the score is a dot product and needs no forward pass.
 
+**CLIP's image preprocessing is pinned, and the pin is load-bearing.**
+`core/embedder.py` passes `use_fast=False` to `CLIPProcessor.from_pretrained`
+rather than inheriting the default. transformers is moving that default to the
+torchvision-backed fast processor; it still returns the slow one for
+`openai/clip-vit-base-patch32` only because a slow config ships with the
+checkpoint, and it warns on every load that this will stop. Measured on
+4.57.6 against the synthetic reference: slow 1.27e-07 from the stored vectors,
+**fast 1.08e-03** — 10x the tolerance in
+`tests/test_embedder_stability.py` and ~8,500x the thread-count noise floor.
+Every one of the ~1,900 stored vectors came from the slow path, so inheriting a
+default that flips would compute new ones in a different space with nothing
+raised anywhere; search would just get gradually worse. **Do not drop the
+kwarg, and do not widen that test's tolerance to get past a failure** — a
+failure there means the corpus and new embeddings have diverged, which turns a
+version bump into a forced full re-embed on a failing disk. Switching to the
+fast processor is a re-embed decision, not a performance tweak.
+
+**`transformers>=4.50,<5` — and it was missing from `requirements.txt`
+entirely** while `core/embedder.py` imported it, so a clean install produced a
+venv that could not embed at all. The blockers on raising it were
+`huggingface_hub<0.18` and `tokenizers==0.14.1`, not the model class. Validated
+4.35.0 -> 4.57.6 with no vector movement. **The deployed `.venv` is still on
+4.35.0**, which cannot construct `SiglipEmbedder` at all (`SiglipModel` does
+not exist there) — that import is inside `__init__` for exactly this reason.
+Upgrading `.venv` requires a worker and sidecar restart to be consistent.
+
+**Two model switches, deliberately separate.** `CHITRA_EMBED_MODEL` selects
+what the sidecar loads and computes with (`core.embedder.build_embedder`, via
+`embed_service.configured_model`); `CHITRA_ACTIVE_EMBED_MODEL` selects what
+`search_photos` ranks from (`core.db_async.active_embed_model`). The re-embed
+cannot be atomic, so the migration needs a window where the sidecar already
+writes 768-d SigLIP rows while search still answers from the complete set of
+512-d CLIP rows: flip the first, re-embed, verify coverage, then flip the
+second. **The sidecar must never read `CHITRA_ACTIVE_EMBED_MODEL`** — if one
+variable drove both, the cutover would flip the read side before a single photo
+was converted and search would silently lose everything not yet re-embedded.
+`build_embedder` raises on an unknown identifier rather than falling back to
+CLIP, which would write 512-d rows under a `model` name claiming otherwise.
+
+**SigLIP 2 fits, in full fp32 with the text tower** — measured, see
+`docs/plans/siglip2-footprint.md`. With buffalo_l co-resident it peaks at
+2,137 MB against 2,018 MB for the CLIP it replaces (+119 MB). **Do not build a
+vision-only deployment**: `/api/search/photos` embeds arbitrary user text, and
+dropping the text tower deletes the primary feature to save nothing. **Do not
+use fp16**: it loses on both axes here — peak RSS goes *up*, because a dtype
+conversion materialises both representations and glibc keeps the arena
+(post-hoc `.half()` on the text tower hits 3,125 MB, 1.7x the fp32 model it was
+meant to shrink), and the forward pass is 5.6x slower since this CPU has no
+fp16 compute path. One non-obvious operational number: the `[256000, 768]`
+multilingual token embedding is 786 MB and is *mmap-backed*, so only the token
+rows real queries touch go resident. Day one reads ~2,137 MB and drifts toward
+**3,240 MB** as the query vocabulary widens, with no code change to blame.
+**Size for 3,240 MB.** Those pages are clean and file-backed, so eviction
+re-reads from `~/.cache/huggingface` on the NVMe, never from `/dev/sda`.
+
+**SigLIP text is padded to the full 64-token context**, not to the longest item
+in a batch, or a label's score would depend on which other labels were ranked
+beside it. `SiglipProcessor` already supplies the 64, but the tokenizer logs
+"Asking to pad to max_length but no maximum length is provided ... Default to
+no padding" — that message is **wrong** and `SiglipEmbedder` passes
+`max_length` explicitly so nobody "fixes" correct code on the strength of it.
+
 **Everything is CPU.** `torch.cuda.is_available()` is False on this box and
 `onnxruntime` is the CPU build. The pinned `nvidia-*` wheels are dead weight.
 Never add a model or code path that assumes a GPU.
