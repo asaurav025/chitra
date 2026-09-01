@@ -290,3 +290,52 @@ class TestSiglipTextPadding(unittest.TestCase):
             ["a beach", "a photograph of an extremely long descriptive caption here"]
         )[0]
         np.testing.assert_allclose(alone, batched, atol=1e-5)
+
+
+class TestTheModelIdentifierIsSpelledTheSameEverywhere(unittest.TestCase):
+    """Four modules hard-code the CLIP identifier as a separate literal:
+
+        core/db.py             DEFAULT_EMBED_MODEL   (what rows are written as)
+        core/embedder.py       DEFAULT_EMBED_MODEL   (what gets constructed)
+        embed_service.py       DEFAULT_MODEL         (what the sidecar loads)
+        scripts/reembed.py     DEFAULT_MODEL         (what the re-embed stamps)
+
+    They agree today. If they ever drift, nothing raises: rows get written under
+    one spelling while `search_photos` filters on another, and every query
+    quietly returns nothing — the exact failure the `model` column was added to
+    prevent. A string compare is cheap insurance against a one-character typo
+    that would otherwise surface as "search is broken" with no traceback.
+    """
+
+    def test_db_embedder_and_sidecar_agree(self):
+        import core.db as db
+        import core.embedder as em
+
+        self.assertEqual(db.DEFAULT_EMBED_MODEL, em.DEFAULT_EMBED_MODEL)
+        self.assertEqual(db.DEFAULT_EMBED_MODEL, embed_service.DEFAULT_MODEL)
+        self.assertEqual(CLIP_MODEL, db.DEFAULT_EMBED_MODEL)
+
+    def test_the_async_side_reuses_the_sync_constant(self):
+        import core.db as db
+        import core.db_async as dba
+
+        self.assertEqual(db.DEFAULT_EMBED_MODEL, dba.DEFAULT_EMBED_MODEL)
+
+    def test_reembed_script_stamps_the_same_name(self):
+        import re
+
+        src = open("scripts/reembed.py").read()
+        m = re.search(r'^DEFAULT_MODEL\s*=\s*["\'](.+?)["\']', src, re.M)
+        self.assertIsNotNone(m, "scripts/reembed.py no longer defines DEFAULT_MODEL")
+        self.assertEqual(CLIP_MODEL, m.group(1))
+
+    def test_every_known_embedder_declares_a_distinct_dimension(self):
+        """Two models sharing a dim would make `/health`'s dim useless as the
+        confirmation of which one is loaded."""
+        import core.embedder as em
+
+        dims = {}
+        for name in em._EMBEDDERS:
+            cls = em.SiglipEmbedder if "siglip" in name else em.ClipEmbedder
+            dims[name] = cls.DIM
+        self.assertEqual(len(dims), len(set(dims.values())), dims)
