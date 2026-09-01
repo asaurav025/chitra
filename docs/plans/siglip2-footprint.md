@@ -125,30 +125,70 @@ Two independent reasons:
 fp32 is simultaneously smaller at peak and faster. There is no configuration in
 which fp16 is the right answer on this box.
 
-## Latency — NOT USABLE, must be re-measured on an idle box
+## Latency and the thread curve
 
-Every timing here was taken at **load average 21-25 on a 6-core box**, with two
-ffmpeg transcodes and three other agents' test suites running. CLIP's image
-embed measured **364 ms against the 113 ms on record** at the same 3 threads, so
-absolute figures are roughly 3x inflated.
+Re-measured after the box quieted. Absolute values are still inflated —
+concurrent work pushed load from 2 to 13 during the sweep — so the honest
+figures are **ratios against CLIP measured in the same window**, scaled by
+CLIP's known idle numbers (113 ms image / 13.0 ms text at 3 threads).
 
-| model | image embed | text embed |
-|---|---|---|
-| CLIP ViT-B/32 (113 ms on an idle box) | 364 ms | 39 ms |
-| SigLIP 2 vision fp32 | 1,395 ms | — |
-| SigLIP 2 full fp32 | 1,779 ms | 501 ms |
-| SigLIP 2 vision fp16 | 7,809 ms | — |
+CLIP calibration in that window: **261 ms image, 19.3 ms text** at 3 threads,
+against 113 / 13.0 on record — a contention factor of ~2.3x on image.
 
-Taking the CLIP ratio as the contention factor puts SigLIP's real image embed
-near ~430-550 ms, against the ~321 ms the plan predicted from the 2.84x encoder
-ratio — same order, and compute was never the constraint.
+### The 3-thread optimum transfers
 
-**The thread curve is deliberately not reported.** Contention does not merely
-scale a thread curve, it reshapes it: an already-oversubscribed box makes low
-thread counts look artificially good, so a 3-vs-4-vs-6 comparison taken now
-would be actively misleading about the real optimum. The open question stands —
-**the 3-thread optimum is a CLIP result and patch16-224 has 4x the tokens** —
-and it needs a quiet box. It gates only tuning, not whether SigLIP lands.
+Measured twice, **in both directions**, because the first sweep had load rising
+monotonically with thread count — a confound perfectly correlated with the
+independent variable. Re-running 6→1 inverts it: if 3 still wins when the
+confound runs the other way, the shape is real.
+
+| threads | image median (fwd / rev) | image best-of-15 (fwd / rev) | text median (fwd / rev) |
+|---|---|---|---|
+| 1 | 1,267 / 1,419 ms | 888 / 1,181 ms | 468 / 492 ms |
+| 2 | 923 / 937 ms | 824 / 861 ms | 324 / 300 ms |
+| **3** | **798 / 825 ms** | **673 / 694 ms** | **298 / 316 ms** |
+| 4 | 1,067 / 1,050 ms | 876 / 855 ms | 408 / 466 ms |
+| 6 | 3,301 / 3,326 ms | 2,073 / 2,660 ms | 2,113 / 1,925 ms |
+
+Both orders put the minimum at **3 threads**, and the two runs agree to within
+3% there. The 6-thread row is the decisive one: in the reverse sweep it ran
+*first*, at the lowest contention of that pass, and was still 4x worse than 3.
+That penalty is real thread thrash, not an artifact.
+
+**So the existing `CHITRA_ML_THREADS=3` needs no change for SigLIP** — the open
+question in the plan ("the 3-thread optimum is a CLIP result and may not
+transfer") is answered: it transfers, and the cost of getting it wrong is worse
+here than for CLIP, 4.1x at 6 threads against CLIP's 1.7x.
+
+### Estimated idle-box cost
+
+| | CLIP (on record) | SigLIP 2 | ratio |
+|---|---|---|---|
+| image embed | 113 ms | **~346 ms** | 3.06x |
+| text embed | 13.0 ms | **~200 ms** | 15.4x |
+
+The image figure lands close to the ~321 ms the plan predicted from the 2.84x
+encoder ratio, so compute for the re-embed is not the constraint: ~1,800 photos
+at ~346 ms is roughly 10 minutes.
+
+### The text tower is 15x slower, and that lands on the search path
+
+This is the one number that should change a plan somewhere. `/api/search/photos`
+embeds the user's query text on **every request**, so the search latency floor
+moves from ~13 ms to ~200 ms. Tagging is unaffected — `core/tagger.py` scores
+against a cached label matrix and runs no text forward pass — so this is
+specifically an interactive-search cost.
+
+The cause is structural, not a misconfiguration: SigLIP pads every sequence to
+its full 64-token context (it has to; see the padding note in
+`core/embedder.py`) and runs a 768-wide tower over all 64, where CLIP runs a
+512-wide tower over only the tokens present in a short query.
+
+It does not block the migration, and D3 already accepted ~113 ms of worst-case
+executor queueing on search. But it stacks with that, and the combination is
+worth deciding about explicitly before the cutover rather than discovering after.
+Query-vector caching is the obvious mitigation — search queries repeat heavily —
+and it is cheap, but it is out of scope here.
 
 ## Recommended configuration
 
