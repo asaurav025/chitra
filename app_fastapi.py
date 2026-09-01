@@ -48,12 +48,13 @@ from core.embed_client import EmbeddingClient
 from core.extractor import collect_metadata, load_image, iter_images, is_video, RAW_EXTS, _normalize_exif_date
 from core.gallery import ensure_thumb
 from core.cache import get_cached_thumbnail, cache_thumbnail
-from core.worker import get_queue
+from core.worker import get_queue, get_redis_connection
 from core.faiss_index import FAISSIndexManager
 from core.jobs import (
     process_photo_embedding_job,
     process_photo_faces_job,
     process_video_transcode_job,
+    generate_video_poster_job,
     index_embeddings_batch_job,
     index_faces_batch_job,
     cluster_faces_job,
@@ -110,11 +111,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"Warning: Database initialization failed: {e}")
 
-    # Video support requires the ffmpeg/ffprobe CLIs (apt-get install ffmpeg)
+    # The API itself never invokes ffmpeg any more — posters and transcodes are
+    # both worker jobs. This probe stays because it is a `shutil.which` (no
+    # process spawned, no memory) and the API is where an operator looks first
+    # when video uploads misbehave. The workers check again at the point of
+    # use: process_video_transcode_job marks the row failed, and
+    # generate_video_poster_job raises.
     if video.ensure_ffmpeg():
-        print("✓ ffmpeg/ffprobe available (video upload supported)")
+        print("✓ ffmpeg/ffprobe available (worker jobs can make posters and transcode)")
     else:
-        print("Warning: ffmpeg/ffprobe NOT found — video posters and transcoding will fail")
+        print("Warning: ffmpeg/ffprobe NOT found — worker posters and transcoding will fail")
 
     # One AsyncClient for the whole process: connection reuse turns the
     # loopback hop into ~2 ms on top of a ~13 ms embed.
@@ -753,38 +759,44 @@ async def ensure_photo_thumb_async(
     return thumb_path
 
 
-async def ensure_video_poster_async(
-    local_src_path: str,
-    photo_id: int,
-    storage: MinIOStorageClient,
-) -> Optional[str]:
-    """Extract a poster (keyframe JPEG) from a local video file and upload it to the
-    photo thumbnail path. Returns the thumbnail object key, or None on failure
-    (a missing poster must never fail the upload)."""
-    thumb_path = storage.generate_thumbnail_path(photo_id, "photo")
-    if not video.ensure_ffmpeg():
-        print("ffmpeg not available; skipping video poster")
-        return None
+# A poster job is enqueued at most once per photo per window. One grid render
+# of 50 videos issues 50 thumbnail GETs at once, and without this each miss
+# would enqueue its own duplicate job.
+POSTER_ENQUEUE_TTL_SECONDS = 300
 
-    poster_tmp = None
+
+def enqueue_video_poster(photo_id: int, file_path: str) -> bool:
+    """Ask a worker for this video's poster. Returns True if newly enqueued.
+
+    Poster extraction is ffmpeg work and no longer happens in this process:
+    two of the six chitra-api OOM kills named `av:hevc:dfN` decode threads
+    running inside the API cgroup. It runs on the **default** queue (4 workers)
+    rather than `video` (2 workers), so it does not queue behind a multi-minute
+    transcode — 1-3 s instead of minutes.
+
+    Never raises: a failure to enqueue must not fail the request that noticed.
+    """
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as pt:
-            poster_tmp = pt.name
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, video.extract_poster, local_src_path, poster_tmp)
-        with open(poster_tmp, "rb") as f:
-            poster_data = f.read()
-        await storage.upload_file_async(poster_data, thumb_path)
-        return thumb_path
+        redis_conn = get_redis_connection()
+        key = f"chitra:poster:enqueued:{photo_id}"
+        if not redis_conn.set(key, b"1", nx=True, ex=POSTER_ENQUEUE_TTL_SECONDS):
+            return False  # already asked for, recently
     except Exception as e:
-        print(f"Warning: video poster generation failed for photo {photo_id}: {e}")
-        return None
-    finally:
-        if poster_tmp and os.path.exists(poster_tmp):
-            try:
-                os.unlink(poster_tmp)
-            except OSError:
-                pass
+        # Redis down: the enqueue below will fail too and be logged there.
+        print(f"Warning: poster dedupe check failed for photo {photo_id}: {e}")
+
+    try:
+        get_queue().enqueue(
+            generate_video_poster_job,
+            photo_id,
+            file_path,
+            DB_PATH,
+            job_timeout="10m",
+        )
+        return True
+    except Exception as e:
+        print(f"Warning: failed to enqueue poster job for photo {photo_id}: {e}")
+        return False
 
 
 # -----------------------------------------------------------------------------
@@ -1001,7 +1013,9 @@ async def get_photo_thumbnail(
 ):
     """Get photo thumbnail with browser caching support."""
     cur = await conn.cursor()
-    await cur.execute("SELECT file_path, thumb_path FROM photos WHERE id=?", (photo_id,))
+    await cur.execute(
+        "SELECT file_path, thumb_path, media_type FROM photos WHERE id=?", (photo_id,)
+    )
     row = await cur.fetchone()
     
     if not row:
@@ -1009,13 +1023,27 @@ async def get_photo_thumbnail(
     
     file_path = row["file_path"]
     thumb_path = row["thumb_path"]
-    
+    # NULL media_type means photo: 766 legacy rows predate the column and must
+    # keep using the lazy PIL path.
+    is_vid = row["media_type"] == "video"
+
+    if is_vid:
+        # A video poster is ffmpeg work, which never runs in the API. The old
+        # code fell through to PIL, which downloaded the entire video and then
+        # 500'd trying to open an mp4 as an image.
+        if not thumb_path or not await storage.file_exists_async(thumb_path):
+            enqueue_video_poster(photo_id, file_path)
+            raise HTTPException(
+                status_code=404,
+                detail="poster_pending",
+                headers={"Retry-After": "3"},
+            )
     # If thumb_path not in DB, generate it and store
-    if not thumb_path:
+    elif not thumb_path:
         thumb_path = await ensure_photo_thumb_async(file_path, photo_id, storage, conn)
         await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
         await conn.commit()
-    else:
+    elif not is_vid:
         # Check if thumbnail exists on MinIO (only if we have path in DB)
         if not await storage.file_exists_async(thumb_path):
             # Thumbnail was deleted or doesn't exist, regenerate
@@ -1179,9 +1207,14 @@ async def upload_photos(
 
                 is_vid = is_video(filename)
 
-                # Generate thumbnail (image) or poster keyframe (video, from the local temp file)
+                # Photos: thumbnail inline (PIL, cheap). Videos: enqueue the
+                # poster — ffmpeg must not run in this process. The response
+                # carries thumbnail: null for videos; both clients tolerate it
+                # (verified in chitra_ui_next and chitra_ios) and the tile
+                # fills in via GET /api/photos/{id}/thumbnail a second later.
                 if is_vid:
-                    thumb_path = await ensure_video_poster_async(tmp_path, photo_id, storage)
+                    thumb_path = None
+                    enqueue_video_poster(photo_id, stored_path)
                 else:
                     thumb_path = await ensure_photo_thumb_async(stored_path, photo_id, storage, conn)
 

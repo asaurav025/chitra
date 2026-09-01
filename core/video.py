@@ -142,10 +142,17 @@ def extract_poster(
     """Extract a single keyframe as a JPEG poster. Raises RuntimeError on failure."""
     # Seek ~1s in to skip black opening frames, unless the clip is shorter than that.
     seek = "0" if (duration_seconds is not None and duration_seconds < 1.0) else "1"
+    # -threads 2 goes before -i so it caps the *decoder*, not just the encoder.
+    # Two of the six chitra-api OOM kills named av:hevc:df0 / av:hevc:df6 —
+    # frame-threaded HEVC decode workers, each allocating its own frame
+    # buffers. A single keyframe does not need six of them. -an/-sn drop the
+    # audio and subtitle streams, which are pure waste for a poster.
     cmd = [
         FFMPEG, "-y",
+        "-threads", "2",
         "-ss", seek,
         "-i", str(src_path),
+        "-an", "-sn",
         "-frames:v", "1",
         "-vf", f"scale='min({max_size},iw)':-2",
         "-q:v", "3",

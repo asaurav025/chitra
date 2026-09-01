@@ -34,7 +34,7 @@ carries a ruff config for when it is installed; nothing runs it automatically.
 ## Test baseline
 
 The suite is **not green**. As of 2026-09-01 a clean run is
-`66 tests, 7 failures, 4 errors, 2 skipped`. These are pre-existing:
+`168 tests, 7 failures, 4 errors, 2 skipped`. These are pre-existing:
 
 - `test_endpoints.py` — 7 failures, all `401 != 200/400/404`. The tests build a
   `TestClient` with no auth token and predate the auth layer.
@@ -48,8 +48,22 @@ is whether *your* change added a failure.
 ## Gotchas
 
 - **`ffmpeg` and `ffprobe` are apt system packages, not pip dependencies.**
-  `requirements.txt` only mentions them in a comment. Video upload, poster
-  generation, and transcoding all shell out to them.
+  `requirements.txt` only mentions them in a comment. Poster generation and
+  transcoding shell out to them — **from the workers only**. The API must
+  never spawn ffmpeg: it did (inline poster extraction on upload) and the
+  `av:hevc:dfN` decode threads were named in 2 of 6 cgroup OOM kills.
+  `tests/test_video_poster.py` guards that.
+- **The API holds no ML model.** Text embeddings for search come from the
+  `embed_service.py` sidecar over loopback; `core/embed_client.py` is the
+  client. There is deliberately no in-process fallback — search 503s when the
+  sidecar is down, and `/api/health` reports `embed_status`. Importing
+  `app_fastapi` must stay under 200 MB with no torch/transformers resident;
+  `tests/test_api_memory_budget.py` enforces it in a fresh subprocess.
+- **Thread counts come from `thread_limits.sh`**, sourced by the launchers
+  after `.env.production` so operator overrides win. 3 is the measured CLIP
+  optimum on this 6-core box; the curve is sharply non-monotonic (4 and 6 are
+  ~1.7x worse than 3). Note `OMP_NUM_THREADS` does **not** reach ONNX Runtime —
+  measured, see `docs/plans/api-oom-fix.md`.
 - **Never run `stop_workers.sh` while a transcode is in flight.** It sends two
   SIGTERMs and cold-kills the job. `process_video_transcode_job` sets
   `transcode_status="processing"` on entry and only leaves that state from

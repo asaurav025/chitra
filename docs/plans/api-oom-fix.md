@@ -1102,3 +1102,90 @@ Killed afterwards; pid gone, both ports free.
 tied to the model name, and a second failure mode, to save single-digit
 milliseconds. Left as a documented option in case sidecar restarts prove
 disruptive.
+
+### Phase 4 — Get ffmpeg out of the API
+
+**Task 4.1 — red tests.** New `tests/test_video_poster.py`, 24 tests, **all
+storage stubbed** — nothing here reads MinIO, both because a poster test has no
+business downloading an original and because the disk holding MinIO is
+currently failing. `FakeStorage.download_file` is a trap that raises rather
+than an implementation, so a regression to it fails loudly. Watched fail:
+
+```
+AssertionError: '-threads' not found in ['ffmpeg', '-y', '-ss', '1', '-i',
+  '/nonexistent/source.mov', '-frames:v', '1', '-vf', "scale='min(512,iw)':-2",
+  '-q:v', '3', '/tmp/tmp1dgn6yef.jpg']
+ValueError: '-threads' is not in list
+AttributeError: module 'core.jobs' has no attribute 'generate_video_poster_job'   (x6)
+FAIL: test_does_not_call_extract_poster / test_ensure_video_poster_async_is_gone
+```
+
+**Task 4.2 — `core/video.py:145-158`.** `-threads 2` placed between `-y` and
+`-ss`, i.e. **before `-i`**, so it caps the *decoder* — after `-i` it would
+configure only the encoder, and the decode is both the expensive half and the
+half that OOM'd. Plus `-an -sn`.
+
+Scope guard held: `git diff -U0 core/video.py` shows three hunks, all inside
+`extract_poster`. The transcode command builders are untouched.
+
+**Task 4.3 — `core/jobs.py:541-608`, `generate_video_poster_job`.** Uses
+`download_to_path` (streams to a file); `download_file` would pull a multi-GB
+original into RAM. No-ops when the poster already exists, so the redundant
+enqueues from a gallery render are cheap. Touches **no** `transcode_status`
+value — pinned by a test that sets it to `processing` first and asserts it
+survives. Re-raises on failure, per AGENTS.md.
+
+**Task 4.4 — upload enqueues instead of decoding.** `ensure_video_poster_async`
+deleted outright. The video branch now calls `enqueue_video_poster()` and
+returns `thumbnail: None` — verified in D2 to break neither client's decoding.
+
+**Task 4.5 — the thumbnail GET is guarded.** A video with no poster yet
+enqueues one and returns `404` + `Retry-After: 3`. Previously it fell through
+to PIL, which **downloaded the entire video and then 500'd** trying to open an
+mp4 as an image; a test now asserts nothing at all is fetched on that path.
+`media_type` NULL is treated as photo, so the 766 legacy rows keep their lazy
+PIL path — also pinned by a test.
+
+Dedupe: `enqueue_video_poster` is one shared helper used by both call sites,
+with a Redis `SET NX EX 300` on `chitra:poster:enqueued:{photo_id}`. A grid of
+50 videos fires 50 GETs and exactly one job; a test issues 5 requests and
+asserts one enqueue, and another asserts the key carries a TTL (a permanent key
+would mean a failed job is never retried).
+
+**Task 4.6 — ffmpeg is gone from the API. Proof:**
+
+```
+$ grep -n "video\." app_fastapi.py
+115:    if video.ensure_ffmpeg():
+
+$ grep -nE "subprocess|ffmpeg|ffprobe|popen" app_fastapi.py
+115:    if video.ensure_ffmpeg():          <- the startup probe
+(everything else is a comment explaining why ffmpeg is not here)
+```
+
+**Decision on the startup probe, recorded as the plan asks: it stays in the
+API.** It is a `shutil.which` — no process, no memory — and the API is where an
+operator looks first when video uploads misbehave. It is not the *only* check:
+both workers verify at the point of use (`process_video_transcode_job` marks
+the row failed, `generate_video_poster_job` raises), so a second probe in
+`worker.py` would add nothing. The startup message is reworded to say the work
+happens in workers.
+
+**Import weight unchanged by Phase 4** (`generate_video_poster_job` comes from
+the already-lazy `core.jobs`):
+
+```
+app_fastapi   rss= 98.7 MB   heavy=['faiss','rawpy']
+core.jobs     rss= 53.1 MB   heavy=['rawpy']
+```
+
+Suite after Phase 4:
+
+```
+Ran 168 tests in 5.187s
+FAILED (failures=7, errors=4, skipped=2)
+```
+
+`AGENTS.md` updated: the test-baseline count 66 -> 168 (failures and errors
+unchanged at 7/4), the ffmpeg gotcha now says workers-only, and two new
+gotchas record the ML-free API and `thread_limits.sh`.

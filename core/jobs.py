@@ -538,6 +538,76 @@ def process_video_transcode_job(photo_id: int, file_path: str, db_path: str):
         conn.close()
 
 
+def generate_video_poster_job(photo_id: int, file_path: str, db_path: str):
+    """Extract a poster keyframe for a video and upload it as its thumbnail.
+
+    This used to happen inline in the API's upload handler. Two of the six
+    chitra-api OOM kills named `av:hevc:df0` / `av:hevc:df6` — ffmpeg HEVC
+    decode threads running inside the API cgroup. Poster extraction is ffmpeg
+    work and belongs in a worker.
+
+    Runs on the **default** queue, not `video`: the video queue has 2 workers
+    and a poster enqueued behind a multi-minute 4K transcode would arrive
+    minutes late. The default queue has 4 and is otherwise idle-ish, so the
+    poster lands in 1-3 s. The cost is one duplicated download of the original
+    — deliberate, and cheaper than the wait.
+
+    Deliberately touches **no** `transcode_status` value. A transcode for the
+    same photo may be running concurrently on the other queue and owns that
+    column; writing it from here could strand the video in a state nothing
+    retries.
+
+    Re-raises on failure so RQ marks the job failed (AGENTS.md: returning False
+    makes a failed job look successful).
+    """
+    storage_client = _get_storage_client()
+    thumb_path = storage_client.generate_thumbnail_path(photo_id, "photo")
+
+    # A grid render of 50 videos can fire 50 enqueues; make the redundant ones
+    # cheap, and above all do not re-download the original for them.
+    if storage_client.file_exists(thumb_path):
+        print(f"Poster for photo {photo_id} already exists at {thumb_path}")
+        return thumb_path
+
+    if not video.ensure_ffmpeg():
+        raise RuntimeError(f"ffmpeg/ffprobe not available; cannot make a poster for {photo_id}")
+
+    conn = None
+    tmp_src = None
+    poster_tmp = None
+    try:
+        ext = Path(file_path).suffix or ".mp4"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp_src = tmp.name
+        # download_to_path streams to disk. download_file would return the
+        # whole original as bytes — a multi-GB video straight into RAM.
+        storage_client.download_to_path(file_path, tmp_src)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as pt:
+            poster_tmp = pt.name
+        video.extract_poster(tmp_src, poster_tmp)
+
+        storage_client.upload_file_from_path(poster_tmp, thumb_path)
+
+        conn = db.connect(db_path)
+        conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
+        conn.commit()
+        print(f"Poster for photo {photo_id} -> {thumb_path}")
+        return thumb_path
+    except Exception as e:
+        print(f"Error generating poster for photo {photo_id}: {e}")
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+        for p in (tmp_src, poster_tmp):
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
 def cluster_faces_job(db_path: str, threshold: float = 0.75, photo_ids: list = None, reset: bool = False):
     """
     Background job to cluster unassigned faces into persons using HDBSCAN.
