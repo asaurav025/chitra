@@ -1038,18 +1038,19 @@ async def get_photo_thumbnail(
                 detail="poster_pending",
                 headers={"Retry-After": "3"},
             )
-    # If thumb_path not in DB, generate it and store
+        # A poster that already exists is served below like any other thumbnail.
     elif not thumb_path:
+        # Photo with no thumb_path yet: generate it lazily and store it. This
+        # is the only path that keeps the 766 legacy NULL-media_type rows
+        # working, which is why it stays in the API — PIL, not ffmpeg.
         thumb_path = await ensure_photo_thumb_async(file_path, photo_id, storage, conn)
         await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
         await conn.commit()
-    elif not is_vid:
-        # Check if thumbnail exists on MinIO (only if we have path in DB)
-        if not await storage.file_exists_async(thumb_path):
-            # Thumbnail was deleted or doesn't exist, regenerate
-            thumb_path = await ensure_photo_thumb_async(file_path, photo_id, storage, conn)
-            await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
-            await conn.commit()
+    elif not await storage.file_exists_async(thumb_path):
+        # Recorded in the DB but gone from MinIO — regenerate.
+        thumb_path = await ensure_photo_thumb_async(file_path, photo_id, storage, conn)
+        await conn.execute("UPDATE photos SET thumb_path = ? WHERE id = ?", (thumb_path, photo_id))
+        await conn.commit()
     
     # Generate ETag based on photo_id and thumb_path (stable identifier)
     etag_value = hashlib.md5(f"{photo_id}:{thumb_path}".encode()).hexdigest()
