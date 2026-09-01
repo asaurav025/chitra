@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import io
+import logging
 import tempfile
 import hashlib
 from contextlib import asynccontextmanager
@@ -72,6 +73,8 @@ try:
 except ImportError:
     pass  # pillow-heif not installed, HEIC support will be limited
 
+
+logger = logging.getLogger(__name__)
 
 # Global instances
 _STORAGE_CLIENT: MinIOStorageClient | None = None
@@ -1024,8 +1027,11 @@ async def get_photo_image(
         file_data = await storage.download_file_async(file_path)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="file_not_found_on_storage")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"storage_error: {str(e)}")
+    except Exception:
+        # The cause belongs in the log, not in the response body: str(e) here is
+        # MinIO/urllib3 internals — bucket hosts, ports, retry state.
+        logger.exception("storage download failed for photo %s (%s)", photo_id, file_path)
+        raise HTTPException(status_code=500, detail="storage_error")
     
     # Check if file needs conversion (RAW or HEIC/HEIF)
     file_ext = Path(file_path).suffix.lower()
@@ -1154,10 +1160,14 @@ async def get_photo_thumbnail(
             thumb_data = await read_thumbnail_async(storage, thumb_path)
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="thumbnail_not_found_on_storage")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"storage_error: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"storage_error: {str(e)}")
+        except Exception:
+            logger.exception(
+                "regenerated thumbnail unreadable for photo %s (%s)", photo_id, thumb_path
+            )
+            raise HTTPException(status_code=500, detail="storage_error")
+    except Exception:
+        logger.exception("thumbnail download failed for photo %s (%s)", photo_id, thumb_path)
+        raise HTTPException(status_code=500, detail="storage_error")
     
     return Response(
         content=thumb_data,
@@ -2230,8 +2240,9 @@ async def get_face_thumbnail(
         thumb_data = await read_thumbnail_async(storage, thumb_path)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="thumb_not_found_on_storage")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"storage_error: {str(e)}")
+    except Exception:
+        logger.exception("face crop download failed for face %s (%s)", face_id, thumb_path)
+        raise HTTPException(status_code=500, detail="storage_error")
     
     return Response(
         content=thumb_data,
@@ -2523,8 +2534,9 @@ async def get_storage_file(
         return Response(content=file_data, media_type=mimetype)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="file_not_found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"storage_error: {str(e)}")
+    except Exception:
+        logger.exception("storage download failed for %s", file_path)
+        raise HTTPException(status_code=500, detail="storage_error")
 
 
 # -----------------------------------------------------------------------------

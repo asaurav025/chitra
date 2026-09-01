@@ -408,5 +408,81 @@ class TestThumbnailStorageRoundTrips(ThumbnailEndpointCase):
         self.assertEqual([], regenerated)
 
 
+# What a real MinIO/urllib3 failure looks like when it reaches a handler.
+MINIO_INTERNALS = (
+    "S3 operation failed; code: InternalError, message: We encountered an "
+    "internal error, host_id: minio-0.minio.default.svc:9000, "
+    "HTTPSConnectionPool(host='10.0.0.4', port=9000): Max retries exceeded"
+)
+
+
+class TestStorageErrorsDoNotLeakInternals(ThumbnailEndpointCase):
+    """`storage_error: {str(e)}` put MinIO hostnames and urllib3 tracebacks in
+    response bodies. The client gets a stable token; the detail goes to the log."""
+
+    def assert_generic_500(self, resp):
+        self.assertEqual(500, resp.status_code, resp.text)
+        self.assertEqual("storage_error", resp.json()["detail"])
+        self.assertNotIn("InternalError", resp.text)
+        self.assertNotIn("minio", resp.text.lower())
+        self.assertNotIn("HTTPSConnectionPool", resp.text)
+
+    def broken_storage(self):
+        return FakeStorage(
+            {PHOTO_THUMB: JPEG, FACE_THUMB: JPEG},
+            download_error=RuntimeError(MINIO_INTERNALS),
+        )
+
+    def test_photo_thumbnail_returns_a_generic_detail(self):
+        client = self.client_with(self.broken_storage())
+
+        with self.assertLogs("app_fastapi", level="ERROR"):
+            resp = client.get("/api/photos/1/thumbnail")
+
+        self.assert_generic_500(resp)
+
+    def test_photo_thumbnail_logs_the_real_cause(self):
+        client = self.client_with(self.broken_storage())
+
+        with self.assertLogs("app_fastapi", level="ERROR") as logs:
+            client.get("/api/photos/1/thumbnail")
+
+        self.assertTrue(
+            any("InternalError" in record.getMessage() or "InternalError" in str(record.exc_info)
+                for record in logs.records),
+            "the cause has to survive somewhere — the log is where it belongs",
+        )
+
+    def test_face_thumbnail_returns_a_generic_detail(self):
+        client = self.client_with(self.broken_storage())
+
+        with self.assertLogs("app_fastapi", level="ERROR"):
+            resp = client.get("/api/faces/1/thumbnail")
+
+        self.assert_generic_500(resp)
+
+    def test_photo_image_returns_a_generic_detail(self):
+        client = self.client_with(self.broken_storage())
+
+        with self.assertLogs("app_fastapi", level="ERROR"):
+            resp = client.get("/api/photos/1/image")
+
+        self.assert_generic_500(resp)
+
+    def test_storage_passthrough_returns_a_generic_detail(self):
+        client = self.client_with(self.broken_storage())
+
+        with self.assertLogs("app_fastapi", level="ERROR"):
+            resp = client.get("/api/storage/photos/2026/09/a.jpg")
+
+        self.assert_generic_500(resp)
+
+    def test_the_module_no_longer_interpolates_exceptions_into_storage_errors(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(repo_root, "app_fastapi.py")) as fh:
+            source = fh.read()
+        self.assertNotIn("storage_error: {str(e)}", source)
+
+
 if __name__ == "__main__":
     unittest.main()
