@@ -17,6 +17,13 @@ if [ -f .env.production ]; then
     set -a; . ./.env.production; set +a
 fi
 
+# Cap BLAS/OpenMP threads. Sourced *after* .env.production so anything set
+# there (or a systemd Environment=) wins. The API's only numeric work is a
+# 1,694x512 GEMV over 3.31 MiB of embeddings — memory-bound, so 2 is plenty.
+# It also bounds the damage if an ML import ever sneaks back in: 2 threads x 4
+# uvicorn workers instead of 24 on a 6-core box.
+. ./thread_limits.sh 2
+
 # Default values
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-5000}"

@@ -684,3 +684,166 @@ assertions**. `TestJobsImportIsMLFree` went green. No regression.
 `TestApiImportIsMLFree` assertions (`heavy=['torch','transformers']`,
 `rss_mb=557`) stay red until Phase 3 Task 3.2 removes `app_fastapi.py:46`. That
 is the plan's expected state, not a defect.
+
+### Phase 6 — Thread limits
+
+**Task 6.1 — thread caps exported from the launcher scripts.**
+
+Implemented as one sourced fragment, `thread_limits.sh`, rather than a block
+duplicated into each launcher — the same block is needed by
+`start_production.sh`, `start_workers.sh` and (Phase 2) the sidecar, and a
+single fragment is what makes the override precedence testable rather than
+merely asserted.
+
+- `start_production.sh:20-25` — `. ./thread_limits.sh 2`
+- `start_workers.sh:20-25` — `. ./thread_limits.sh "${CHITRA_ML_THREADS:-3}"`
+
+Both sit immediately *after* the `.env.production` source. The fragment uses
+`: "${VAR:=default}"`, which assigns only when the variable is unset or empty,
+so anything already exported wins.
+
+Variables set: `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+`NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`.
+
+**Deviation from the plan text:** the plan names `VECLIB_NUM_THREADS`. No such
+variable exists — Apple Accelerate reads `VECLIB_MAXIMUM_THREADS`, which is what
+is set. Inert on this Linux box either way; setting the plan's spelling would
+have been a no-op with a misleading name.
+
+New `tests/test_thread_limits.py` — 9 tests, watched fail first
+(`thread_limits.sh is missing — nothing caps thread counts`, and
+`./thread_limits.sh: No such file or directory` from the launcher-wiring tests),
+then green.
+
+**Override-precedence demonstration:**
+
+```
+1. API default (no override)
+   MKL_NUM_THREADS=2  NUMEXPR_NUM_THREADS=2  OMP_NUM_THREADS=2
+   OPENBLAS_NUM_THREADS=2  VECLIB_MAXIMUM_THREADS=2
+
+2. Workers default (CHITRA_ML_THREADS unset -> 3)
+   MKL_NUM_THREADS=3  NUMEXPR_NUM_THREADS=3  OMP_NUM_THREADS=3
+   OPENBLAS_NUM_THREADS=3  VECLIB_MAXIMUM_THREADS=3
+
+3. CHITRA_ML_THREADS=5 beats the built-in 3
+   OMP_NUM_THREADS=5
+
+4. A pre-set OMP_NUM_THREADS=8 beats the API's 2, and only that variable
+   OMP_NUM_THREADS=8  (overridden)   MKL_NUM_THREADS=2  (default)
+
+5. Full .env.production simulation (set -a; . file; set +a; . ./thread_limits.sh 2)
+   OMP_NUM_THREADS=6  <- operator file won
+
+6. Sourcing with no argument fails loudly rather than silently capping nothing
+   thread_limits.sh must be sourced with a thread count, e.g. . ./thread_limits.sh 2
+```
+
+`.env.example` documents `CHITRA_ML_THREADS` and the override rule.
+
+**Task 6.3 — does ONNX Runtime honour `OMP_NUM_THREADS`? Answer: NO.**
+Three independent lines of evidence.
+
+*(a) Static — the wheel is not OpenMP-linked.* `onnxruntime==1.19.0`:
+
+```
+libonnxruntime.so.1.19.0                     (no OpenMP library linked)
+libonnxruntime_providers_shared.so           (no OpenMP library linked)
+onnxruntime_pybind11_state...so              (no OpenMP library linked)
+```
+
+`ldd | grep -iE 'omp|gomp'` matches nothing in any of the three. Confirms the
+plan's suspicion: there is no OpenMP runtime for `OMP_NUM_THREADS` to steer.
+
+*(b) Dynamic — one isolated session, thread count is invariant under
+`OMP_NUM_THREADS`.* Loading `buffalo_l/det_10g.onnx` on 6 cores:
+
+| SessionOptions | OMP_NUM_THREADS | threads added by the session |
+|---|---|---|
+| default (`intra_op=0`) | unset | **+5** |
+| default (`intra_op=0`) | 1 | **+5** |
+| default (`intra_op=0`) | 2 | **+5** |
+| `intra_op_num_threads=2` | unset | **+1** |
+| `intra_op_num_threads=1` | unset | **+0** |
+
+`+5` extra plus the calling thread = 6 = core count, unchanged whatever
+`OMP_NUM_THREADS` says. `SessionOptions().intra_op_num_threads` reads `0`
+("ORT decides"). `intra_op_num_threads` moves it; the env var does not.
+
+*(c) Full pipeline.* `FaceAnalysis(name="buffalo_l")` opens 5 ONNX sessions, so
+the effect multiplies — measured peak OS thread count during a real detection:
+
+```
+OMP_NUM_THREADS=<unset>  after_prepare=36  peak=37
+OMP_NUM_THREADS=2        after_prepare=28  peak=29
+OMP_NUM_THREADS=3        after_prepare=30  peak=31
+OMP_NUM_THREADS=1        after_prepare=26  peak=27
+```
+
+The variation tracks *numpy's* OpenBLAS pool (which does obey the var — thread
+count before the insightface import was 6/2/3/1 respectively). Subtracting it,
+ORT contributes a flat ~25-30 threads in every case.
+
+*Remediation is feasible.* `insightface.app.FaceAnalysis` passes `**kwargs`
+to `model_zoo.get_model`, which forwards only `providers` and
+`provider_options` — there is **no `sess_options` parameter anywhere in the
+chain**, exactly as the plan suspected. Wrapping `ort.InferenceSession` to
+inject `SessionOptions` before constructing `FaceAnalysis` does work:
+
+| cap | threads added by buffalo_l (5 sessions) |
+|---|---|
+| none | **+30** |
+| `intra_op_num_threads=3` | **+12** |
+| `intra_op_num_threads=2` | **+6** |
+
+Perfectly reproducible across three runs. Follow-up task added below.
+
+**Caveat on latency, stated explicitly:** a concurrent agent was running real
+video transcodes throughout (load average 4.2-6.2), so the *per-detect
+milliseconds* in these runs swing widely (uncapped 225-432 ms, cap=3 106-267 ms)
+and are **not** a claim. The thread *counts* above are exact and load-independent,
+and they are what the conclusion rests on.
+
+**Task 6.4 — CLIP embed thread curve.** Median of 15 runs after 3 warm-ups, two
+full passes, per-thread-count subprocess with both `OMP_NUM_THREADS` and
+`torch.set_num_threads`:
+
+| threads | image embed (pass 1) | image embed (pass 2) | text embed (p1/p2) |
+|---|---|---|---|
+| 1 | 133.9 ms | 133.8 ms | 21.9 / 22.0 ms |
+| 2 | 87.5 ms | 85.9 ms | 15.2 / 15.0 ms |
+| **3** | **78.8 ms** | **77.4 ms** | **13.3 / 13.3 ms** |
+| 4 | 165.6 ms | 159.7 ms | 42.3 / 40.4 ms |
+| 6 (default) | 157.5 ms | 150.8 ms | 20.5 / 21.9 ms |
+
+**3 threads is the optimum and the curve is sharply non-monotonic** — 4 and 6
+threads are roughly 2x *worse* than 3, not merely flat. This reproduces the
+plan's headline pair (measured 6-thread 151-157 ms vs the plan's 153 ms;
+3-thread 77-79 ms vs the plan's 68 ms, the gap explained by the concurrent
+transcode load). Unlike Task 6.3's latencies these numbers are stable to ~2%
+across passes, because each is a median of 15.
+
+`CHITRA_ML_THREADS=3` is therefore evidence-backed, and the text-embed figure at
+3 threads (13.3 ms) matches the 12.7 ms the plan assumes for the search path.
+
+Suite after Phase 6:
+
+```
+Ran 93 tests in 5.727s
+FAILED (failures=9, errors=4, skipped=2)
+```
+
+7 pre-existing `test_endpoints` auth failures + 2 intentionally-red guard
+assertions + 4 pre-existing errors. All 9 new thread-limit tests pass.
+
+## Follow-up added by Task 6.3
+
+**Cap InsightFace's ONNX Runtime threads explicitly.** `OMP_NUM_THREADS` is
+proven inert for ORT, so `thread_limits.sh` does *not* constrain face jobs:
+`buffalo_l` still opens 5 sessions x 6 threads = ~30 threads on a 6-core box,
+which is a prime suspect for the workers' 81% CPU throttling. `FaceAnalysis`
+exposes no `SessionOptions`, so the fix is to wrap `ort.InferenceSession` in
+`core/face.py:_lazy_init_insightface` before constructing `FaceAnalysis`,
+setting `intra_op_num_threads` from `CHITRA_ML_THREADS` and
+`inter_op_num_threads=1`. Measured to reduce the pool from +30 to +12 threads at
+a cap of 3. Needs its own latency measurement on an **idle** box before landing.

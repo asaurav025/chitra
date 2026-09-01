@@ -17,6 +17,12 @@ if [ -f .env.production ]; then
     set -a; . ./.env.production; set +a
 fi
 
+# Cap BLAS/OpenMP threads. Sourced *after* .env.production so anything set
+# there (or a systemd Environment=) wins. 3 is the measured sweet spot for CLIP
+# on this 6-core box: 68 ms/embed vs 153 ms at the 6-thread default. Tune with
+# CHITRA_ML_THREADS.
+. ./thread_limits.sh "${CHITRA_ML_THREADS:-3}"
+
 # Number of workers
 WORKER_COUNT="${WORKER_COUNT:-4}"
 
