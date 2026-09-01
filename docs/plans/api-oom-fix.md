@@ -483,3 +483,97 @@ CLIP — an emergency escape hatch, not a configuration option.
 ## Evidence
 
 _(Appended by the executing agent as tasks complete.)_
+
+### Phase 0 — Baseline
+
+**Task 0.1 — pre-change baseline, 2026-09-01T16:54:25+05:30.**
+
+Suite (`CHITRA_DB_PATH=/tmp/chitra_test.db .venv/bin/python tests/run_tests.py`):
+
+```
+Ran 81 tests in 3.127s
+FAILED (failures=7, errors=4, skipped=2)
+```
+
+Note: 81 tests, not the 66 recorded in `AGENTS.md` — 15 passing tests were added
+by concurrent work since the plan was written. Failures and errors are unchanged
+at 7/4, so the baseline that matters is intact.
+
+Import probe (fresh interpreter, `cwd=repo root`, `ru_maxrss`):
+
+```
+target=app_fastapi baseline_MB=9 after_import_MB=557 delta_MB=548
+heavy modules resident: ['torch', 'transformers', 'faiss', 'rawpy']
+
+target=core.jobs   baseline_MB=9 after_import_MB=519 delta_MB=509
+heavy modules resident: ['torch', 'transformers', 'rawpy']
+```
+
+Reproduces the plan's measured `after_import_MB=557` exactly. `core.jobs` alone
+accounts for 519 of those 557 MB.
+
+`chitra-api.service` cgroup (service restarted since the last kill):
+
+```
+memory.current  1,349,849,088  (1,287 MiB)
+memory.peak     1,352,994,816  (1,290 MiB)
+memory.events   low 0  high 0  max 0  oom 0  oom_kill 0  oom_group_kill 0
+cpu.stat        nr_periods 30696  nr_throttled 135  throttled_usec 6,875,617   (0.4% throttled)
+```
+
+`chitra-workers.service` cgroup:
+
+```
+memory.current    135,684,096  (129 MiB — idle between jobs)
+memory.peak     3,471,708,160  (3,311 MiB)
+memory.events   all zero
+cpu.stat        nr_periods 10853  nr_throttled 8762  throttled_usec 1,089,240,159   (80.7% throttled)
+```
+
+Worker CPU throttling confirmed at 80.7% of periods, matching the plan's 81%.
+
+**Task 0.2 — memory-budget guard test added and watched fail.**
+
+New `tests/test_api_memory_budget.py`. The probe runs in a fresh subprocess via
+`subprocess.run([sys.executable, "-c", ...])` with `cwd` at the repo root and
+`CHITRA_DB_PATH` forced to a scratch path. This is load-bearing: `run_tests.py`
+discovers every module into one interpreter, where `test_background_jobs`
+imports `core.jobs` and `test_search` constructs a real `ClipEmbedder`, so an
+in-process `sys.modules` assertion would be pre-polluted and silently useless.
+
+Two guard classes: `TestApiImportIsMLFree` (`app_fastapi`, plus the < 200 MB RSS
+budget) and `TestJobsImportIsMLFree` (`core.jobs`) — the latter is the red test
+for Task 1.1, whose done-check is exactly this assertion.
+
+Red, for the right reasons:
+
+```
+FAIL: test_no_heavy_ml_modules_resident (TestApiImportIsMLFree)
+AssertionError: Lists differ: [] != ['torch', 'transformers']
+ : importing app_fastapi loaded ['torch', 'transformers'] — each uvicorn worker
+   pays this with no model loaded
+
+FAIL: test_import_rss_within_budget (TestApiImportIsMLFree)
+AssertionError: 556.73828125 not less than 200 : import of app_fastapi resident
+   at 557 MB, budget is 200 MB (x4 uvicorn workers)
+
+FAIL: test_no_heavy_ml_modules_resident (TestJobsImportIsMLFree)
+AssertionError: Lists differ: [] != ['torch', 'transformers']
+ : importing core.jobs loaded ['torch', 'transformers'] — the API imports this
+   module only to enqueue by reference
+```
+
+`rss_mb=557` and `heavy=['torch','transformers']` are exactly the predicted
+done-when values.
+
+Suite after Task 0.2:
+
+```
+Ran 84 tests in 7.456s
+FAILED (failures=10, errors=4, skipped=2)
+```
+
+**Divergence from the plan:** the plan predicted "errors go 4 -> 5". In fact the
+guard lands as **3 failures, not 1 error** (7 -> 10 failures; errors unchanged at
+4), because the probe subprocess succeeds and it is the assertions that fail —
+an error would mean the probe itself crashed. Intended and temporary.
