@@ -847,3 +847,79 @@ exposes no `SessionOptions`, so the fix is to wrap `ort.InferenceSession` in
 setting `intra_op_num_threads` from `CHITRA_ML_THREADS` and
 `inter_op_num_threads=1`. Measured to reduce the pool from +30 to +12 threads at
 a cap of 3. Needs its own latency measurement on an **idle** box before landing.
+
+### Phase 6 — independent re-measurement on an idle box
+
+The 6.3/6.4 numbers above were taken while a concurrent agent ran video
+transcodes (load 4.2-6.2), so their latency figures were explicitly withheld as
+non-claims. Re-run 2026-09-01T17:32-17:43 with load average 0.4-1.3 and no
+ffmpeg on the box, in fresh subprocesses.
+
+**6.3(a) — static linkage, reproduced.** `ldd | grep -iE 'omp|gomp'` matches
+nothing in `libonnxruntime.so.1.19.0`, `libonnxruntime_providers_shared.so`, or
+`onnxruntime_pybind11_state...so`. No OpenMP runtime exists for
+`OMP_NUM_THREADS` to steer.
+
+**6.3(b) — one session, reproduced exactly.** `det_10g.onnx`, threads counted
+from `/proc/self/task` before and after `InferenceSession(...)`:
+
+```
+OMP_NUM_THREADS=<unset>  intra_op=default(0)  threads  6 -> 11  (+5)
+OMP_NUM_THREADS=      1  intra_op=default(0)  threads  1 ->  6  (+5)
+OMP_NUM_THREADS=      2  intra_op=default(0)  threads  2 ->  7  (+5)
+OMP_NUM_THREADS=      3  intra_op=default(0)  threads  3 ->  8  (+5)
+OMP_NUM_THREADS=<unset>  intra_op=         1  threads  6 ->  6  (+0)
+OMP_NUM_THREADS=<unset>  intra_op=         2  threads  6 ->  7  (+1)
+OMP_NUM_THREADS=<unset>  intra_op=         3  threads  6 ->  8  (+2)
+```
+
+`+5` — the calling thread plus five, i.e. core count — whatever the env var
+says. The *pre*-session count (6/1/2/3) is numpy's OpenBLAS pool, which does
+obey the var; that is the only thing `OMP_NUM_THREADS` moves here.
+`intra_op_num_threads` moves the ORT pool exactly.
+
+**6.3(c) — full `FaceAnalysis` pipeline, now with latency.** `buffalo_l`,
+`ctx_id=-1`, `det_size=(640,640)`, median of 5 detects after 3 warm-ups on a
+1080x1440 image:
+
+| config | threads added by ORT | detect median |
+|---|---|---|
+| uncapped, `OMP_NUM_THREADS` unset | **+25** | 242 / 249 / 250 / 269 ms |
+| uncapped, `OMP_NUM_THREADS=1` | **+25** | 260 ms |
+| uncapped, `OMP_NUM_THREADS=2` | **+25** | 258 ms |
+| uncapped, `OMP_NUM_THREADS=3` | **+25** | 260 ms |
+| `intra_op_num_threads=1` | +0 | 252 ms |
+| `intra_op_num_threads=2` | +5 | 142 / 145 ms |
+| **`intra_op_num_threads=3`** | **+10** | **102 / 104 / 157 ms** |
+| `intra_op_num_threads=4` | +15 | 302 ms |
+
+**`OMP_NUM_THREADS` changes neither ORT's thread count nor its latency — the
+answer to Task 6.3 is a clean NO, now with the latency half the loaded run had
+to withhold.** And the follow-up is worth more than the plan assumed: capping
+`intra_op_num_threads=3` is not merely a thread-count reduction (+25 -> +10),
+it is **~2.4x faster per detection** (249 -> 104 ms). The curve is the same
+sharply non-monotonic shape as CLIP's: 3 optimal, 4 worse than 1.
+
+**6.4 — CLIP thread curve, idle box.** Median of 15 runs after 3 warm-ups, per
+thread-count subprocess with both `OMP_NUM_THREADS` and `torch.set_num_threads`,
+on a 1200x1600 JPEG:
+
+| threads | image (p1) | image (p2) | text (p1) | text (p2) |
+|---|---|---|---|---|
+| 1 | 164.4 ms | 165.2 ms | 21.6 ms | 21.8 ms |
+| 2 | 120.0 ms | 119.4 ms | 14.9 ms | 14.6 ms |
+| **3** | **112.7 ms** | **112.9 ms** | **13.0 ms** | **13.0 ms** |
+| 4 | 187.1 ms | 201.5 ms | 12.3 ms | 12.4 ms |
+| 6 (default) | 220.4 ms | 194.2 ms | 12.8 ms | 12.3 ms |
+
+Reproducible to under 1% between passes. Absolute milliseconds differ from the
+loaded run above (different bench image), but **the shape is identical and the
+conclusion is unchanged: 3 threads is the optimum for image embedding, and 4
+and 6 are ~1.7x worse, not merely flat.**
+
+One refinement the loaded run could not see: **the text curve is flat from 3
+threads up** (13.0 / 12.3 / 12.8 ms at 3 / 4 / 6). The sidecar's search path is
+text-only, so it gains nothing above 3 — `CHITRA_ML_THREADS=3` costs the search
+path 0.7 ms against the best-ever number while keeping image embedding at its
+optimum. The 13.0 ms text figure also matches the 12.7 ms the plan assumes for
+search.
