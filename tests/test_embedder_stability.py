@@ -261,5 +261,73 @@ def _regenerate() -> None:
     print(")")
 
 
+
+class TestPreprocessingIsPinnedNotInherited(unittest.TestCase):
+    """`ClipEmbedder` must *choose* the slow image processor, not inherit it.
+
+    Measured on transformers 4.57.6 with the reference image above:
+
+        use_fast=False (and today's default) -> max|delta| 1.27e-07
+        use_fast=True                        -> max|delta| 1.08e-03
+
+    That is 10.8x the 1e-4 tolerance and ~8,500x the numeric floor. The upgrade
+    from 4.35.0 is safe today *only* because `openai/clip-vit-base-patch32`
+    ships a slow processor config, so `from_pretrained` keeps returning the slow
+    class and warns that it will stop. Nothing about that is a guarantee — it is
+    a default that transformers has already announced it intends to flip, and
+    when it does, every new embedding silently diverges from the ~1,800 stored
+    ones with no error and no version number to blame.
+
+    So the choice is written down. `use_fast=False` has been accepted since at
+    least 4.35.0, so pinning it costs nothing on either side of the bump.
+
+    Adopting the fast processor later is a **re-embed decision**, not a
+    performance tweak: it would need every stored vector recomputed in the same
+    pass, which is Phase 6 and the owner's call.
+    """
+
+    def test_embedder_passes_use_fast_explicitly(self):
+        import core.embedder as embedder_mod
+
+        captured = {}
+        real = embedder_mod.CLIPProcessor.from_pretrained
+
+        class _Spy:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                captured.update(kwargs)
+                return real(*args, **kwargs)
+
+        original = embedder_mod.CLIPProcessor
+        embedder_mod.CLIPProcessor = _Spy
+        try:
+            embedder_mod.ClipEmbedder(MODEL_NAME)
+        finally:
+            embedder_mod.CLIPProcessor = original
+
+        self.assertIn(
+            "use_fast",
+            captured,
+            "ClipEmbedder relies on transformers' default image processor. That "
+            "default is documented as changing, and the fast processor moves the "
+            "vector by 1.08e-03 — 10x the stability tolerance. Pass use_fast "
+            "explicitly so the corpus stays reproducible across versions.",
+        )
+        self.assertIs(captured["use_fast"], False)
+
+    @unittest.skipUnless(
+        LOAD_MODELS, "set CHITRA_TEST_LOAD_MODELS=1 to load CLIP (~1.7 GB, ~10 s)"
+    )
+    def test_resolved_processor_is_the_slow_one(self):
+        from core.embedder import ClipEmbedder
+
+        name = type(ClipEmbedder(MODEL_NAME).processor.image_processor).__name__
+        self.assertFalse(
+            name.endswith("Fast"),
+            f"image processor resolved to {name}; the stored corpus was built "
+            "with the slow one",
+        )
+
+
 if __name__ == "__main__":
     _regenerate()
