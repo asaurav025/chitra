@@ -82,8 +82,9 @@ is whether *your* change added a failure.
 
 ## Git
 
-Active development happens on **`flask`**, not `master` (origin's HEAD is
-`master`, but every recent commit lands on `flask`). Branch from `flask`.
+`main` is the only branch and the default. It was renamed from `flask` on
+2026-09-01; the stale `master` pointer (27 commits behind, fully contained in
+`main`) was deleted at the same time. Branch from `main`.
 
 ## Safety
 
