@@ -820,6 +820,7 @@ async def get_photo(
 @app.delete("/api/photos/{photo_id}")
 async def delete_photo(
     photo_id: int,
+    current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async),
     storage: MinIOStorageClient = Depends(get_storage_client)
 ):
