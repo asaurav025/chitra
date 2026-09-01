@@ -2760,6 +2760,19 @@ async def stream_photo_video(
     return StreamingResponse(_stream(0, size), status_code=200, media_type="video/mp4", headers=headers)
 
 
+# -----------------------------------------------------------------------------
+# ROUTERS
+# -----------------------------------------------------------------------------
+# Tags, tag search, similar photos and duplicates. New endpoint groups go in a
+# router rather than growing this file (.claude/rules/http-layer.md). The
+# router takes this module's DI callables as arguments instead of importing
+# them, which keeps the import one-directional and keeps
+# `dependency_overrides[get_db_async]` matching by identity in tests. Imported
+# here, at the bottom, because the callables it needs are defined above.
+from core.routes_discovery import build_router as _build_discovery_router  # noqa: E402
+app.include_router(_build_discovery_router(current_user_dep=get_current_active_user, db_dep=get_db_async, photo_dto=row_to_photo_dto))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
