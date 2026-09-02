@@ -8,9 +8,10 @@ It is now split in two:
   file, no socket. That is what lets the whole library be re-tagged from the
   blobs already in `embeddings.vector` without reading one byte off the disk
   that holds the originals (`scripts/retag.py`).
-* `auto_tags` — the original signature, kept because `cli/main.py:174` and
-  `core/jobs.py:371`/`:509` call it. It still needs a model, because it starts
-  from an image path.
+* `auto_tags` — the original signature, kept because `cli/main.py:174` still
+  calls it. It needs a model, because it starts from an image path. The RQ
+  jobs no longer do: `core/jobs._embed_and_tag` scores labels against the
+  vector it already has, which is one forward pass rather than two.
 
 `from core.embedder import ClipEmbedder` used to sit at module scope here, for
 one type annotation. It pulled torch — 1.1 GB and several seconds — into every

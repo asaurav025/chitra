@@ -82,6 +82,21 @@ silently lose everything not yet re-embedded.
 `build_embedder` raises on an unknown identifier rather than falling back to
 CLIP, which would write 512-d rows under a `model` name claiming otherwise.
 
+**A row names the model that computed it, and the only thing that knows that is
+the sidecar.** `core/jobs._embed_and_tag` calls
+`SyncEmbeddingClient.served_model()` — a `/health` read — and stamps the answer
+into `embeddings.model` and, via `vocabulary.tag_source`, into `tags.source`.
+Do not substitute `CHITRA_EMBED_MODEL`: that describes *this* worker's
+environment and says nothing about the separate process that holds the weights.
+Do not give it a default either. `db.put_embedding` falls back to
+`DEFAULT_EMBED_MODEL`, so a guess does not fail — it writes the wrong name, and
+that is exactly what happened: after the 11:48 SigLIP restart the first upload
+(photo 2775) stored a **768-d SigLIP vector under `openai/clip-vit-base-patch32`**
+with no row at all under the name `CHITRA_ACTIVE_EMBED_MODEL` filters to. The
+photo was invisible to search, and a rollback to CLIP would have taken
+`search_photos` down on `np.stack`. `cli/main.py` is the exception and is
+correct: it constructs `ClipEmbedder()` itself, so the default name is true.
+
 **SigLIP 2 fits, in full fp32 with the text tower** — measured, see
 `docs/plans/siglip2-footprint.md`. With buffalo_l co-resident it peaks at
 2,137 MB against 2,018 MB for the CLIP it replaces (+119 MB). **Do not build a
@@ -108,6 +123,24 @@ no padding" — that message is **wrong** and `SiglipEmbedder` passes
 **Everything is CPU.** `torch.cuda.is_available()` is False on this box and
 `onnxruntime` is the CPU build. The pinned `nvidia-*` wheels are dead weight.
 Never add a model or code path that assumes a GPU.
+
+**Post-upload clustering fires on `depends_on`, and it can only ever *match*,
+never *discover*.** `_enqueue_cluster_after_faces` gates the pass on that
+batch's own face-detection jobs (verified end-to-end on 2026-09-02: photo 2775's
+face job finished at 06:38:55.398Z and the dependent cluster job was enqueued at
+06:38:55.403Z, ran, and returned). But it sees one upload batch, so Phase 2's
+HDBSCAN has a handful of faces at most and a stranger who appears once per batch
+never accumulates into a person. **A catch-up pass over everything is not the
+answer, and measurably makes none**: a dry run over all 1,879 unassigned faces
+on a DB copy assigned 28 (all Phase 1 matches to existing persons), created
+**zero** new persons, and left 1,851 as noise — `min_cluster_size` scales with
+`n` (`max(2, n//100)` = 18) and `cluster_selection_epsilon` is
+`sqrt(2*(1-0.6))` = 0.894, so with `allow_single_cluster=True` the whole corpus
+condenses to one cluster averaging 0.144 similarity, which the acceptance gate
+then correctly rejects. Those faces are not noise: 1,096 of 1,879 (58.3%) have a
+nearest neighbour *among the other unassigned faces* at cosine >= 0.6. The
+parameters need to stop being a function of batch size before any bulk
+re-cluster is worth running.
 
 **Face matching thresholds are inconsistent and that is a known bug**: 0.75 in
 `_auto_match_face_to_person`, 0.6 from the upload path and `recluster_all.py`,
@@ -215,14 +248,42 @@ know before touching any of it:
   81.4%, and it is also why a library that genuinely is 30% portraits will have
   portraits it does not tag. A tag means "unusually beach-like *for this
   library*", not "depicts a beach".
-* **It needs the whole corpus at once**, which a per-photo RQ job does not have.
-  `auto_tags` is therefore still the uncalibrated legacy-17 top-k path;
-  `scripts/retag.py` is what gives a photo its real tags. Do not try to
-  calibrate inside a job.
-* **This is a workaround, not a fix.** SigLIP's sigmoid loss trains each
-  image-text pair independently, so its scores are absolute and a fixed
-  threshold finally means something. Plan 3's calibration is what Phase 6.6
-  deletes. Do not describe it as more than it is.
+* **Calibrating needs the whole corpus at once, which a per-photo RQ job does
+  not have — so the job consumes a calibration rather than computing one.**
+  `scripts/retag.py --apply` persists what it learned to
+  `models/tag_calibration_{model}_{fingerprint}.json`, beside the label matrix
+  and under the same key, and `core/jobs._embed_and_tag` loads the pair for
+  whatever model the sidecar reports. Both present and matching -> calibrated
+  345-label tags stamped `vocab-v2`; either absent -> the legacy 17 stamped
+  `vocab-v1`. **Never compute either artifact inside a job**: embedding the 345
+  prompts takes 29.8 s against the SigLIP sidecar, in a work-horse that lives
+  for one photo. And never fall back to *top-k over the 345* — measured on the
+  2,721 stored SigLIP vectors that puts `diwali celebration` on 22.6% of the
+  library and hands every photo exactly six tags, which is the failure the
+  calibration exists to remove.
+* **Staleness is handled by the filename, not by a timestamp.** The model slug
+  and the vocabulary fingerprint are *in* the path, so a model cutover or a
+  label change makes both artifacts absent and the job falls back — it can
+  never apply CLIP percentiles to SigLIP scores. A file that exists under a
+  name it does not describe is corruption, not staleness, and raises
+  `CacheMismatch`. The one drift the key cannot catch is a growing library, so
+  the artifact records `n_photos` and `written_at` for the operator to judge
+  with. `CHITRA_TAG_CACHE_DIR` overrides the directory; the default is absolute
+  and repo-relative, because a CWD-relative `models/` is the trap
+  `faiss_indexes/` already sprang, only quieter — the job would find nothing
+  and tag from the legacy 17 forever with nothing in the logs.
+* **SigLIP does not delete this, and the plan's Phase 6.6 was wrong to assume
+  it would.** The sigmoid objective does make a score absolute:
+  `google/siglip2-base-patch16-224` ships `logit_scale` 4.7244534 and
+  `logit_bias` -16.771725, so `p = sigmoid(112.7 * cos - 16.77)`. The
+  arithmetic is real; the operating point is not. Measured over all 2,721
+  stored SigLIP vectors x 345 labels: the principled `p >= 0.5` cut tags **28
+  photos**, `p >= 0.05` still leaves 1,838 of 2,721 (68%) with nothing, and the
+  median `p` over the whole grid is 4e-6. Per-label corpus-relative calibration
+  stays. Note the sidecar returns bare L2-normalised cosines and exposes
+  neither scalar, so `p` is not even reachable through the pipeline today —
+  reading them out of the checkpoint (`safetensors`, keys `logit_scale` and
+  `logit_bias`) is how the numbers above were obtained.
 
 **Re-tagging reads zero media, and that must stay true.** A tag score is
 `cosine(image_vec, text_vec)` and `embeddings.vector` already holds the
