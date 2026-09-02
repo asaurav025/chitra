@@ -42,18 +42,41 @@ by `100 - low_percentile` (with the defaults, no label can reach more than ~10%
 of the corpus, which is precisely what stops another `travel` at 81%), and a
 library that genuinely is 30% portraits will have portraits it does not tag.
 Scores remain incomparable across images; nothing here makes them comparable.
-SigLIP's sigmoid loss is what actually fixes this — it trains each
-image-text pair independently, so its scores *are* absolute and a fixed
-threshold finally means something. Until that lands, this is the best available
-and it should not be described as more.
+
+SigLIP does not delete this, which is what the plan assumed
+-----------------------------------------------------------
+The sigmoid objective trains each image-text pair independently, so a SigLIP
+score really is absolute — `p = sigmoid(exp(logit_scale) * cos + logit_bias)`,
+and `google/siglip2-base-patch16-224` ships `logit_scale` 4.7244534 and
+`logit_bias` -16.771725, i.e. `p = sigmoid(112.7 * cos - 16.77)`. The arithmetic
+is real. The operating point is not: measured over all 2,721 stored SigLIP
+vectors x 345 labels, the principled `p >= 0.5` cut tags **28 photos**, and even
+`p >= 0.05` leaves 1,838 of 2,721 (68%) with nothing at all. Median `p` over the
+whole grid is 4e-6.
+
+Plain top-k over the 345 is better under SigLIP than it was under CLIP —
+`diwali celebration` on 22.6% of the library rather than `travel` on 81.4% —
+but it still hands every photo exactly six tags whether or not it resembles
+anything. The same matrix run through `calibrate` gives 4.72 tags per photo
+(0 to 8), uses all 345 labels, and tops out at 3.8% coverage for any one label.
+
+So per-label corpus-relative calibration stays, under SigLIP as under CLIP.
+What changed is who can use it: the thresholds are now persisted by
+`scripts/retag.py` and read back by `core/jobs.py`, so a per-photo job gets
+them without having a corpus of its own. See "THE CACHE ON DISK" below.
 """
 from __future__ import annotations
 
+import json
+import os
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from core import vocabulary
 from core.vocabulary import LEGACY_LABELS
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
@@ -243,3 +266,205 @@ def auto_tags(
     `scripts/retag.py` is what gives a photo its real tags.
     """
     return embedder.rank_labels(image_path, DEFAULT_LABELS, top_k=k)
+
+
+# ----------------------------------------------------------------------
+# THE CACHE ON DISK
+# ----------------------------------------------------------------------
+# `scripts/retag.py` produces both artifacts a per-photo job would need but
+# cannot compute — the label matrix and the corpus calibration — so they live
+# here, in `core`, where the RQ jobs can read them without importing a script.
+#
+# **Both are keyed on `(model, vocabulary fingerprint)` and that key is in the
+# filename.** A model change or a label change therefore moves the path, so a
+# consumer sees *absence* and can fall back. A file that exists under a name it
+# does not describe is corruption rather than staleness, and raises: a
+# mismatched cache is the worst outcome available here — right shape, clean
+# run, every tag silently wrong.
+
+#: Overrides where the artifacts live. Defaults to `models/` beside this
+#: package rather than the relative `"models"` it grew up as: `faiss_indexes/`
+#: already taught this lesson, where a relative path resolved against the
+#: process CWD silently created a second empty directory and matching stopped
+#: working with no error. Here the same mistake would be quieter still — the
+#: job would simply never find a calibration and tag from the legacy 17
+#: forever.
+CACHE_DIR_ENV = "CHITRA_TAG_CACHE_DIR"
+DEFAULT_CACHE_DIR = Path(__file__).resolve().parent.parent / "models"
+
+
+class CacheMismatch(RuntimeError):
+    """A cached artifact does not describe the run being asked for.
+
+    Loading it anyway is the worst available outcome: the numbers are the right
+    shape, the run completes, and every tag is silently wrong.
+    """
+
+
+def resolve_cache_dir(cache_dir: Optional[object] = None) -> Path:
+    """Precedence: explicit argument, then `CHITRA_TAG_CACHE_DIR`, then the
+    repo-relative default. Never the process CWD."""
+    if cache_dir is None:
+        cache_dir = os.environ.get(CACHE_DIR_ENV) or DEFAULT_CACHE_DIR
+    return Path(cache_dir).expanduser()
+
+
+def label_matrix_path(cache_dir, model: str, fingerprint: str) -> Path:
+    """`models/tag_vectors_{model}_{fingerprint}.npy` — on the NVMe, not MinIO.
+
+    Both halves of the name are load-bearing. The model decides what the
+    vectors mean; the fingerprint covers the labels, their order, the
+    vocabulary version and the prompt template.
+    """
+    return resolve_cache_dir(cache_dir) / (
+        f"tag_vectors_{vocabulary.model_slug(model)}_{fingerprint}.npy")
+
+
+def calibration_path(cache_dir, model: str, fingerprint: str) -> Path:
+    """`models/tag_calibration_{model}_{fingerprint}.json`, beside the matrix.
+
+    Same key for the same reason. The thresholds are **raw cosines**, so they
+    are only meaningful next to the matrix and model they were measured with —
+    a CLIP-derived percentile applied to a SigLIP score is not approximately
+    right, it is arithmetic on two different spaces.
+    """
+    return resolve_cache_dir(cache_dir) / (
+        f"tag_calibration_{vocabulary.model_slug(model)}_{fingerprint}.json")
+
+
+def save_cached_matrix(path, matrix: np.ndarray, *, model: str,
+                       fingerprint: str, labels: Sequence[str],
+                       template: Optional[str] = None,
+                       version: Optional[str] = None) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, np.asarray(matrix, dtype="float32"))
+    path.with_suffix(".json").write_text(json.dumps({
+        "model": model,
+        "fingerprint": fingerprint,
+        "labels": list(labels),
+        "template": template or vocabulary.PROMPT_TEMPLATE,
+        "version": version or vocabulary.VOCAB_VERSION,
+        "dim": int(np.asarray(matrix).shape[1]),
+        "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }, indent=2))
+
+
+def load_cached_matrix(path, *, model: str, fingerprint: str,
+                       labels: Sequence[str]) -> Optional[np.ndarray]:
+    """Return the cached matrix, `None` if absent, raise on any mismatch.
+
+    Absent is normal. Mismatched is not — it means a file on disk claims to
+    describe this run and does not, and the only safe response is to stop.
+    """
+    path = Path(path)
+    meta_path = path.with_suffix(".json")
+    if not path.exists():
+        return None
+    if not meta_path.exists():
+        raise CacheMismatch(f"{path} has no metadata sidecar at {meta_path}")
+
+    meta = json.loads(meta_path.read_text())
+    _check_meta(path, meta, model=model, fingerprint=fingerprint, labels=labels)
+
+    matrix = np.load(path)
+    if matrix.ndim != 2 or matrix.shape[0] != len(labels):
+        raise CacheMismatch(
+            f"{path} holds {matrix.shape} vectors for {len(labels)} labels")
+    return matrix.astype("float32")
+
+
+def save_calibration(path, calibration: LabelCalibration, *, model: str,
+                     fingerprint: str) -> None:
+    """Write the thresholds a bulk pass learned, for a per-photo job to reuse.
+
+    `n_photos` and `written_at` go in because this artifact *does* go stale in
+    a way the key cannot catch: the percentiles were measured over a library of
+    a given size and drift as it grows. That drift is gradual and one-directional,
+    not a correctness cliff — but the operator deciding when to re-run
+    `scripts/retag.py` needs the number to decide with.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "model": model,
+        "fingerprint": fingerprint,
+        "labels": list(calibration.labels),
+        "low": [float(x) for x in calibration.low],
+        "high": [float(x) for x in calibration.high],
+        "low_percentile": float(calibration.low_percentile),
+        "high_percentile": float(calibration.high_percentile),
+        "n_photos": int(calibration.n_photos),
+        "version": vocabulary.VOCAB_VERSION,
+        "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }, indent=2))
+
+
+def load_calibration(path, *, model: str, fingerprint: str,
+                     labels: Sequence[str]) -> Optional[LabelCalibration]:
+    """Return the stored calibration, `None` if absent, raise on any mismatch."""
+    path = Path(path)
+    if not path.exists():
+        return None
+
+    meta = json.loads(path.read_text())
+    _check_meta(path, meta, model=model, fingerprint=fingerprint, labels=labels)
+
+    low = np.asarray(meta.get("low"), dtype="float64")
+    high = np.asarray(meta.get("high"), dtype="float64")
+    if low.shape != (len(labels),) or high.shape != (len(labels),):
+        raise CacheMismatch(
+            f"{path} holds {low.shape}/{high.shape} thresholds for "
+            f"{len(labels)} labels")
+    return LabelCalibration(
+        labels=tuple(labels),
+        low=low,
+        high=high,
+        low_percentile=float(meta["low_percentile"]),
+        high_percentile=float(meta["high_percentile"]),
+        n_photos=int(meta.get("n_photos", 0)),
+    )
+
+
+def _check_meta(path, meta: dict, *, model: str, fingerprint: str,
+                labels: Sequence[str]) -> None:
+    if meta.get("model") != model:
+        raise CacheMismatch(
+            f"{path} was built for model {meta.get('model')!r}, not {model!r}")
+    if meta.get("fingerprint") != fingerprint:
+        raise CacheMismatch(
+            f"{path} has fingerprint {meta.get('fingerprint')!r}, not {fingerprint!r}")
+    if list(meta.get("labels") or []) != list(labels):
+        raise CacheMismatch(f"{path} was built for a different label list")
+
+
+def load_corpus_calibration(model: str, *, cache_dir=None,
+                            labels: Optional[Sequence[str]] = None):
+    """The pair a per-photo tagger needs, or `None` if it is not on disk.
+
+    Returns `(labels, label_matrix, calibration)`. **Both** artifacts are
+    required: a calibration without its matrix cannot be applied, and the
+    matrix without a calibration is plain top-k — the "always exactly 6 tags,
+    one label on a fifth of the library" behaviour the calibration exists to
+    remove. Half of the pair is therefore not a partial success, it is a miss.
+
+    This never computes anything. Embedding the 345 prompts costs ~30 s
+    (measured against the SigLIP sidecar), which is not a thing to do inside a
+    forked work-horse that lives for one photo. `scripts/retag.py` is the
+    producer; this is only ever the consumer.
+    """
+    labels = tuple(vocabulary.LABELS if labels is None else labels)
+    fingerprint = vocabulary.vocab_fingerprint(labels=labels)
+    cache_dir = resolve_cache_dir(cache_dir)
+
+    matrix = load_cached_matrix(
+        label_matrix_path(cache_dir, model, fingerprint),
+        model=model, fingerprint=fingerprint, labels=labels)
+    if matrix is None:
+        return None
+    calibration = load_calibration(
+        calibration_path(cache_dir, model, fingerprint),
+        model=model, fingerprint=fingerprint, labels=labels)
+    if calibration is None:
+        return None
+    return labels, matrix, calibration

@@ -23,7 +23,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core import db, vocabulary  # noqa: E402
+from core import db, tagger, vocabulary  # noqa: E402
 from scripts import retag  # noqa: E402
 
 
@@ -262,6 +262,55 @@ class TestLabelMatrixCache(_DbCase):
         m = np.load(Path(self.cache) / stem)
         norms = np.linalg.norm(m, axis=1)
         self.assertTrue(np.allclose(norms, 1.0, atol=1e-5))
+
+
+class TestTheCalibrationIsLeftBehindForTheUploadPath(_DbCase):
+    """A bulk pass is the only thing that *has* a corpus; it must leave the
+    thresholds where the per-photo job can find them.
+
+    Without this the upload path can never do better than the legacy 17: it
+    holds one photo, and there is no corpus in one photo. `core.tagger`
+    keys the artifact on `(model, fingerprint)` exactly like the label matrix
+    beside it, so the job falls back rather than applying CLIP percentiles to
+    SigLIP scores.
+    """
+
+    def _calibration(self):
+        fp = vocabulary.vocab_fingerprint()
+        return tagger.load_calibration(
+            tagger.calibration_path(self.cache, MODEL, fp),
+            model=MODEL, fingerprint=fp, labels=list(vocabulary.LABELS))
+
+    def test_apply_writes_it_beside_the_label_matrix(self):
+        self._run(apply=True)
+
+        cal = self._calibration()
+        self.assertIsNotNone(cal, "no calibration was written")
+        self.assertEqual(len(vocabulary.LABELS), len(cal))
+        self.assertEqual(40, cal.n_photos)
+
+    def test_it_matches_what_the_pass_actually_used(self):
+        result = self._run(apply=True)
+        cal = self._calibration()
+
+        self.assertEqual(result.low_percentile, cal.low_percentile)
+        self.assertEqual(result.high_percentile, cal.high_percentile)
+
+    def test_the_job_can_load_the_pair_straight_back(self):
+        """The whole point: end-to-end, retag produces what the job consumes."""
+        self._run(apply=True)
+
+        loaded = tagger.load_corpus_calibration(MODEL, cache_dir=self.cache)
+        self.assertIsNotNone(loaded)
+        labels, matrix, cal = loaded
+        self.assertEqual(tuple(vocabulary.LABELS), tuple(labels))
+        self.assertEqual((len(vocabulary.LABELS), 32), matrix.shape)
+        self.assertEqual(len(vocabulary.LABELS), len(cal))
+
+    def test_a_dry_run_leaves_no_calibration(self):
+        """It describes thresholds nothing was tagged with."""
+        self._run(apply=False)
+        self.assertIsNone(self._calibration())
 
 
 class TestRetagReadsNoStorage(_DbCase):

@@ -66,8 +66,19 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import db, tagger, vocabulary  # noqa: E402
+# The label-matrix cache moved into `core.tagger` so `core/jobs.py` can read it
+# without importing a script; re-exported here because it is still this
+# script's cache and `retag.load_cached_matrix` is how it is addressed.
+from core.tagger import (  # noqa: E402
+    CacheMismatch,
+    calibration_path,
+    label_matrix_path,
+    load_cached_matrix,
+    save_cached_matrix,
+    save_calibration,
+)
 
-DEFAULT_CACHE_DIR = "models"
+DEFAULT_CACHE_DIR = tagger.DEFAULT_CACHE_DIR
 DEFAULT_EMBED_URL = "http://127.0.0.1:5101"
 DEFAULT_RETRIES = 4
 DEFAULT_BACKOFF = 0.5
@@ -78,14 +89,6 @@ DEFAULT_BACKOFF = 0.5
 # without this delete `travel` would sit on 100% of the library forever and the
 # whole pass would be cosmetic.
 OWNED_SOURCE_LIKE = "%/vocab-%"
-
-
-class CacheMismatch(RuntimeError):
-    """The cached label matrix does not describe the run being asked for.
-
-    Loading it anyway is the worst available outcome: the numbers are the right
-    shape, the run completes, and every tag is silently wrong.
-    """
 
 
 # ----------------------------------------------------------------------
@@ -168,66 +171,6 @@ class SidecarTextEmbedder:
 # ----------------------------------------------------------------------
 # LABEL MATRIX + ITS CACHE
 # ----------------------------------------------------------------------
-def label_matrix_path(cache_dir, model: str, fingerprint: str) -> Path:
-    """`models/tag_vectors_{model}_{fingerprint}.npy` — on the NVMe, not MinIO.
-
-    Both halves of the name are load-bearing. The model decides what the vectors
-    mean; the fingerprint covers the labels, their order, the vocabulary version
-    and the prompt template. A file that matches on neither is a wrong answer
-    with no error.
-    """
-    return Path(cache_dir) / f"tag_vectors_{vocabulary.model_slug(model)}_{fingerprint}.npy"
-
-
-def save_cached_matrix(path: Path, matrix: np.ndarray, *, model: str,
-                       fingerprint: str, labels: Sequence[str],
-                       template: Optional[str] = None,
-                       version: Optional[str] = None) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(path, np.asarray(matrix, dtype="float32"))
-    path.with_suffix(".json").write_text(json.dumps({
-        "model": model,
-        "fingerprint": fingerprint,
-        "labels": list(labels),
-        "template": template or vocabulary.PROMPT_TEMPLATE,
-        "version": version or vocabulary.VOCAB_VERSION,
-        "dim": int(np.asarray(matrix).shape[1]),
-        "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }, indent=2))
-
-
-def load_cached_matrix(path: Path, *, model: str, fingerprint: str,
-                       labels: Sequence[str]) -> Optional[np.ndarray]:
-    """Return the cached matrix, `None` if absent, raise on any mismatch.
-
-    Absent is normal. Mismatched is not — it means a file on disk claims to
-    describe this run and does not, and the only safe response is to stop.
-    """
-    path = Path(path)
-    meta_path = path.with_suffix(".json")
-    if not path.exists():
-        return None
-    if not meta_path.exists():
-        raise CacheMismatch(f"{path} has no metadata sidecar at {meta_path}")
-
-    meta = json.loads(meta_path.read_text())
-    if meta.get("model") != model:
-        raise CacheMismatch(
-            f"{path} was built for model {meta.get('model')!r}, not {model!r}")
-    if meta.get("fingerprint") != fingerprint:
-        raise CacheMismatch(
-            f"{path} has fingerprint {meta.get('fingerprint')!r}, not {fingerprint!r}")
-    if list(meta.get("labels") or []) != list(labels):
-        raise CacheMismatch(f"{path} was built for a different label list")
-
-    matrix = np.load(path)
-    if matrix.ndim != 2 or matrix.shape[0] != len(labels):
-        raise CacheMismatch(
-            f"{path} holds {matrix.shape} vectors for {len(labels)} labels")
-    return matrix.astype("float32")
-
-
 def get_label_matrix(embedder, *, model: str, cache_dir=DEFAULT_CACHE_DIR,
                      labels: Optional[Sequence[str]] = None,
                      refresh: bool = False, verbose: bool = True) -> np.ndarray:
@@ -410,6 +353,17 @@ def retag(
     calibration = tagger.calibrate(scores, labels,
                                    low_percentile=low_percentile,
                                    high_percentile=high_percentile)
+
+    # Leave the thresholds where the per-photo upload job can find them. Only
+    # on an apply: a dry run's calibration describes tags nothing was written
+    # with, and the job would then be scoring against a corpus state the `tags`
+    # table never reflected. Written before the loop so a pass interrupted
+    # part-way still leaves an artifact matching the rows it did write.
+    if apply:
+        save_calibration(
+            calibration_path(cache_dir, model, fingerprint),
+            calibration, model=model, fingerprint=fingerprint,
+        )
 
     selected = range(len(ids)) if not limit else range(min(limit, len(ids)))
     result = RetagResult(

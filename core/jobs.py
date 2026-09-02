@@ -402,11 +402,36 @@ def _get_embed_client():
     return _EMBED_CLIENT
 
 
-#: Tags kept per photo by the embedding job. Unchanged from the `auto_tags(k=6)`
-#: it replaces — Phase 3's calibrated `core.tagger.tag_from_vector` is what
-#: makes this count vary per photo, and it needs a corpus calibration this job
-#: does not have.
+#: Tags kept per photo by the embedding job **on the legacy fallback path**.
+#: A constant tag count is the symptom the calibrated path exists to remove:
+#: every tagged photo in production had exactly 6.0 tags.
 EMBED_JOB_TAG_COUNT = 6
+
+#: `(model, artifacts)` for this work-horse, where `artifacts` is what
+#: `core.tagger.load_corpus_calibration` returned — including `None`, which is
+#: cached too so a miss costs one `stat` per job rather than one per photo in
+#: `index_embeddings_batch_job`. RQ forks per job, so this dies with the child;
+#: that is fine, the artifacts are a ~1 MB read off the NVMe.
+_TAG_CORPUS = None
+
+
+def _tag_corpus(model: str):
+    """The label matrix and calibration for `model`, or None if not on disk.
+
+    Absence is the normal state right after a model cutover: the artifacts are
+    named for the model that produced them, so SigLIP simply has none until
+    `scripts/retag.py` has been run under SigLIP. Falling back to the legacy 17
+    is the honest answer there. Falling back to *top-k over the 345* would not
+    be: measured on the 2,721 stored SigLIP vectors, plain top-6 puts
+    `diwali celebration` on 22.6% of the library and gives every photo exactly
+    six tags, which is the failure the calibration was built to remove.
+    """
+    global _TAG_CORPUS
+    if _TAG_CORPUS is None or _TAG_CORPUS[0] != model:
+        from core.tagger import load_corpus_calibration
+
+        _TAG_CORPUS = (model, load_corpus_calibration(model))
+    return _TAG_CORPUS[1]
 
 
 def _embed_and_tag(conn, photo_id: int, key: str, data: bytes) -> None:
@@ -423,7 +448,7 @@ def _embed_and_tag(conn, photo_id: int, key: str, data: bytes) -> None:
     `core/jobs.py` is imported by `app_fastapi` purely to enqueue jobs by
     reference — see the note at the top of this file.
     """
-    from core.tagger import DEFAULT_LABELS
+    from core.tagger import DEFAULT_LABELS, tag_from_vector
     from core.vocabulary import LEGACY_VERSION, tag_source
 
     client = _get_embed_client()
@@ -433,10 +458,18 @@ def _embed_and_tag(conn, photo_id: int, key: str, data: bytes) -> None:
     vec = np.asarray(client.image_embedding(os.path.basename(key), data), dtype="float32")
     db.put_embedding(conn, photo_id, vec.tobytes(), int(vec.shape[0]), model=model)
 
-    # `DEFAULT_LABELS` is still the legacy 17, so the stamp says v1. Claiming
-    # `vocab-v2` here would be the same class of lie as the model name was.
-    source = tag_source(model, LEGACY_VERSION)
-    for tag, score in client.rank_labels_for_vector(vec, DEFAULT_LABELS, EMBED_JOB_TAG_COUNT):
+    corpus = _tag_corpus(model)
+    if corpus is not None:
+        labels, matrix, calibration = corpus
+        source = tag_source(model)
+        chosen = tag_from_vector(vec, matrix, labels, calibration)
+    else:
+        # `DEFAULT_LABELS` is the legacy 17, so the stamp says v1. Claiming
+        # `vocab-v2` here would be the same class of lie the model name was.
+        source = tag_source(model, LEGACY_VERSION)
+        chosen = client.rank_labels_for_vector(vec, DEFAULT_LABELS, EMBED_JOB_TAG_COUNT)
+
+    for tag, score in chosen:
         db.add_tag(conn, photo_id, tag, float(score), source=source)
 
 
