@@ -127,6 +127,18 @@ which fp16 is the right answer on this box.
 
 ## Latency and the thread curve
 
+> **Superseded — read `docs/plans/siglip2-text-latency.md` first.** Everything
+> from here to the end of this section was *extrapolated* from a loaded box
+> rather than measured on an idle one, and the extrapolation was wrong by ~3x.
+> Re-measured idle at `CHITRA_ML_THREADS=3`: text **66.7 ms, not ~200 ms**
+> (5.4x CLIP, not 15.4x) and image **~174 ms, not ~346 ms**. The scaling below
+> assumed CLIP's contention factor transferred to SigLIP; it does not, because
+> SigLIP's 64-token pass saturates its threads far harder. The *ratios between
+> thread counts* in the sweep still hold — 3 threads still wins — and the
+> memory half of this document is confirmed. Only the absolute latencies and
+> the "15x" conclusion are wrong.
+
+
 Re-measured after the box quieted. Absolute values are still inflated —
 concurrent work pushed load from 2 to 13 during the sweep — so the honest
 figures are **ratios against CLIP measured in the same window**, scaled by
@@ -189,6 +201,15 @@ executor queueing on search. But it stacks with that, and the combination is
 worth deciding about explicitly before the cutover rather than discovering after.
 Query-vector caching is the obvious mitigation — search queries repeat heavily —
 and it is cheap, but it is out of scope here.
+
+> **Corrected.** `docs/plans/siglip2-text-latency.md` measured this on an idle
+> box: the regression is 5.4x (12.4 → 66.7 ms), not 15x, and end-to-end search
+> goes ~27 ms → ~82 ms. It is genuine compute — the token-table lookup is 0.06%
+> of the forward pass and forcing all 256,000 rows resident changes latency by
+> 0.0% — and it is fully accounted for by 1.95x tower width times 2.84x fixed
+> padding. D3's queueing budget should be raised to ~224 ms (the corrected
+> image figure), and query-vector caching is *not* needed for the go/no-go: the
+> web client already caches repeats at `["search", kind, q]`.
 
 ## Recommended configuration
 
