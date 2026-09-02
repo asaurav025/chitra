@@ -56,7 +56,16 @@ case "$ans" in
 esac
 
 say "5/5  Verify"
-sleep 5
+# The sidecar loads the model before it binds, and SigLIP is larger than CLIP.
+# A single check moments after the restart reports a failure that is really a
+# cold start -- and then prints rollback advice at the worst possible moment.
+# Poll instead, and only conclude after it has genuinely had time.
+echo -n "     waiting for the sidecar to load the model"
+for i in $(seq 1 30); do
+  if curl -s --max-time 5 localhost:5101/health 2>/dev/null | grep -q '"dim"'; then echo " up after $((i*5))s"; break; fi
+  echo -n "."; sleep 5
+done
+echo ""
 echo "     sidecar: $(curl -s --max-time 25 localhost:5101/health 2>/dev/null)"
 echo "     api    : $(curl -s --max-time 15 localhost:5000/api/health 2>/dev/null | tr ',' '\n' | grep -E '"status"|embed_status' | tr '\n' ' ')"
 if curl -s --max-time 15 localhost:5101/health 2>/dev/null | grep -q '"dim":768'; then
