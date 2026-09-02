@@ -195,7 +195,12 @@ def cluster(
 ):
     """Group similar photos using FAISS + threshold union-find."""
     conn = db.connect(db_path)
-    items = db.get_embeddings(conn)
+    # Filter to one model in SQL. `embeddings` holds both generations during a
+    # re-embed, and stacking a 512-d CLIP row beside a 768-d SigLIP one raises
+    # `ValueError: all input arrays must have the same shape` inside
+    # `threshold_clusters`. Which model is "active" is a config flip, read at
+    # call time so the cutover and its rollback stay config-only.
+    items = db.get_embeddings(conn, model=db.active_embed_model())
 
     if not items:
         print("[yellow]No embeddings found. Run 'analyze' first.[/yellow]")
@@ -465,7 +470,11 @@ def search(
     em = ClipEmbedder()
     q = em.text_embedding(query)
 
-    rows = db.get_embeddings(conn)
+    # Same filter as `cluster` and as `/api/search/photos`: one model only, or
+    # `np.stack` below raises on a library that is mid-re-embed. Scores from
+    # two models are not comparable either, so a merged ranking would be
+    # meaningless even where the shapes happened to agree.
+    rows = db.get_embeddings(conn, model=db.active_embed_model())
     if not rows:
         print("[yellow]No embeddings found. Run 'analyze' first.[/yellow]")
         conn.close()

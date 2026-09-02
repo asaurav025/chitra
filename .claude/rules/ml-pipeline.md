@@ -62,13 +62,23 @@ Upgrading `.venv` requires a worker and sidecar restart to be consistent.
 **Two model switches, deliberately separate.** `CHITRA_EMBED_MODEL` selects
 what the sidecar loads and computes with (`core.embedder.build_embedder`, via
 `embed_service.configured_model`); `CHITRA_ACTIVE_EMBED_MODEL` selects what
-`search_photos` ranks from (`core.db_async.active_embed_model`). The re-embed
-cannot be atomic, so the migration needs a window where the sidecar already
-writes 768-d SigLIP rows while search still answers from the complete set of
-512-d CLIP rows: flip the first, re-embed, verify coverage, then flip the
-second. **The sidecar must never read `CHITRA_ACTIVE_EMBED_MODEL`** — if one
-variable drove both, the cutover would flip the read side before a single photo
-was converted and search would silently lose everything not yet re-embedded.
+every ranking read filters to — `search_photos`, `/similar`, and the CLI
+`search` and `cluster` commands. It is defined **once**, in
+`core.db.active_embed_model`, and re-exported as
+`core.db_async.active_embed_model`; same rule as `DEFAULT_EMBED_MODEL` and the
+`(photo_id, model)` migration, and for the same reason — a second copy is a
+second default model name. Both readers take the filter as SQL
+(`get_embeddings(conn, model=...)` / `get_embeddings_async`) so a mixed-model
+list never exists in Python; `np.stack` over one raises `ValueError: all input
+arrays must have the same shape`.
+
+The re-embed cannot be atomic, so the migration needs a window where the
+sidecar already writes 768-d SigLIP rows while search still answers from the
+complete set of 512-d CLIP rows: flip the first, re-embed, verify coverage,
+then flip the second. **The sidecar must never read
+`CHITRA_ACTIVE_EMBED_MODEL`** — if one variable drove both, the cutover would
+flip the read side before a single photo was converted and search would
+silently lose everything not yet re-embedded.
 `build_embedder` raises on an unknown identifier rather than falling back to
 CLIP, which would write 512-d rows under a `model` name claiming otherwise.
 

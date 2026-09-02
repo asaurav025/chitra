@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import sqlite3
 from pathlib import Path
 from typing import Iterable, List, Tuple, Dict, Optional, Any
@@ -393,10 +394,60 @@ def put_embedding(
     conn.commit()
 
 
-def get_embeddings(conn: sqlite3.Connection) -> List[Tuple[int, int, bytes]]:
+def get_embeddings(
+    conn: sqlite3.Connection,
+    model: Optional[str] = None,
+) -> List[Tuple[int, int, bytes]]:
+    """Read stored vectors, optionally restricted to one embedding model.
+
+    Sync twin of `db_async.get_embeddings_async`, with the same contract and
+    for the same reason. The table is keyed on `(photo_id, model)` so two
+    generations coexist during a re-embed; callers that stack the vectors into
+    a matrix — the CLI `search` and `cluster` commands — MUST pass `model`,
+    because rows from two models have different dimensions and `np.stack` on a
+    mixed list raises `ValueError: all input arrays must have the same shape`.
+    Filtering here rather than in the caller means the mixed list never exists.
+
+    Scores from two models are not comparable anyway (CLIP cosine occupies
+    0.16-0.28; a sigmoid-trained model does not), so merging them would be
+    silently meaningless even where the shapes happened to agree.
+
+    `model=None` stays an unfiltered read for callers that genuinely want every
+    row — migration and coverage counting.
+    """
     cur = conn.cursor()
-    cur.execute("SELECT photo_id, dim, vector FROM embeddings")
+    if model is None:
+        cur.execute("SELECT photo_id, dim, vector FROM embeddings")
+    else:
+        cur.execute(
+            "SELECT photo_id, dim, vector FROM embeddings WHERE model = ?",
+            (model,),
+        )
     return [(row["photo_id"], row["dim"], row["vector"]) for row in cur.fetchall()]
+
+
+def active_embed_model() -> str:
+    """The single model every ranking read filters to.
+
+    Lives here, not in `db_async`, for the same reason `DEFAULT_EMBED_MODEL`
+    and `migrate_embeddings_and_tags` do: both halves of the duplicated schema
+    layer need it, and a second copy would be a second default model name. The
+    CLIP identifier is already spelled as an independent literal in four
+    modules; two spellings of it write rows under one name while search filters
+    on another, and every query silently returns nothing.
+
+    Read at call time, not import time: the cutover in the re-embed plan is one
+    environment variable flip plus a restart, and the rollback is flipping it
+    back. Defaulting to the CLIP identifier means an unset variable keeps
+    answering from the rows every existing photo already has, rather than from
+    nothing.
+
+    Deliberately *not* `CHITRA_EMBED_MODEL`, which says what the sidecar
+    computes with. The migration needs a window where the sidecar already
+    writes 768-d SigLIP rows while reads still answer from the complete set of
+    512-d CLIP rows; one variable driving both would collapse that window.
+    """
+    return os.environ.get("CHITRA_ACTIVE_EMBED_MODEL", DEFAULT_EMBED_MODEL)
 
 
 # ----------------------------------------------------------------------

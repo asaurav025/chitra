@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,6 +21,12 @@ DB_DEFAULT_PATH = "photo.db"
 # modules owns the constant. There is exactly one definition, in `core.db`.
 DEFAULT_EMBED_MODEL = db.DEFAULT_EMBED_MODEL
 DEFAULT_TAG_SOURCE = db.DEFAULT_TAG_SOURCE
+
+# Same rule for the read-side model switch: the sync CLI paths need it too, so
+# it is defined once in `core.db` and re-exported here rather than copied.
+# `core.db_async.active_embed_model` stays the spelling the API and the scoped
+# rules use, and it is the same function object.
+active_embed_model = db.active_embed_model
 
 
 # ----------------------------------------------------------------------
@@ -408,18 +413,6 @@ async def get_embeddings_async(
     async with conn.execute(sql, params) as cur:
         rows = await cur.fetchall()
     return [(row["photo_id"], row["dim"], row["vector"]) for row in rows]
-
-
-def active_embed_model() -> str:
-    """The single model `/api/search/photos` ranks from.
-
-    Read at call time, not import time: the cutover in the re-embed plan is
-    one environment variable flip plus a restart, and the rollback is flipping
-    it back. Defaulting to the CLIP identifier means an unset variable keeps
-    answering from the rows every existing photo already has, rather than
-    from nothing.
-    """
-    return os.environ.get("CHITRA_ACTIVE_EMBED_MODEL", DEFAULT_EMBED_MODEL)
 
 
 # ----------------------------------------------------------------------
