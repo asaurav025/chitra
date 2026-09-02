@@ -48,7 +48,7 @@ from core import video
 from core.embed_client import EmbeddingClient
 from core.extractor import collect_metadata, load_image, iter_images, is_video, RAW_EXTS, _normalize_exif_date
 from core.gallery import ensure_thumb, ThumbnailUnavailable
-from core.cache import get_cached_thumbnail, cache_thumbnail
+from core.cache import get_cached_thumbnail, cache_thumbnail, get_cache_stats
 from core.worker import get_queue, get_redis_connection
 from core.faiss_index import FAISSIndexManager
 from core.jobs import (
@@ -373,6 +373,12 @@ async def health_check(
     health_info["embed_url"] = embed_client.base_url
     if embed_status != "ok":
         health_info["status"] = "degraded"
+
+    # Per-worker thumbnail cache. Reported because the alternative, last time,
+    # was inferring a runaway cache from cgroup numbers and arithmetic. Health
+    # checks land on whichever of the four workers answers, so consecutive
+    # polls legitimately differ.
+    health_info["thumb_cache"] = get_cache_stats()
 
     # Return 200 even if degraded (service is still functional).
     # Known issue, deliberately not changed here — see the plan's scope note.

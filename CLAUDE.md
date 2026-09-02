@@ -42,7 +42,8 @@ core/
                       the only one using the logging framework.
   gallery.py          Thumbnail generation (PIL).
   raw_loader.py       RAW format decoding.
-  cache.py            In-process thumbnail cache. FIFO despite the name.
+  cache.py            In-process thumbnail cache. Byte-bounded (64 MiB per
+                      worker by default), FIFO eviction, 1h TTL.
   worker.py           Redis connection + queue definitions.
 
 cli/                  Typer CLI + Textual TUI. Separate entrypoint from the

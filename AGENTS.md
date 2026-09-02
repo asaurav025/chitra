@@ -79,6 +79,14 @@ is whether *your* change added a failure.
   sidecar is down, and `/api/health` reports `embed_status`. Importing
   `app_fastapi` must stay under 200 MB with no torch/transformers resident;
   `tests/test_api_memory_budget.py` enforces it in a fresh subprocess.
+- **The thumbnail cache is bounded by bytes, not entries.**
+  `CHITRA_THUMB_CACHE_BYTES` (default 64 MiB) is a **per-uvicorn-worker**
+  budget — multiply by `WORKERS` for the tier. It was capped at 1,000 entries
+  with no byte budget, and since `ensure_thumb` writes 150-400 KB JPEGs that
+  allowed ~250 MB per worker; on 2026-09-01 the four workers held
+  959/908/805/839 MB against a 4 GB `MemoryMax`. `/api/health` now reports
+  `thumb_cache` (entries, bytes, both bounds, evictions, hits/misses) so the
+  next investigation reads a counter instead of inferring from cgroups.
 - **Thread counts come from `thread_limits.sh`**, sourced by the launchers
   after `.env.production` so operator overrides win. 3 is the measured CLIP
   optimum on this 6-core box; the curve is sharply non-monotonic (4 and 6 are

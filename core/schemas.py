@@ -220,6 +220,7 @@ class HealthResponse(BaseModel):
     storage_note: Optional[str] = Field(None, description="Storage note")
     embed_status: Optional[str] = Field(None, description="Embedding sidecar status")
     embed_url: Optional[str] = Field(None, description="Embedding sidecar URL")
+    thumb_cache: Optional[Dict[str, Any]] = Field(None, description="Per-worker thumbnail cache stats")
 
 
 class RootResponse(BaseModel):
