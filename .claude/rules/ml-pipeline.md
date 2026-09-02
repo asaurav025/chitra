@@ -168,6 +168,22 @@ would evict it and take rollback-by-config with it. `tags` is unique on
 `(photo_id, tag)`; `tags.source` is provenance and stays out of the key. The
 migration lives once, in `core/db.py`, and `db_async.py` imports it.
 
+**The CLIP identifier is still four independent literals**, and only one of
+them is consolidated. `core/db.py:14` `DEFAULT_EMBED_MODEL` is the definition
+(`core/db_async.py` re-exports it, as it does `active_embed_model`); the other
+three are their own strings — `core/embedder.py:15` `DEFAULT_EMBED_MODEL`,
+`embed_service.py:50` `DEFAULT_MODEL`, `scripts/reembed.py:120`
+`DEFAULT_MODEL`. If they drift, rows are written under one spelling while
+every read filters another and **every query silently returns nothing**, with
+no traceback. `TestTheModelIdentifierIsSpelledTheSameEverywhere` in
+`tests/test_embed_model_selection.py` is a string compare standing in for the
+import. All three *can* import `core.db.DEFAULT_EMBED_MODEL`: `core/db.py` is
+stdlib-only and imports nothing from `core`, so there is no cycle and nothing
+to pay, and `scripts/reembed.py` already imports `core.db` anyway. The only
+cost is that the guard test greps `reembed.py` for a literal assignment and
+would need rewriting as an identity check. Prefer the import when you are next
+editing one of those files.
+
 **`load_image` dispatches on the file extension, and the extension lies.** 63
 photos are named `.arw`/`.ARW` whose bytes begin `FF D8 FF E0 JFIF` — they are
 JPEGs, so rawpy raises `LibRawFileUnsupportedError` and both thumbnail
