@@ -57,6 +57,12 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 VOCAB_VERSION = "v2"
 
+#: The version `LEGACY_LABELS` shipped under. `db.DEFAULT_TAG_SOURCE` spells it
+#: into a literal (`clip-vitb32/vocab-v1`); this is the same string, available
+#: to anything that still tags from the legacy 17 and must say so rather than
+#: claiming the calibrated 345.
+LEGACY_VERSION = "v1"
+
 # Part of the fingerprint on purpose: changing this string moves every label
 # vector, which invalidates every cached matrix and every stored score.
 PROMPT_TEMPLATE = "a photo of {label}"

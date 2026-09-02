@@ -424,13 +424,20 @@ def _embed_and_tag(conn, photo_id: int, key: str, data: bytes) -> None:
     reference — see the note at the top of this file.
     """
     from core.tagger import DEFAULT_LABELS
+    from core.vocabulary import LEGACY_VERSION, tag_source
 
     client = _get_embed_client()
+    # Asked *before* the embed so a sidecar that cannot name itself costs one
+    # round trip rather than a whole forward pass and a download.
+    model = client.served_model()
     vec = np.asarray(client.image_embedding(os.path.basename(key), data), dtype="float32")
-    db.put_embedding(conn, photo_id, vec.tobytes(), int(vec.shape[0]))
+    db.put_embedding(conn, photo_id, vec.tobytes(), int(vec.shape[0]), model=model)
 
+    # `DEFAULT_LABELS` is still the legacy 17, so the stamp says v1. Claiming
+    # `vocab-v2` here would be the same class of lie as the model name was.
+    source = tag_source(model, LEGACY_VERSION)
     for tag, score in client.rank_labels_for_vector(vec, DEFAULT_LABELS, EMBED_JOB_TAG_COUNT):
-        db.add_tag(conn, photo_id, tag, float(score))
+        db.add_tag(conn, photo_id, tag, float(score), source=source)
 
 
 def process_photo_embedding_job(photo_id: int, file_path: str, db_path: str):

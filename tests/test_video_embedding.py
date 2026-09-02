@@ -44,6 +44,12 @@ class CountingSidecar:
     def __init__(self):
         self.image_calls = []
 
+    def served_model(self):
+        # The job asks which model computed the vector before it stores one;
+        # see `TestTheRowsNameTheModelThatMadeThem` in
+        # tests/test_embedding_job_sidecar.py.
+        return "google/siglip2-base-patch16-224"
+
     def image_embedding(self, filename, data):
         self.image_calls.append(filename)
         vec = np.zeros(4, dtype="float32")

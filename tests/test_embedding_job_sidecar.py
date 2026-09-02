@@ -77,11 +77,17 @@ class CountingStorage:
 class CountingSidecar:
     """Sidecar stub that records image embeds and label lookups."""
 
-    def __init__(self, dim=4, fail_with=None):
+    def __init__(self, dim=4, fail_with=None, model="google/siglip2-base-patch16-224"):
         self.image_calls = []
         self.label_calls = []
         self.dim = dim
         self.fail_with = fail_with
+        self.model = model
+
+    def served_model(self):
+        if self.model is None:
+            raise EmbeddingUnavailable("sidecar did not name its model")
+        return self.model
 
     def image_embedding(self, filename, data):
         self.image_calls.append((filename, len(data)))
@@ -237,6 +243,65 @@ class TestProcessSingleEmbedding(EmbeddingJobTestCase):
         self.assertEqual(1, indexed)
 
 
+class TestTheRowsNameTheModelThatMadeThem(EmbeddingJobTestCase):
+    """A row is only worth anything if it names the model that produced it.
+
+    `embeddings.model` is half that table's unique key and the value every
+    ranking read filters on. `_embed_and_tag` stored the sidecar's vector
+    without saying which model computed it, so `db.put_embedding` fell back to
+    `DEFAULT_EMBED_MODEL` — the CLIP identifier — and after the SigLIP cutover
+    the very first upload wrote a **768-d vector under
+    `openai/clip-vit-base-patch32`**. Measured on production: photo 2775, one
+    row, `dim=768, model='openai/clip-vit-base-patch32'`, and no row at all
+    under the SigLIP name that `CHITRA_ACTIVE_EMBED_MODEL` filters to. Two
+    consequences, neither of which raises anything:
+
+    * the photo is invisible to search, because search reads the active model
+      and there is no row there;
+    * a rollback to CLIP takes `search_photos` down with
+      ``ValueError: all input arrays must have the same shape`` the moment
+      `np.stack` meets a 768 beside 2,721 512s.
+
+    `tags.source` has the same disease from the same cause — `db.add_tag`'s
+    `DEFAULT_TAG_SOURCE` is the literal `clip-vitb32/vocab-v1`, so SigLIP's
+    tags have been filing themselves under CLIP's name since the 11:48
+    restart.
+    """
+
+    def test_the_embedding_row_names_the_model_the_sidecar_served(self):
+        jobs.process_photo_embedding_job(1, "photos/1.jpg", self.db_path)
+
+        rows = self.rows("SELECT model FROM embeddings WHERE photo_id=1")
+        self.assertEqual(["google/siglip2-base-patch16-224"],
+                         [r["model"] for r in rows])
+
+    def test_it_does_not_fall_back_to_the_clip_default(self):
+        from core.db import DEFAULT_EMBED_MODEL
+
+        self.sidecar.model = "google/siglip2-base-patch16-224"
+        jobs.process_photo_embedding_job(1, "photos/1.jpg", self.db_path)
+
+        rows = self.rows("SELECT model FROM embeddings WHERE photo_id=1")
+        self.assertNotIn(DEFAULT_EMBED_MODEL, [r["model"] for r in rows])
+
+    def test_tag_provenance_names_the_model_the_sidecar_served(self):
+        jobs.process_photo_embedding_job(1, "photos/1.jpg", self.db_path)
+
+        sources = {r["source"] for r in self.rows("SELECT source FROM tags WHERE photo_id=1")}
+        self.assertEqual(1, len(sources), sources)
+        source = sources.pop()
+        self.assertTrue(source.startswith("siglip2-base-patch16-224/"), source)
+
+    def test_a_sidecar_that_will_not_name_its_model_fails_the_job(self):
+        """Guessing the name is the bug; there is nothing safe to guess."""
+        self.sidecar.model = None
+
+        with self.assertRaises(EmbeddingUnavailable):
+            jobs.process_photo_embedding_job(1, "photos/1.jpg", self.db_path)
+
+        self.assertEqual([], self.rows("SELECT 1 FROM embeddings WHERE photo_id=1"))
+
+
 class TestTheSharedClient(unittest.TestCase):
     def setUp(self):
         self._saved = jobs._EMBED_CLIENT
@@ -280,6 +345,8 @@ class TestTheWorkerLoadsNoModel(unittest.TestCase):
                     return b"bytes"
 
             class Sidecar:
+                def served_model(self):
+                    return "google/siglip2-base-patch16-224"
                 def image_embedding(self, filename, data):
                     return np.array([1, 0, 0, 0], dtype="float32")
                 def rank_labels_for_vector(self, vec, labels, top_k=6):

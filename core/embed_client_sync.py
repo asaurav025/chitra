@@ -103,6 +103,10 @@ class SyncEmbeddingClient:
         # the whole batch, it is one round trip per label for the entire run.
         self._label_cache: Dict[str, np.ndarray] = {}
 
+        # The identifier the *resident* process reports, not the one this
+        # process's environment happens to name. See `served_model`.
+        self._served_model: Optional[str] = None
+
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
@@ -183,6 +187,47 @@ class SyncEmbeddingClient:
         sims = self.label_vectors(labels) @ np.asarray(image_vec, dtype="float32")
         order = sims.argsort()[::-1][:top_k]
         return [(labels[i], float(sims[i])) for i in order]
+
+    def served_model(self) -> str:
+        """The model identifier the sidecar is **actually** holding.
+
+        Every vector this client returns was computed by whatever weights that
+        separate process loaded at *its* last restart, and `embeddings.model`
+        is half that table's unique key and the value every ranking read
+        filters on. Reading `CHITRA_EMBED_MODEL` here instead would report this
+        worker's environment, which says nothing about the other process — that
+        is precisely the mistake `scripts/reembed.py` was carrying, where a
+        sidecar still serving CLIP happily filled `google/siglip2-...` rows
+        with 512-d CLIP vectors.
+
+        Not letting this default is deliberate. `db.put_embedding` falls back
+        to `DEFAULT_EMBED_MODEL`, so a guess here does not fail — it writes a
+        768-d SigLIP vector under the CLIP name, where search cannot find it
+        and a rollback trips `np.stack`. Raising is the only honest answer.
+
+        Cached: the resident model cannot change without the sidecar
+        restarting, which drops this client's connection anyway.
+        """
+        if self._served_model is not None:
+            return self._served_model
+        try:
+            resp = self._http.get(
+                f"{self.base_url}/health", headers=self._headers(), timeout=self.timeout
+            )
+        except httpx.HTTPError as exc:
+            raise self._unavailable(f"could not be asked for its model ({exc})") from exc
+        if resp.status_code != 200:
+            raise self._unavailable(
+                f"returned HTTP {resp.status_code} when asked for its model")
+        try:
+            model = resp.json().get("model")
+        except Exception as exc:
+            raise self._unavailable(
+                f"returned an unusable /health payload ({exc})") from exc
+        if not model:
+            raise self._unavailable("did not name the model it is serving")
+        self._served_model = str(model)
+        return self._served_model
 
     def health(self) -> str:
         """Report the sidecar's status. Never raises."""

@@ -258,6 +258,62 @@ class TestLabelRanking(unittest.TestCase):
         )
 
 
+class TestServedModel(unittest.TestCase):
+    """What the *resident* process is holding, not what this one's env names.
+
+    `embeddings.model` is half that table's unique key and the value every
+    ranking read filters on. Reading `CHITRA_EMBED_MODEL` in the worker would
+    describe the worker's environment, which says nothing about the separate
+    process that actually computed the vector — the exact mistake
+    `scripts/reembed.py` was carrying, where a sidecar still serving CLIP
+    filled `google/siglip2-...` rows with 512-d CLIP vectors.
+    """
+
+    def test_it_reports_the_model_from_health(self):
+        def handler(request):
+            self.assertEqual("/health", request.url.path)
+            return httpx.Response(200, json={"status": "ok",
+                                             "model": "google/siglip2-base-patch16-224",
+                                             "dim": 768})
+
+        self.assertEqual("google/siglip2-base-patch16-224",
+                         client_for(handler).served_model())
+
+    def test_it_asks_once_per_client(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.path)
+            return httpx.Response(200, json={"status": "ok", "model": "m", "dim": 4})
+
+        client = client_for(handler)
+        client.served_model()
+        client.served_model()
+        self.assertEqual(1, len(calls), calls)
+
+    def test_a_health_payload_with_no_model_raises(self):
+        """A default here writes a SigLIP vector under CLIP's name."""
+        def handler(request):
+            return httpx.Response(200, json={"status": "ok"})
+
+        with self.assertRaises(EmbeddingUnavailable):
+            client_for(handler).served_model()
+
+    def test_an_unreachable_sidecar_raises(self):
+        def handler(request):
+            raise httpx.ConnectError("connection refused")
+
+        with self.assertRaises(EmbeddingUnavailable):
+            client_for(handler).served_model()
+
+    def test_a_non_200_raises(self):
+        def handler(request):
+            return httpx.Response(503, text="model still loading")
+
+        with self.assertRaises(EmbeddingUnavailable):
+            client_for(handler).served_model()
+
+
 class TestImportWeight(unittest.TestCase):
     """The point of the sidecar is that nothing else holds a model.
 
