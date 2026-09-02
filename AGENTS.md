@@ -33,16 +33,21 @@ carries a ruff config for when it is installed; nothing runs it automatically.
 
 ## Test baseline
 
-The suite is **not green**. Measured 2026-09-01 on a clean checkout of `main`
+The suite is **not green**. Measured 2026-09-02 on a clean checkout of `main`
 (no uncommitted work), twice, stable:
 
 ```
-182 tests, 7 failures, 5 errors, 2 skipped
+581 tests, 7 failures, 5 errors, 13 skipped
 ```
 
-Measure the baseline the same way before trusting it — a `git worktree add
---detach <path> HEAD` gives a tree without local WIP, which is what this number
-describes. Running it in a dirty tree counts other people's in-progress tests.
+**Measure it the same way before trusting it.** `git worktree add --detach <path>
+HEAD` gives a tree without local work-in-progress, which is what this number
+describes. Running in a dirty tree counts whatever else is in flight — and with
+several agents working, that has produced a different answer for each of them.
+
+**The totals move constantly; the failure and error counts are the signal.**
+They have been 7 and 5 since 2026-09-01 while the total went 182 -> 581. Compare
+those two numbers, not the total.
 
 - `test_endpoints.py` — **7 failures**, all `401 != 200/400/404`. The tests build
   a `TestClient` with no auth token and predate the auth layer. Fixable: give the
@@ -51,10 +56,10 @@ describes. Running it in a dirty tree counts other people's in-progress tests.
 - `test_endpoints.test_health_check` (**1 error**) — **order-dependent, not
   environmental.** It passes in isolation (`run_tests.py test_endpoints` gives
   10 tests / 7 failures / 0 errors) and errors only in a full run, with an
-  httpcore timeout. `/api/health` now probes the embedding sidecar for
-  `embed_status`; in a full run that async call times out. This one is ours and
-  is worth fixing properly rather than documenting forever.
-- 2 skips in `test_storage_client` / `test_background_jobs` when MinIO is down.
+  httpcore timeout, because `/api/health` now probes the embedding sidecar for
+  `embed_status`. This one is ours and is worth fixing rather than documenting.
+- **13 skips**: 2 in `test_storage_client` / `test_background_jobs` when MinIO is
+  down, plus 11 model-gated tests that need `CHITRA_TEST_LOAD_MODELS=1`.
 
 Do not "fix" these as a side effect of unrelated work, and do not treat them as
 your own breakage. Compare against this baseline; the only number that matters
