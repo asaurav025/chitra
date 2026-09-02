@@ -1,5 +1,7 @@
 # Chitra — Photo Intelligence CLI
 
+> **Architecture tour:** [`docs/inside-chitra.html`](docs/inside-chitra.html) explains the system as it runs today (server, clients, ML pipeline, constraints, incidents). The rest of this README describes the original command-line tool.
+
 Chitra is a local, privacy-preserving CLI that scans your photo folders, extracts EXIF, computes image embeddings, auto-tags, finds near-duplicates, clusters similar photos, detects faces (optional), and stores **everything in SQLite** — without moving your files. It can also export a static HTML gallery and provides a **Terminal UI** built with Textual.
 
 ## Highlights

@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Inside Chitra: architecture tour, written 2026-09-02. Standalone copy of the published page; open in a browser. Fonts load from Google Fonts and fall back to system faces offline. -->
+<title>Inside Chitra</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..900,0..100;1,9..144,300..900,0..100&amp;family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400;1,700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Tiro+Devanagari+Hindi&amp;display=swap">
+<style>
+:root{
+  color-scheme:light;
+  --paper:#EEF0EE; --sheet:#FAFBF9; --sheet-2:#F4F6F4;
+  --ink:#18222B; --ink-2:#4F5B66; --ink-3:#7C8791; --rule:#D1D7D5; --rule-2:#E2E6E4;
+  --blue:#1E4E8C; --blue-ink:#173D6E; --blue-soft:#DCE6F4; --blue-wash:#EAF0F8;
+  --wax:#BE3A2B; --wax-soft:#F6E1DC;
+  --ok:#2E7D4F; --ok-soft:#DDF0E4;
+  --dk-paper:#1A1714; --dk-sheet:#231F1B; --dk-ink:#EDE3D3; --dk-ink-2:#BBAE9B; --dk-ink-3:#8B8072; --dk-rule:#3A322B; --amber:#E9A23B; --amber-soft:#3A2C16; --amber-ink:#F3C577;
+  --f-display:"Fraunces","Iowan Old Style","Georgia",serif;
+  --f-body:"Atkinson Hyperlegible","Segoe UI","Helvetica Neue",Arial,sans-serif;
+  --f-mono:"IBM Plex Mono","SFMono-Regular",Menlo,Consolas,monospace;
+  --f-deva:"Tiro Devanagari Hindi","Noto Sans Devanagari",serif;
+  --note-w:250px; --note-gap:44px;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --paper:#14181B; --sheet:#1B2126; --sheet-2:#20272D;
+    --ink:#E4E8EA; --ink-2:#AAB4BC; --ink-3:#7E8992; --rule:#2E373E; --rule-2:#262E35;
+    --blue:#7EA6E6; --blue-ink:#A9C5F0; --blue-soft:#1F3352; --blue-wash:#1B2838;
+    --wax:#F0785A; --wax-soft:#3B221C;
+    --ok:#6CC391; --ok-soft:#1D3327;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --paper:#14181B; --sheet:#1B2126; --sheet-2:#20272D;
+  --ink:#E4E8EA; --ink-2:#AAB4BC; --ink-3:#7E8992; --rule:#2E373E; --rule-2:#262E35;
+  --blue:#7EA6E6; --blue-ink:#A9C5F0; --blue-soft:#1F3352; --blue-wash:#1B2838;
+  --wax:#F0785A; --wax-soft:#3B221C;
+  --ok:#6CC391; --ok-soft:#1D3327;
+}
+*{box-sizing:border-box}
+html{font-size:17px}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--f-body);line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--blue);text-decoration-thickness:1px;text-underline-offset:3px}
+a:hover{color:var(--blue-ink)}
+:focus-visible{outline:2px solid var(--blue);outline-offset:3px;border-radius:2px}
+code,kbd,pre,.mono{font-family:var(--f-mono);font-size:.86em}
+code{background:var(--sheet-2);padding:.08em .35em;border-radius:3px;border:1px solid var(--rule-2)}
+pre{background:var(--sheet);border:1px solid var(--rule);border-radius:4px;padding:.9rem 1.1rem;overflow-x:auto;line-height:1.5;font-size:.82rem}
+pre code{background:none;border:0;padding:0;font-size:inherit}
+h1,h2,h3,h4{font-family:var(--f-display);font-variation-settings:"SOFT" 30,"opsz" 72;font-weight:600;line-height:1.12;letter-spacing:-.005em;text-wrap:balance;margin:0}
+h2{font-size:2rem;font-variation-settings:"SOFT" 40,"opsz" 96}
+h3{font-size:1.3rem;font-variation-settings:"SOFT" 20,"opsz" 36;font-weight:600;margin-top:2.2rem;margin-bottom:.6rem}
+h4{font-family:var(--f-body);font-size:1rem;font-weight:700;margin-top:1.6rem;margin-bottom:.3rem}
+p{margin:0 0 1.1rem}
+strong{font-weight:700}
+hr{border:0;border-top:1px solid var(--rule);margin:2.5rem 0}
+ul,ol{padding-left:1.3rem;margin:0 0 1.1rem}
+li{margin:.3rem 0}
+li::marker{color:var(--ink-3)}
+small,.small{font-size:.86rem;color:var(--ink-2)}
+
+/* ---------- page frame ---------- */
+.frame{max-width:1160px;margin:0 auto;padding:0 28px}
+.col{max-width:72ch}
+@media (min-width:1120px){ .frame{padding-right:calc(var(--note-w) + var(--note-gap) + 28px)} }
+
+/* ---------- top nav ---------- */
+.nav{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--paper) 88%,transparent);backdrop-filter:blur(8px);border-bottom:1px solid var(--rule);font-family:var(--f-mono);font-size:.74rem}
+.nav .in{max-width:1160px;margin:0 auto;padding:0 28px;display:flex;gap:1.4rem;align-items:center;overflow-x:auto;white-space:nowrap;scrollbar-width:none}
+.nav .in::-webkit-scrollbar{display:none}
+.nav a{color:var(--ink-2);text-decoration:none;padding:.7rem 0;border-bottom:2px solid transparent}
+.nav a:hover{color:var(--ink);border-bottom-color:var(--blue)}
+.nav a b{color:var(--ink-3);font-weight:500;margin-right:.35rem}
+.nav .brand{font-family:var(--f-deva);font-size:1.05rem;color:var(--ink);margin-right:.6rem}
+
+/* ---------- masthead ---------- */
+.mast{padding:4.5rem 0 3rem;border-bottom:1px solid var(--rule)}
+.mast .word{display:flex;align-items:baseline;gap:1.1rem;flex-wrap:wrap}
+.mast .deva{font-family:var(--f-deva);font-size:5.2rem;line-height:1;color:var(--blue)}
+.mast h1{font-size:3.2rem;font-variation-settings:"SOFT" 60,"opsz" 144;font-weight:500}
+.mast .thesis{font-family:var(--f-display);font-variation-settings:"SOFT" 40,"opsz" 24;font-size:1.45rem;line-height:1.35;max-width:32ch;margin:1.4rem 0 1rem;color:var(--ink)}
+.mast .lede{max-width:64ch;color:var(--ink-2);font-size:1.02rem}
+.byline{font-family:var(--f-mono);font-size:.76rem;color:var(--ink-3);margin-top:1.6rem}
+
+/* EXIF-style spec block */
+.exif{margin:2.4rem 0 0;border:1px solid var(--rule);background:var(--sheet);border-radius:4px;max-width:76ch}
+.exif .cap{font-family:var(--f-mono);font-size:.72rem;color:var(--ink-3);padding:.55rem .9rem;border-bottom:1px solid var(--rule-2)}
+.exif dl{display:grid;grid-template-columns:1fr 1fr;gap:0;margin:0}
+.exif .cell{display:grid;grid-template-columns:6.4rem 1fr;gap:.6rem;padding:.55rem .9rem;border-bottom:1px solid var(--rule-2);border-right:1px solid var(--rule-2);align-items:baseline}
+.exif .cell:nth-child(2n){border-right:0}
+.exif .cell:nth-last-child(-n+2){border-bottom:0}
+.exif dt{font-family:var(--f-mono);font-size:.72rem;color:var(--ink-3);margin:0}
+.exif dd{margin:0;font-size:.93rem;font-variant-numeric:tabular-nums}
+@media (max-width:640px){ .exif dl{grid-template-columns:1fr} .exif .cell{border-right:0} .exif .cell:nth-last-child(-n+2){border-bottom:1px solid var(--rule-2)} .exif .cell:last-child{border-bottom:0} }
+
+/* ---------- sections ---------- */
+.sec{padding:3.6rem 0 1rem;border-bottom:1px solid var(--rule)}
+.sec:last-of-type{border-bottom:0}
+.kicker{font-family:var(--f-mono);font-size:.74rem;color:var(--blue);margin-bottom:.7rem}
+.sec h2{margin-bottom:1.1rem}
+.sec .intro{font-size:1.12rem;color:var(--ink);max-width:62ch}
+.sec .intro + p{margin-top:.2rem}
+.bars + p small{display:block;max-width:60ch;margin-top:-.1rem;margin-bottom:1.6rem}
+
+/* margin notes (Tufte-style) */
+.note{font-size:.84rem;line-height:1.5;color:var(--ink-2)}
+.note .who{font-family:var(--f-mono);font-size:.68rem;color:var(--wax);display:block;margin-bottom:.25rem}
+.note p{margin:0 0 .5rem}
+.note code{font-size:.82em}
+@media (min-width:1120px){
+  .note{float:right;clear:right;width:var(--note-w);margin:.15rem calc(-1 * (var(--note-w) + var(--note-gap))) 1rem 0;padding-left:.9rem;border-left:2px solid var(--rule)}
+}
+@media (max-width:1119px){
+  .note{margin:1rem 0 1.3rem;padding:.6rem 0 .6rem 1rem;border-left:3px solid var(--wax);background:transparent}
+}
+
+/* figures */
+figure.fig{margin:1.8rem 0 2.2rem;clear:both}
+figure.fig svg{max-width:100%;height:auto;display:block;color:var(--ink)}
+figure.fig figcaption{font-size:.84rem;color:var(--ink-2);margin-top:.7rem;max-width:72ch}
+figure.fig figcaption b{font-family:var(--f-mono);font-weight:500;color:var(--ink);margin-right:.35rem}
+@media (min-width:1120px){ .col .wide{width:calc(100% + var(--note-w) + var(--note-gap))} }
+.svg-box{fill:var(--sheet);stroke:currentColor;stroke-width:1.2}
+.svg-box-2{fill:var(--sheet-2);stroke:currentColor;stroke-width:1.2}
+.svg-blue{fill:var(--blue-soft);stroke:var(--blue);stroke-width:1.4}
+.svg-wax{fill:var(--wax-soft);stroke:var(--wax);stroke-width:1.4}
+.svg-t{font-family:var(--f-body);font-size:12.5px;fill:currentColor}
+.svg-m{font-family:var(--f-mono);font-size:10.5px;fill:var(--ink-2)}
+.svg-h{font-family:var(--f-body);font-size:12.5px;font-weight:700;fill:currentColor}
+.svg-edge{stroke:currentColor;stroke-width:1.3;fill:none}
+.svg-edge-blue{stroke:var(--blue);stroke-width:1.8;fill:none}
+.svg-edge-dash{stroke:currentColor;stroke-width:1.2;fill:none;stroke-dasharray:4 4}
+.svg-faint{stroke:var(--rule);stroke-width:1;fill:none}
+
+/* tables */
+.tbl{width:100%;border-collapse:collapse;font-size:.9rem;margin:1rem 0 1.6rem;background:var(--sheet);border:1px solid var(--rule);color:var(--ink)}
+.tbl th{text-align:left;font-family:var(--f-mono);font-weight:500;font-size:.72rem;color:var(--ink-3);padding:.55rem .8rem;border-bottom:1px solid var(--rule);background:var(--sheet-2)}
+.tbl td{padding:.6rem .8rem;border-bottom:1px solid var(--rule-2);vertical-align:top}
+.tbl tr:last-child td{border-bottom:0}
+.tbl td.n{font-family:var(--f-mono);font-size:.82rem;font-variant-numeric:tabular-nums}
+.tbl td.k{font-weight:700;white-space:nowrap}
+.tbl td.k small{display:block;font-weight:400;font-family:var(--f-mono);font-size:.7rem;color:var(--ink-3);white-space:normal}
+.darkroom .tbl td.k small{color:var(--dk-ink-3)}
+.tbl td small{font-size:.8rem}
+.scroll{overflow-x:auto;clear:both}
+
+/* constraint cards */
+.rules{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin:1.4rem 0 2rem;clear:both}
+.rule{background:var(--sheet);border:1px solid var(--rule);border-radius:4px;padding:1rem 1.1rem 1rem;display:grid;grid-template-rows:auto auto 1fr;gap:.35rem}
+.rule .what{font-family:var(--f-display);font-variation-settings:"SOFT" 30,"opsz" 24;font-weight:600;font-size:1.12rem;line-height:1.25}
+.rule .why{font-size:.86rem;color:var(--ink-2)}
+.rule .forced{font-size:.88rem;border-top:1px dashed var(--rule);padding-top:.55rem;margin-top:.35rem}
+.rule .forced b{color:var(--wax);font-family:var(--f-mono);font-weight:500;font-size:.72rem;display:block;margin-bottom:.15rem}
+
+/* timeline */
+.tl{list-style:none;padding:0;margin:1.2rem 0 1.6rem;border-left:2px solid var(--rule);clear:both}
+.tl li{position:relative;padding:0 0 1.1rem 1.4rem;margin:0}
+.tl li::before{content:"";position:absolute;left:-6px;top:.5rem;width:10px;height:10px;border-radius:50%;background:var(--paper);border:2px solid var(--blue)}
+.tl .when{font-family:var(--f-mono);font-size:.72rem;color:var(--ink-3);display:block}
+.tl .what{font-weight:700}
+.tl p{margin:.15rem 0 0;font-size:.92rem;color:var(--ink-2)}
+
+/* incident cards */
+.inc{border:1px solid var(--rule);border-left:4px solid var(--wax);background:var(--sheet);border-radius:0 4px 4px 0;padding:1rem 1.2rem;margin:1.2rem 0;clear:both}
+.inc .stamp{font-family:var(--f-mono);font-size:.7rem;color:var(--wax);margin-bottom:.3rem}
+.inc h4{margin:0 0 .4rem;font-family:var(--f-display);font-variation-settings:"SOFT" 30,"opsz" 24;font-weight:600;font-size:1.15rem}
+.inc p{font-size:.94rem;margin-bottom:.55rem}
+.inc .lesson{font-size:.9rem;padding-top:.5rem;border-top:1px dashed var(--rule)}
+.inc .lesson b{color:var(--blue)}
+
+/* lessons */
+.lessons{counter-reset:les;list-style:none;padding:0;margin:1.2rem 0 1.5rem;clear:both}
+.lessons li{counter-increment:les;display:grid;grid-template-columns:2.6rem 1fr;gap:.6rem;padding:.9rem 0;border-top:1px solid var(--rule-2)}
+.lessons li::before{content:counter(les);grid-column:1;grid-row:1 / span 2;font-family:var(--f-display);font-variation-settings:"SOFT" 60,"opsz" 72;font-size:1.7rem;line-height:1;color:var(--blue);font-weight:500}
+.lessons b{display:block;grid-column:2;margin-bottom:.15rem}
+.lessons p{grid-column:2;margin:0;font-size:.94rem;color:var(--ink-2)}
+
+/* bar figure (single series) */
+.bars{margin:1rem 0 .4rem;display:grid;gap:.55rem;max-width:60ch}
+.bar{display:grid;grid-template-columns:11rem 1fr 5.5rem;align-items:center;gap:.7rem;font-size:.88rem}
+.bar .lab{color:var(--ink-2)}
+.bar .track{height:14px;position:relative;background:transparent}
+.bar .fill{position:absolute;left:0;top:0;height:100%;background:var(--blue);border-radius:0 4px 4px 0}
+.bar .fill.hot{background:var(--wax)}
+.bar .fill.dim{opacity:.42}
+.bar .val{font-family:var(--f-mono);font-size:.8rem;font-variant-numeric:tabular-nums;color:var(--ink)}
+
+/* pills */
+.pill{display:inline-block;font-family:var(--f-mono);font-size:.68rem;padding:.1rem .45rem;border-radius:3px;border:1px solid var(--rule);color:var(--ink-2);background:var(--sheet-2);vertical-align:middle;white-space:nowrap}
+.pill.live{border-color:var(--ok);color:var(--ok);background:var(--ok-soft)}
+.pill.mig{border-color:var(--blue);color:var(--blue);background:var(--blue-soft)}
+.pill.plan{border-style:dashed}
+.pill.gap{border-color:var(--wax);color:var(--wax);background:var(--wax-soft)}
+
+/* ---------- the darkroom (ML section) ---------- */
+.darkroom{background:var(--dk-paper);color:var(--dk-ink);margin:0;padding:3.6rem 0 2.4rem;border-top:6px solid var(--amber);border-bottom:6px solid var(--amber)}
+.darkroom .frame{color:var(--dk-ink)}
+.darkroom .kicker{color:var(--amber)}
+.darkroom a{color:var(--amber-ink)}
+.darkroom h2,.darkroom h3{color:var(--dk-ink)}
+.darkroom .intro{color:var(--dk-ink)}
+.darkroom p{color:var(--dk-ink)}
+.darkroom small,.darkroom .small{color:var(--dk-ink-2)}
+.darkroom .note{color:var(--dk-ink-2);border-left-color:var(--dk-rule)}
+.darkroom .note .who{color:var(--amber)}
+@media (max-width:1119px){ .darkroom .note{border-left-color:var(--amber)} }
+.darkroom code{background:var(--dk-sheet);border-color:var(--dk-rule);color:var(--dk-ink)}
+.darkroom pre{background:var(--dk-sheet);border-color:var(--dk-rule);color:var(--dk-ink)}
+.darkroom .tbl{background:var(--dk-sheet);border-color:var(--dk-rule);color:var(--dk-ink)}
+.darkroom .tbl th{background:#2A2520;color:var(--dk-ink-3);border-color:var(--dk-rule)}
+.darkroom .tbl td{border-color:var(--dk-rule)}
+.darkroom figure.fig svg{color:var(--dk-ink)}
+.darkroom figure.fig figcaption{color:var(--dk-ink-2)}
+.darkroom figure.fig figcaption b{color:var(--dk-ink)}
+.darkroom .svg-box{fill:var(--dk-sheet)}
+.darkroom .svg-box-2{fill:#2A2520}
+.darkroom .svg-blue{fill:var(--amber-soft);stroke:var(--amber)}
+.darkroom .svg-edge-blue{stroke:var(--amber)}
+.darkroom .svg-m{fill:var(--dk-ink-2)}
+.darkroom .svg-faint{stroke:var(--dk-rule)}
+.darkroom .svg-wax{fill:#3D2320;stroke:#E27B62}
+.darkroom .pill{border-color:var(--dk-rule);color:var(--dk-ink-2);background:var(--dk-sheet)}
+.darkroom .pill.live{border-color:#7FC99A;color:#9BD9B2;background:#1E2F24}
+.darkroom .pill.mig{border-color:var(--amber);color:var(--amber-ink);background:var(--amber-soft)}
+.darkroom .pill.gap{border-color:#E27B62;color:#F0A08C;background:#3D2320}
+.darkroom .bar .lab{color:var(--dk-ink-2)}
+.darkroom .bar .fill{background:var(--amber)}
+.darkroom .bar .fill.hot{background:#E27B62}
+.darkroom .bar .val{color:var(--dk-ink)}
+.darkroom .lessons li{border-color:var(--dk-rule)}
+.darkroom .lessons li::before{color:var(--amber)}
+.darkroom .lessons p{color:var(--dk-ink-2)}
+.darkroom .safelight{font-family:var(--f-mono);font-size:.72rem;color:var(--amber);display:flex;align-items:center;gap:.6rem;margin-bottom:.8rem}
+.darkroom .safelight::before{content:"";width:9px;height:9px;border-radius:50%;background:var(--amber);box-shadow:0 0 12px 3px rgba(233,162,59,.55)}
+.darkroom .rules .rule{background:var(--dk-sheet);border-color:var(--dk-rule)}
+.darkroom .rule .why{color:var(--dk-ink-2)}
+.darkroom .rule .forced{border-color:var(--dk-rule)}
+.darkroom .rule .forced b{color:var(--amber)}
+
+/* footer */
+.foot{padding:2.5rem 0 4rem;font-size:.84rem;color:var(--ink-3);font-family:var(--f-mono)}
+.foot p{margin:0 0 .4rem}
+
+@media (prefers-reduced-motion:reduce){ *{transition:none!important;animation:none!important} }
+@media (max-width:640px){
+  html{font-size:16px}
+  .mast{padding:3rem 0 2rem}
+  .mast .deva{font-size:3.6rem}
+  .mast h1{font-size:2.3rem}
+  h2{font-size:1.65rem}
+  .frame{padding:0 18px}
+  .bar{grid-template-columns:7.5rem 1fr 4.5rem}
+}
+</style>
+</head>
+<body>
+<nav class="nav" aria-label="Sections"><div class="in">
+  <span class="brand">चित्र</span>
+  <a href="#why"><b>1</b>Why</a>
+  <a href="#rules"><b>2</b>Rules</a>
+  <a href="#shape"><b>3</b>Shape</a>
+  <a href="#journey"><b>4</b>Journey</a>
+  <a href="#reading"><b>5</b>Reading</a>
+  <a href="#data"><b>6</b>Data</a>
+  <a href="#clients"><b>7</b>Clients</a>
+  <a href="#darkroom"><b>8</b>Darkroom</a>
+  <a href="#ops"><b>9</b>Ops</a>
+  <a href="#incidents"><b>10</b>Incidents</a>
+  <a href="#lessons"><b>11</b>Lessons</a>
+  <a href="#next"><b>12</b>Next</a>
+</div></nav>
+
+<header class="mast"><div class="frame">
+  <div class="word"><span class="deva" lang="hi">चित्र</span><h1>Chitra</h1></div>
+  <p class="thesis">A photo library I built on one home server, mostly to find out what “system architecture” feels like when you also have to keep it running.</p>
+  <p class="lede">Chitra is the Sanskrit and Hindi word for a picture. The system backs up a family’s iPhones to a machine at home, stores the originals, makes thumbnails, transcodes video, finds faces, tags scenes, and answers “beach at sunset” with actual photos. It runs on six CPU cores and no GPU, behind a home internet connection. This page is the tour: the shape of the system, the constraints that bent it, the machine-learning pieces, the things that broke, and what all of it taught me.</p>
+  <p class="byline">Written 2 September 2026 by Saurav Agrawal. Every number was read from the live system that morning, and the numbers move.</p>
+
+  <div class="exif">
+    <div class="cap">Field data, recorded the way a camera would</div>
+    <dl>
+      <div class="cell"><dt>Body</dt><dd>Intel Core i5-8500, 6 cores, no hyperthreading, no GPU</dd></div>
+      <div class="cell"><dt>Memory</dt><dd>15.8 GB, shared with a dozen other home services</dd></div>
+      <div class="cell"><dt>Storage</dt><dd>256 GB NVMe for metadata; 1 TB USB disk for media</dd></div>
+      <div class="cell"><dt>Library</dt><dd>2,374 photos and 359 videos, 38 GB of originals</dd></div>
+      <div class="cell"><dt>People</dt><dd>3,289 faces, 19 persons, 13 of them named</dd></div>
+      <div class="cell"><dt>Vocabulary</dt><dd>345 scene labels, 12,026 tag rows</dd></div>
+      <div class="cell"><dt>Code</dt><dd>24.6k lines of Python, 7.6k Swift, 3.8k TypeScript</dd></div>
+      <div class="cell"><dt>Users</dt><dd>4 accounts, admin-approved only</dd></div>
+      <div class="cell"><dt>Cloud spend</dt><dd>None for compute or storage</dd></div>
+      <div class="cell"><dt>Incidents</dt><dd>3 written up, 0 photos lost</dd></div>
+      <div class="cell"><dt>Born</dt><dd>17 November 2025, as a command-line tool</dd></div>
+      <div class="cell"><dt>Exposure</dt><dd>98 commits, 68 of them in the first two days of September 2026</dd></div>
+    </dl>
+  </div>
+</div></header>
+
+<!-- ============ 1 WHY ============ -->
+<section class="sec" id="why"><div class="frame"><div class="col">
+  <div class="kicker">1 / Why</div>
+  <h2>Why build a photo library when Google Photos exists</h2>
+  <p class="intro">Because the goal was never the photos. The goal was to learn system architecture, and the only way I trust is to run a real system for real people who notice when it breaks.</p>
+
+  <aside class="note"><span class="who">Field note</span><p>Architecture diagrams are cheap. The expensive part is discovering which boxes lie. Chitra’s health endpoint said “ok” for five days while the disk was gone. That lesson is not in any book I read.</p></aside>
+  <p>Books teach the vocabulary: queues, object stores, sidecars, cache invalidation. Running something teaches the consequences. A queue is a diagram until the scheduler never runs and 1,485 jobs sit in Redis for nine months. A cache is a good idea until it is bounded by entries instead of bytes and quietly eats a gigabyte per worker. Photos were the right vehicle because they are unforgiving: the files are large, the users are family, and the data cannot be regenerated if you lose it.</p>
+  <p>So each phase of Chitra was picked to force one new architectural idea into the system, and I let the system push back. Here is the sequence.</p>
+
+  <ol class="tl">
+    <li><span class="when">November 2025</span><span class="what">A command-line tool.</span><p>Typer plus a Textual terminal UI. Scan folders, extract EXIF, embed with CLIP, tag, find duplicates by perceptual hash, cluster, export a static gallery. Everything in one SQLite file, photos left untouched. The lesson was data modelling and idempotent scans.</p></li>
+    <li><span class="when">December 2025</span><span class="what">A service.</span><p>Flask for five days, then FastAPI, MinIO for objects, Redis and RQ for background jobs, and a login layer, all inside one week. The lesson was process boundaries: what runs in the request, what runs later, and where bytes live.</p></li>
+    <li><span class="when">April 2026</span><span class="what">Two clients.</span><p>A SwiftUI iPhone app with zero dependencies and a React web app cut over on the same day. The lesson was contracts, and the discovery that browsers cannot send an authorization header on an image tag.</p></li>
+    <li><span class="when">May 2026</span><span class="what">Video.</span><p>Posters from keyframes, transcodes to browser-safe H.264, range-streamed playback. The lesson was long-running jobs and state machines, including the state a job gets stuck in when someone kills it.</p></li>
+    <li><span class="when">July 2026</span><span class="what">The network.</span><p>Split-horizon DNS so home uploads skip the tunnel, hardware video encoding on the integrated GPU, and a refusal to boot with a default signing secret. The lesson was that the network is part of the system, not the thing around it.</p></li>
+    <li><span class="when">September 2026</span><span class="what">Reliability, with agents.</span><p>Sixty-eight commits in two days working alongside AI coding agents: an embedding sidecar, a byte-bounded cache, a 345-label vocabulary, and a migration from CLIP to SigLIP 2 that finished the morning this page was written. The lesson was that on a small box memory is the real currency, and a migration needs two switches, not one.</p></li>
+  </ol>
+
+  <aside class="note"><span class="who">Field note</span><p>The Python side is 43% tests by line count. Not because I planned it; because every incident ended with a test that pins the fix, and there were a lot of incidents.</p></aside>
+  <p>What follows is the system as it stands today, written for people who did not watch it grow. Where a decision looks odd, there is usually an outage behind it, and I have tried to point at the outage.</p>
+</div></div></section>
+
+<!-- ============ 2 RULES ============ -->
+<section class="sec" id="rules"><div class="frame"><div class="col">
+  <div class="kicker">2 / Rules</div>
+  <h2>The rules of the game</h2>
+  <p class="intro">Every architecture is a response to constraints. These were mine. Each one shows up somewhere in the design, and the last line of each card says where.</p>
+
+  <div class="rules wide">
+    <div class="rule"><div class="what">One box, six cores, no GPU.</div><div class="why">An i5-8500 with 15.8 GB of RAM that also runs a local LLM chat UI, a RAG service, and a dozen other homelab services. Nothing here is dedicated to Chitra.</div><div class="forced"><b>What it forced</b>CPU-only models, thread caps at exactly 3, memory ceilings per service (4 GB for the API, 8 GB for workers), and one embedding process instead of one per worker.</div></div>
+    <div class="rule"><div class="what">The media disk is dying.</div><div class="why">Originals, thumbnails, posters and face crops sit on a 1 TB USB drive with thousands of unrecovered read errors and eleven known bad sectors. I accepted the risk knowingly.</div><div class="forced"><b>What it forced</b>Metadata on the healthy NVMe. Batch jobs read 237 KB thumbnails instead of 4.6 MB originals. Re-tagging reads no media at all. Scripts watch the kernel error counter and abort when it climbs.</div></div>
+    <div class="rule"><div class="what">Home internet, through a free tunnel.</div><div class="why">A Cloudflare tunnel makes the API reachable anywhere, but traffic from the living room hairpins out to Cloudflare and back: 7 MB/s and a 100 MB body cap, versus 553 MB/s and 5 GB straight into the box.</div><div class="forced"><b>What it forced</b>Split-horizon DNS at home, an iPhone app that probes the LAN and sticks to it, and a backpressure governor once the fast path started overrunning the storage.</div></div>
+    <div class="rule"><div class="what">It is on the internet.</div><div class="why">Anyone who can reach the tunnel can reach the API. A missing auth check is not a bug report, it is an open door.</div><div class="forced"><b>What it forced</b>An auth dependency on 39 of 44 routes, a whitelist gate on new accounts, single-purpose media tokens for video tags, and a server that refuses to start with a known default secret.</div></div>
+    <div class="rule"><div class="what">Zero cloud spend. Photos stay home.</div><div class="why">No managed vector database, no hosted ML API, no object storage bill. The point was to learn what these services do by owning the problem they solve.</div><div class="forced"><b>What it forced</b>Local models, SQLite, brute-force search over an 8 MB matrix, and the discovery that at this scale a vector database would solve nothing.</div></div>
+    <div class="rule"><div class="what">One part-time developer.</div><div class="why">Ten months of history with a five-and-a-half-month gap in the middle. AI agents joined in September 2026 and multiplied the hands but not the memory.</div><div class="forced"><b>What it forced</b>Additive-only schema migrations, tests that refuse to touch the production database by default, agent context files that record every gotcha, and a restart script that refuses to run during a transcode.</div></div>
+    <div class="rule"><div class="what">Never lose a photo.</div><div class="why">A backup tool that loses the thing it backs up has failed at its only job.</div><div class="forced"><b>What it forced</b>Originals only, no on-device recompression. SHA-1 dedupe before any upload. A database snapshot before every risky operation (twelve of them sit beside the live file). Rollback by flipping config, never by re-running a migration.</div></div>
+    <div class="rule"><div class="what">Phones are hostile clients.</div><div class="why">iOS suspends the app mid-upload, defaults to WiFi-only, and neither an image tag nor a video player can send a custom header.</div><div class="forced"><b>What it forced</b>Multipart bodies streamed from a temp file, a background task with a 25-second budget, blob-fetched images in the browser, and a short-lived token that travels in the query string.</div></div>
+  </div>
+</div></div></section>
+
+<!-- ============ 3 SHAPE ============ -->
+<section class="sec" id="shape"><div class="frame"><div class="col">
+  <div class="kicker">3 / Shape</div>
+  <h2>The shape of it</h2>
+  <p class="intro">Two clients, one API, six worker processes, one model server, three stores, all on one machine. Fig. 1 is the whole thing.</p>
+
+  <figure class="fig wide">
+  <svg viewBox="0 0 980 480" role="img" aria-label="System topology: iPhone and web clients reach the API through either the Cloudflare tunnel or the home LAN; the API talks to SQLite, MinIO and Redis and asks an embedding sidecar for text vectors; RQ workers dequeue jobs from Redis, use the sidecar for image vectors, and read and write the stores.">
+    <defs><marker id="arr1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+    <rect class="svg-box" x="16" y="70" width="150" height="56" rx="3"/>
+    <text class="svg-h" x="28" y="93">iPhone app</text><text class="svg-m" x="28" y="111">ChitraSync, SwiftUI</text>
+    <rect class="svg-box" x="16" y="160" width="150" height="56" rx="3"/>
+    <text class="svg-h" x="28" y="183">Web app</text><text class="svg-m" x="28" y="201">React SPA, static</text>
+    <path class="svg-edge" d="M166 98 H196 V188 H166"/>
+    <path class="svg-edge" d="M196 98 H226" marker-end="url(#arr1)"/>
+    <path class="svg-edge" d="M196 188 H226" marker-end="url(#arr1)"/>
+    <rect class="svg-box" x="226" y="70" width="178" height="56" rx="3"/>
+    <text class="svg-h" x="238" y="93">Cloudflare tunnel</text><text class="svg-m" x="238" y="111">from anywhere, ~7 MB/s</text>
+    <rect class="svg-box" x="226" y="160" width="178" height="56" rx="3"/>
+    <text class="svg-h" x="238" y="183">Home LAN, split DNS</text><text class="svg-m" x="238" y="201">same name, ~550 MB/s</text>
+    <path class="svg-edge" d="M404 98 H434 V143 H452" marker-end="url(#arr1)"/>
+    <path class="svg-edge" d="M404 188 H434 V143"/>
+    <rect class="svg-box" x="452" y="108" width="118" height="70" rx="3"/>
+    <text class="svg-h" x="464" y="131">Front door</text><text class="svg-m" x="464" y="149">cloudflared,</text><text class="svg-m" x="464" y="165">nginx</text>
+    <path class="svg-edge" d="M570 143 H620" marker-end="url(#arr1)"/>
+    <rect class="svg-box" x="620" y="108" width="170" height="70" rx="3"/>
+    <text class="svg-h" x="632" y="131">FastAPI on :5000</text>
+    <text class="svg-m" x="632" y="149">uvicorn ×4, 44 routes</text>
+    <text class="svg-m" x="632" y="165">no ML in-process, ≤ 200 MB</text>
+    <rect class="svg-blue" x="620" y="228" width="170" height="56" rx="3"/>
+    <text class="svg-h" x="632" y="251">Embedding sidecar</text><text class="svg-m" x="632" y="269">SigLIP 2, one copy, :5101</text>
+    <path class="svg-edge" d="M705 178 V228" marker-end="url(#arr1)"/>
+    <text class="svg-m" x="712" y="207">text → vector</text>
+    <rect class="svg-box" x="400" y="340" width="180" height="60" rx="3"/>
+    <text class="svg-h" x="412" y="363">RQ video workers ×2</text><text class="svg-m" x="412" y="381">ffmpeg, Quick Sync encode</text>
+    <rect class="svg-box" x="620" y="340" width="170" height="60" rx="3"/>
+    <text class="svg-h" x="632" y="363">RQ default workers ×4</text><text class="svg-m" x="632" y="381">embed, faces, posters, cluster</text>
+    <path class="svg-edge" d="M705 340 V284" marker-end="url(#arr1)"/>
+    <text class="svg-m" x="712" y="302">image → vector</text>
+    <rect class="svg-box-2" x="868" y="40" width="104" height="56" rx="3"/>
+    <text class="svg-h" x="880" y="63">SQLite</text><text class="svg-m" x="880" y="81">photo.db, NVMe</text>
+    <rect class="svg-box-2" x="868" y="126" width="104" height="70" rx="3"/>
+    <text class="svg-h" x="880" y="149">MinIO</text><text class="svg-m" x="880" y="167">chitra-photos</text><text class="svg-m" x="880" y="183">1 TB USB disk</text>
+    <rect class="svg-box-2" x="868" y="226" width="104" height="70" rx="3"/>
+    <text class="svg-h" x="880" y="249">Redis</text><text class="svg-m" x="880" y="267">job queues,</text><text class="svg-m" x="880" y="283">TTL markers</text>
+    <path class="svg-edge" d="M790 120 H826 V68 H868" marker-end="url(#arr1)"/>
+    <path class="svg-edge" d="M790 150 H868" marker-end="url(#arr1)"/>
+    <path class="svg-edge" d="M790 170 H826 V261 H868" marker-end="url(#arr1)"/>
+    <text class="svg-m" x="837" y="218" text-anchor="middle" transform="rotate(-90 837 218)">enqueue</text>
+    <path class="svg-edge" d="M790 370 H846 V84 H868" marker-end="url(#arr1)"/>
+    <path class="svg-edge" d="M846 180 H868" marker-end="url(#arr1)"/>
+    <path class="svg-edge" d="M580 370 H600 V318 H846"/>
+    <text class="svg-m" x="857" y="300" text-anchor="middle" transform="rotate(-90 857 300)">read originals, write derivatives</text>
+    <path class="svg-edge" d="M920 296 V445 H490 V400" marker-end="url(#arr1)"/>
+    <path class="svg-edge" d="M705 445 V400" marker-end="url(#arr1)"/>
+    <text class="svg-m" x="690" y="440" text-anchor="end">dequeue jobs</text>
+  </svg>
+  <figcaption><b>Fig. 1</b>Everything that runs. The same hostname takes one of two roads into the box. The API never loads a model and never runs ffmpeg; those belong to the sidecar and the workers, and the memory story in the darkroom section explains why.</figcaption>
+  </figure>
+
+  <h3>The front door</h3>
+  <aside class="note"><span class="who">Field note</span><p>Split DNS was rolled out to phones only, by hand. The install notes say why: this box has a real outage history, and making it the house’s only DNS server would take everyone’s browsing down with it.</p></aside>
+  <p>From outside, <code>api.saurav-swati.in</code> resolves to Cloudflare, which forwards through a tunnel to the machine. From inside the house, a dnsmasq rule answers the same hostname with the machine’s LAN address, and nginx terminates TLS with a real wildcard certificate obtained through a DNS challenge. Same URL, same certificate chain, two very different roads: the tunnel path caps request bodies around 100 MB and moves about 7 MB/s; the LAN path allows 5 GB and moves closer to 550 MB/s.</p>
+
+  <h3>The API tier</h3>
+  <p>Four uvicorn workers run one FastAPI app with 44 routes. It uses raw SQL, no ORM, and speaks to SQLite through an async driver. Two rules define its character and both were paid for with an outage. First, importing the app must stay under 200 MB with no PyTorch resident; a test starts a fresh interpreter and checks. Second, the API never spawns ffmpeg. Everything heavy is somebody else’s job.</p>
+
+  <h3>Workers and the sidecar</h3>
+  <p>Background work runs on RQ, a Redis-backed job queue. Four workers take the <code>default</code> queue for embeddings, face detection, video posters and face clustering. Two workers take the <code>video</code> queue for transcodes, which can run for minutes and hold a couple of cores each. RQ forks a fresh process per job, which is simple and safe and means nothing survives between jobs, including a loaded model. That is why the embedding model lives in its own long-running process on loopback port 5101. The API asks it for text vectors when someone searches; workers ask it for image vectors when a photo arrives. If it is down, search returns 503 and the health endpoint says so. There is deliberately no fallback that would load the model into the API.</p>
+
+  <h3>Three stores</h3>
+  <p>SQLite holds all metadata in one 38 MB file on the NVMe drive, in write-ahead mode. MinIO holds originals and every derivative in one bucket on the USB disk, behind an S3 API so that the storage could move without the code noticing. Redis holds the job queues and two kinds of short-lived markers. Section 6 goes through each.</p>
+</div></div></section>
+
+<!-- ============ 4 JOURNEY ============ -->
+<section class="sec" id="journey"><div class="frame"><div class="col">
+  <div class="kicker">4 / Journey</div>
+  <h2>A photo’s journey</h2>
+  <p class="intro">From the moment a phone sends bytes to the moment “beach at sunset” finds the picture. Fig. 2 is the request; the jobs underneath it are what make the photo findable.</p>
+
+  <figure class="fig wide">
+  <svg viewBox="0 0 980 330" role="img" aria-label="Upload pipeline: receive, fingerprint, check for duplicate, store in MinIO, record in SQLite, thumbnail, enqueue jobs. Jobs fan out to transcode, poster frame, embed and tag, detect faces, and cluster faces which depends on the face jobs.">
+    <defs><marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+    <rect class="svg-box" x="16" y="30" width="124" height="60" rx="3"/><text class="svg-h" x="26" y="53">Receive</text><text class="svg-m" x="26" y="69">stream to temp,</text><text class="svg-m" x="26" y="82">1 MiB chunks</text>
+    <path class="svg-edge" d="M140 60 H154" marker-end="url(#arr2)"/>
+    <rect class="svg-box" x="154" y="30" width="124" height="60" rx="3"/><text class="svg-h" x="164" y="53">Fingerprint</text><text class="svg-m" x="164" y="69">SHA-1, EXIF, pHash</text><text class="svg-m" x="164" y="82">ffprobe for video</text>
+    <path class="svg-edge" d="M278 60 H292" marker-end="url(#arr2)"/>
+    <rect class="svg-box" x="292" y="30" width="124" height="60" rx="3"/><text class="svg-h" x="302" y="53">Duplicate?</text><text class="svg-m" x="302" y="69">checksum lookup,</text><text class="svg-m" x="302" y="82">before any upload</text>
+    <path class="svg-edge" d="M416 60 H430" marker-end="url(#arr2)"/>
+    <rect class="svg-box" x="430" y="30" width="124" height="60" rx="3"/><text class="svg-h" x="440" y="53">Store</text><text class="svg-m" x="440" y="69">MinIO object at</text><text class="svg-m" x="440" y="82">photos/yyyy/mm/</text>
+    <path class="svg-edge" d="M554 60 H568" marker-end="url(#arr2)"/>
+    <rect class="svg-box" x="568" y="30" width="124" height="60" rx="3"/><text class="svg-h" x="578" y="53">Record</text><text class="svg-m" x="578" y="69">photos row</text><text class="svg-m" x="578" y="82">in SQLite</text>
+    <path class="svg-edge" d="M692 60 H706" marker-end="url(#arr2)"/>
+    <rect class="svg-box" x="706" y="30" width="124" height="60" rx="3"/><text class="svg-h" x="716" y="53">Thumbnail</text><text class="svg-m" x="716" y="69">photo: inline JPEG</text><text class="svg-m" x="716" y="82">video: poster job</text>
+    <path class="svg-edge" d="M830 60 H844" marker-end="url(#arr2)"/>
+    <rect class="svg-box" x="844" y="30" width="124" height="60" rx="3"/><text class="svg-h" x="854" y="53">Enqueue</text><text class="svg-m" x="854" y="69">jobs onto Redis,</text><text class="svg-m" x="854" y="82">by queue</text>
+    <path class="svg-edge-dash" d="M354 90 V124" marker-end="url(#arr2)"/><text class="svg-m" x="354" y="141" text-anchor="middle">yes: return the existing row,</text><text class="svg-m" x="354" y="154" text-anchor="middle">upload nothing</text>
+    <path class="svg-edge" d="M906 90 V175 H104"/>
+    <path class="svg-edge" d="M104 175 V220" marker-end="url(#arr2)"/>
+    <path class="svg-edge" d="M296 175 V220" marker-end="url(#arr2)"/>
+    <path class="svg-edge" d="M488 175 V220" marker-end="url(#arr2)"/>
+    <path class="svg-edge" d="M680 175 V220" marker-end="url(#arr2)"/>
+    <text class="svg-m" x="898" y="140" text-anchor="end">video: A, B</text><text class="svg-m" x="898" y="153" text-anchor="end">photo: C, D, then E</text>
+    <rect class="svg-box" x="16" y="220" width="176" height="64" rx="3"/><text class="svg-h" x="26" y="243">A: Transcode</text><text class="svg-m" x="26" y="259">video queue, up to 2 h,</text><text class="svg-m" x="26" y="272">iGPU encode, CPU decode</text>
+    <rect class="svg-box" x="208" y="220" width="176" height="64" rx="3"/><text class="svg-h" x="218" y="243">B: Poster frame</text><text class="svg-m" x="218" y="259">default queue, 1–3 s,</text><text class="svg-m" x="218" y="272">never behind a transcode</text>
+    <rect class="svg-box" x="400" y="220" width="176" height="64" rx="3"/><text class="svg-h" x="410" y="243">C: Embed + tag</text><text class="svg-m" x="410" y="259">default queue,</text><text class="svg-m" x="410" y="272">one call to the sidecar</text>
+    <rect class="svg-box" x="592" y="220" width="176" height="64" rx="3"/><text class="svg-h" x="602" y="243">D: Detect faces</text><text class="svg-m" x="602" y="259">default queue, buffalo_l,</text><text class="svg-m" x="602" y="272">crops to MinIO</text>
+    <rect class="svg-box" x="784" y="220" width="176" height="64" rx="3"/><text class="svg-h" x="794" y="243">E: Cluster faces</text><text class="svg-m" x="794" y="259">once per upload batch,</text><text class="svg-m" x="794" y="272">depends on the D jobs</text>
+    <path class="svg-edge" d="M768 252 H784" marker-end="url(#arr2)"/>
+  </svg>
+  <figcaption><b>Fig. 2</b>The upload request and the jobs it leaves behind. The duplicate check happens before the object store is touched, so a re-upload costs the failing disk nothing. Clustering waits on the batch’s face jobs with a dependency, not a timer.</figcaption>
+  </figure>
+
+  <p>The request streams each file to a temporary path a megabyte at a time, so a 4 GB video never sits in memory. Up to three files in one request are processed in parallel. Fingerprinting produces a SHA-1 over the bytes, an EXIF date and GPS position for photos, a perceptual hash for near-duplicate detection, and for videos an ffprobe call that reads the creation time from the container, with a guard for encoders that write 1970.</p>
+
+  <aside class="note"><span class="who">Field note</span><p>The object key uses the upload year and month, not the capture date. So 2,501 objects live under <code>photos/2026/</code> regardless of when they were taken. Harmless, and a good reminder that a key is a name, not a fact.</p></aside>
+  <p>The checksum lookup runs before anything is uploaded. A hit returns the existing row and the words <code>duplicate: true</code>, and the iPhone app leans on exactly this: it does no pre-flight “do you have this?” call, it simply uploads and reads the verdict. Then the object goes to MinIO, the row goes to SQLite, and the thumbnail is made. For a photo that is a 512-pixel JPEG built inline. For a video it is a job, because the API is not allowed to run ffmpeg; the response carries a null thumbnail and both clients tolerate it and retry.</p>
+
+  <p>Finally the jobs. A photo gets an embedding job and a face job on the default queue. A video gets a transcode on the video queue and a poster job on the default queue, deliberately not the video queue, because a poster stuck behind a ten-minute 4K transcode would arrive ten minutes late, and the poster is what the grid shows. One clustering job per upload batch runs after that batch’s face jobs, declared as a dependency with <code>allow_failure</code>, so that a face job that crashes cannot leave the batch waiting forever.</p>
+
+  <aside class="note"><span class="who">Field note</span><p>Clustering used to be scheduled 30 seconds after upload with a delayed enqueue. Nothing on the box dequeued delayed jobs. From December to September 1,485 of them piled up while 73% of faces sat unassigned. The fix was not a scheduler. It was a dependency.</p></aside>
+  <h3>The video branch</h3>
+  <p>A video is browser-safe only if all three hold: H.264 video, an MP4 container, and AAC or no audio. iPhone footage is HEVC in a MOV, so almost everything is transcoded. The encoder is the integrated GPU through VA-API; decoding stays on the CPU on purpose, because feeding hardware-decoded 10-bit HEVC into the hardware encoder trips a driver allocation bug on this generation of Intel graphics, and the encoder is the expensive half anyway. Any failure falls back to libx264. The row moves through <code>pending</code>, <code>processing</code>, and then <code>ready</code>, <code>failed</code> or <code>not_needed</code>; the playback endpoint answers 409 while it is in flight. Two 4K transcodes at once push the one-minute load average past 12, so 4K work is requeued one at a time.</p>
+</div></div></section>
+
+<!-- ============ 5 READING ============ -->
+<section class="sec" id="reading"><div class="frame"><div class="col">
+  <div class="kicker">5 / Reading</div>
+  <h2>Getting the pictures back</h2>
+  <p class="intro">Serving is where a browser’s rules collide with an authenticated API. Half of the read path exists because an image tag cannot carry a header.</p>
+
+  <figure class="fig wide">
+  <svg viewBox="0 0 980 260" role="img" aria-label="Two read paths. Thumbnails: the browser image tag cannot send a bearer token, so an AuthImage component fetches with the token and creates a blob URL; the server answers with an ETag and a per-worker byte-bounded cache in front of MinIO. Video: the player cannot send a header either, so the client obtains a media-scoped token, passes it as a query parameter on a range request, and receives 206 partial content streamed in 1 MiB chunks from MinIO.">
+    <defs><marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+    <rect class="svg-box" x="16" y="30" width="170" height="64" rx="3"/><text class="svg-h" x="26" y="53">Browser &lt;img&gt;</text><text class="svg-m" x="26" y="69">cannot send a</text><text class="svg-m" x="26" y="82">bearer header</text>
+    <path class="svg-edge" d="M186 62 H210" marker-end="url(#arr3)"/>
+    <rect class="svg-box" x="210" y="30" width="170" height="64" rx="3"/><text class="svg-h" x="220" y="53">AuthImage</text><text class="svg-m" x="220" y="69">fetch() with the token,</text><text class="svg-m" x="220" y="82">bytes → blob URL</text>
+    <path class="svg-edge" d="M380 62 H404" marker-end="url(#arr3)"/>
+    <rect class="svg-box" x="404" y="30" width="170" height="64" rx="3"/><text class="svg-h" x="414" y="53">GET …/thumbnail</text><text class="svg-m" x="414" y="69">ETag, 304 if unchanged,</text><text class="svg-m" x="414" y="82">7-day cache header</text>
+    <path class="svg-edge" d="M574 62 H598" marker-end="url(#arr3)"/>
+    <rect class="svg-blue" x="598" y="30" width="170" height="64" rx="3"/><text class="svg-h" x="608" y="53">Per-worker cache</text><text class="svg-m" x="608" y="69">LRU, 64 MiB budget,</text><text class="svg-m" x="608" y="82">bounded by bytes</text>
+    <path class="svg-edge" d="M768 62 H792" marker-end="url(#arr3)"/>
+    <rect class="svg-box-2" x="792" y="30" width="170" height="64" rx="3"/><text class="svg-h" x="802" y="53">MinIO</text><text class="svg-m" x="802" y="69">thumbnails/photos/</text><text class="svg-m" x="802" y="82">{id}.jpg</text>
+
+    <rect class="svg-box" x="16" y="150" width="170" height="64" rx="3"/><text class="svg-h" x="26" y="173">&lt;video&gt;, AVPlayer</text><text class="svg-m" x="26" y="189">cannot send a</text><text class="svg-m" x="26" y="202">header either</text>
+    <path class="svg-edge" d="M186 182 H210" marker-end="url(#arr3)"/>
+    <rect class="svg-box" x="210" y="150" width="170" height="64" rx="3"/><text class="svg-h" x="220" y="173">GET /api/media-token</text><text class="svg-m" x="220" y="189">scope: media only,</text><text class="svg-m" x="220" y="202">valid 60 minutes</text>
+    <path class="svg-edge" d="M380 182 H404" marker-end="url(#arr3)"/>
+    <rect class="svg-box" x="404" y="150" width="170" height="64" rx="3"/><text class="svg-h" x="414" y="173">GET …/video?token=</text><text class="svg-m" x="414" y="189">Range: bytes=…</text><text class="svg-m" x="414" y="202">409 while transcoding</text>
+    <path class="svg-edge" d="M574 182 H598" marker-end="url(#arr3)"/>
+    <rect class="svg-box" x="598" y="150" width="170" height="64" rx="3"/><text class="svg-h" x="608" y="173">206 Partial Content</text><text class="svg-m" x="608" y="189">1 MiB chunks, streamed,</text><text class="svg-m" x="608" y="202">never buffered whole</text>
+    <path class="svg-edge" d="M768 182 H792" marker-end="url(#arr3)"/>
+    <rect class="svg-box-2" x="792" y="150" width="170" height="64" rx="3"/><text class="svg-h" x="802" y="173">MinIO</text><text class="svg-m" x="802" y="189">videos/playback/</text><text class="svg-m" x="802" y="202">{id}.mp4</text>
+  </svg>
+  <figcaption><b>Fig. 3</b>The two read paths that browsers forced. The top lane carries the token in a header the client attaches by hand; the bottom lane carries a weaker, single-purpose token in the URL because the player gives no other option.</figcaption>
+  </figure>
+
+  <h3>Thumbnails</h3>
+  <aside class="note"><span class="who">Field note</span><p>Face crops were failing at 51% versus 3.5% for photo thumbnails, because every visit to the People page re-downloaded two thousand crops from the disk. Adding the same ETag and 7-day cache header fixed it. The disk was the bottleneck, not the code.</p></aside>
+  <p>The web app fetches every thumbnail with the token attached, turns the bytes into a blob URL, hands that to the image tag, and revokes the URL when its query cache drops the entry, otherwise a scroll through the library leaks memory. On the server the endpoint derives an ETag from the photo id and object key, answers 304 to a matching <code>If-None-Match</code>, and marks the response cacheable for seven days. Behind it sits a per-process cache of decoded thumbnails, bounded to 64 MiB per uvicorn worker. It used to be bounded to a thousand entries instead, and section 10 tells that story. Sources that cannot be decoded, such as the 63 JPEG files that arrived with a <code>.arw</code> extension, are remembered in Redis for an hour so that a broken file does not trigger a multi-megabyte download on every grid render.</p>
+
+  <h3>Originals and video</h3>
+  <p>An original is fetched whole. RAW and HEIC files are decoded on the server and re-encoded as a high-quality JPEG, since browsers cannot show them; the response is marked never-cache. Video needs the second lane in Fig. 3. The client asks for a media token whose only claim is <code>scope: media</code>, valid for an hour. The playback endpoint accepts only that scope, and the normal API refuses it, so a leaked media token cannot list or delete anything. The endpoint honours byte ranges, answers 206 with the requested slice streamed from MinIO a megabyte at a time, 416 for an unsatisfiable range, 409 while the transcode is still running, and 422 if it failed.</p>
+
+  <h3>Search</h3>
+  <p>A text query goes to the sidecar and comes back as a 768-number vector. The API loads every stored vector for the active model from SQLite, stacks them into a matrix, multiplies once, keeps scores above a threshold, sorts, and returns the top results. The whole thing is about 80 milliseconds. There is no vector database and no approximate index; the darkroom section shows why one would be a solution to a problem this library does not have.</p>
+</div></div></section>
+
+<!-- ============ 6 DATA ============ -->
+<section class="sec" id="data"><div class="frame"><div class="col">
+  <div class="kicker">6 / Data</div>
+  <h2>Where things live</h2>
+  <p class="intro">Five places hold state, and each was chosen for a reason that fits on one line.</p>
+
+  <div class="scroll wide"><table class="tbl">
+    <thead><tr><th>Store</th><th>What it holds</th><th>Where</th><th>Why this and not something bigger</th></tr></thead>
+    <tbody>
+      <tr><td class="k">SQLite</td><td>Eight tables: photos, embeddings, tags, faces, face_thumbs, persons, clusters, users. One 38 MB file in write-ahead mode.</td><td class="n">NVMe</td><td>One machine, a handful of writers, and a 13 MB embeddings table. Postgres would add an operator and solve nothing.</td></tr>
+      <tr><td class="k">MinIO</td><td>Bucket <code>chitra-photos</code>: originals under <code>photos/yyyy/mm/</code>, thumbnails and video posters under <code>thumbnails/photos/</code>, face crops under <code>thumbnails/faces/</code>, transcodes under <code>videos/playback/</code>.</td><td class="n">USB 1 TB</td><td>An S3 API from day one, so the bytes can move to a better disk or a real bucket without the code noticing.</td></tr>
+      <tr><td class="k">Redis</td><td>Two job queues, job results, and two families of markers: “poster already requested” for five minutes and “this source cannot be decoded” for an hour.</td><td class="n">loopback</td><td>RQ needs it anyway. The markers live here rather than in a column so they expire on their own.</td></tr>
+      <tr><td class="k">FAISS</td><td>One HNSW index over the face vectors of every assigned face, mapped by face id. 3.3 MB. Faces only; photo search uses none.</td><td class="n">NVMe</td><td>Face matching runs once per detected face against thousands of neighbours; that is the one place an index earns its keep.</td></tr>
+      <tr><td class="k">Model cache</td><td>Hugging Face weights, the InsightFace ONNX files, and the cached 345×512 label matrix keyed by a fingerprint of the vocabulary.</td><td class="n">NVMe</td><td>Read-only and regenerable. It just has to stay off the failing disk.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Four schema decisions that mattered</h3>
+  <aside class="note"><span class="who">Field note</span><p>Twelve database snapshots sit next to the live file, each named for what it preceded: pre-retag, pre-SigLIP, pre-cutover. That is the migration framework. It is not elegant. It has never lost a row.</p></aside>
+  <ul>
+    <li><b>Embeddings are unique on (photo, model), not on photo.</b> A key on photo alone would make the first SigLIP row evict the CLIP row it was meant to run beside, and turn a safe migration into an unrecoverable one. This one index is the hinge the whole model migration swings on.</li>
+    <li><b>Tags are unique on (photo, tag) with a separate provenance column.</b> Every row records which model and vocabulary produced it, so a bad vocabulary is one <code>DELETE … WHERE source = …</code> away from gone.</li>
+    <li><b>Foreign keys are switched on, per connection, and not inside a try/except.</b> They never were before, which made every <code>ON DELETE CASCADE</code> a no-op and left 259 orphan rows behind deleted photos.</li>
+    <li><b>Migrations are additive only.</b> Startup runs a list of <code>ALTER TABLE ADD COLUMN</code> statements and ignores “already exists”. There is no version table, so renames and backfills have nowhere to live, and the schema is designed around never needing them.</li>
+  </ul>
+  <p>Two honest gaps: the synchronous and asynchronous database helpers carry duplicated schema code that has already drifted (the sync copy has no users table), and nothing has an owner column. Every approved user sees every photo, face and person. For a family library that is the intended behaviour; for anything else it would be the first thing to change.</p>
+</div></div></section>
+
+<!-- ============ 7 CLIENTS ============ -->
+<section class="sec" id="clients"><div class="frame"><div class="col">
+  <div class="kicker">7 / Clients</div>
+  <h2>Two clients, one contract</h2>
+  <p class="intro">A web app for browsing and a phone app for backing up. They share an API and almost nothing else, which is the point.</p>
+
+  <h3>The web app</h3>
+  <p>React 18 with TypeScript, Tailwind, a router and TanStack Query, built to a single 304 KB bundle and served by nginx as static files. It has ten routes: library, search, people, faces, a photo viewer, an admin area for approving accounts, and login. Every piece of server state goes through the query layer with a 30-second staleness window; every image goes through the blob-fetch component from Fig. 3. Upload is one multipart request with drag-and-drop and no progress bar. Search is submit-only, and results keep the server’s order because the relevance ranking is the whole point. It replaced a 2,400-line single-file predecessor on 27 April 2026, and the old build is still on disk as a rollback.</p>
+
+  <aside class="note"><span class="who">Field note</span><p>The gallery is not virtualised. A virtualisation library is installed and imported nowhere. Deep scrolling means hundreds of parallel thumbnail requests and live blob URLs. It is on the list.</p></aside>
+  <h3>The iPhone app</h3>
+  <p>ChitraSync is SwiftUI on iOS 17, Swift 5.9, with no third-party dependencies at all: 7.6k lines of app and 2.5k of tests. Its defining feature is a merged timeline that shows the device library and the server library as one date-sectioned grid with a “backed up” badge per cell. Sync looks back 30 days by default, uploads originals as they are (HEIC stays HEIC, a MOV stays a MOV), and streams each multipart body from a temp file so peak memory is one copy of the asset rather than two. Deduplication has three layers: the device asset identifier, a synthesised filename that embeds the capture time and part of that identifier, and finally the server’s SHA-1.</p>
+  <p>Concurrency is adaptive between one and five parallel uploads. It halves when the server signals backpressure and widens by one after eight straight successes, with jittered exponential backoff instead of the flat two-second wait that used to send five uploads back into a saturated backend in lockstep. Background sync runs as a processing task with a 25-second budget, WiFi-only by default. The token lives in the Keychain with an accessibility class that lets background sync read it before the first unlock.</p>
+
+  <aside class="note"><span class="who">Field note</span><p>The app got fast enough on the LAN to knock the storage over. Five uploads at three to six megabytes a second each and MinIO answered <code>SlowDownWrite</code>, which the API surfaced as a 500. That is not a fault, it is a request. The governor exists because the fast path worked.</p></aside>
+  <p>The most architectural piece of the app is how it finds the server. It probes the LAN address’s health endpoint and prefers it when it answers, with a 60-second success memory and a deliberately short 3-second failure memory. Staleness alone never sends it back to the tunnel: a long sync that drifted onto the tunnel mid-run once made every large video fail with 413, so only a transport failure clears the choice. The table below is why any of this matters.</p>
+
+  <div class="scroll"><table class="tbl">
+    <thead><tr><th>Path</th><th>Throughput</th><th>Body cap</th><th>Per-request latency</th><th>A 1 GB video</th></tr></thead>
+    <tbody>
+      <tr><td class="k">Through the tunnel</td><td class="n">~7 MB/s</td><td class="n">~100 MB</td><td class="n">~0.8 s</td><td class="n">~2.5 min</td></tr>
+      <tr><td class="k">On the home LAN</td><td class="n">~553 MB/s</td><td class="n">5 GB</td><td class="n">~3 ms</td><td class="n">~15 s</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Known gaps, documented in the repo rather than hidden: uploads still die when the app suspends because the session is a default one rather than a background one; Live Photo motion clips are dropped; and photos that fail permanently are retried on every run because the failure set is not persisted.</p>
+</div></div></section>
+<!-- ============ 8 DARKROOM ============ -->
+<section class="sec darkroom" id="darkroom"><div class="frame"><div class="col">
+  <div class="safelight">Safelight on. This is where pixels become vectors.</div>
+  <div class="kicker">8 / Darkroom</div>
+  <h2>The ML and AI integrations</h2>
+  <p class="intro">Three models, one process that holds the big one, and a great deal of measuring. No cloud APIs, no GPU, and no large language model anywhere in the pipeline.</p>
+
+  <div class="scroll wide"><table class="tbl">
+    <thead><tr><th>Model</th><th>Job</th><th>Vector</th><th>Memory</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td class="k">SigLIP 2 base<br><small>google/siglip2-base-patch16-224</small></td><td>Image and text embeddings in one shared space. This is what search, similar-photos and (soon) tagging rank in.</td><td class="n">768-d</td><td class="n">1.5 GB on disk; 0.9 GB at rest, 1.8 GB exercised, up to 3.2 GB worst case</td><td><span class="pill live">live since 2 Sep 2026</span></td></tr>
+      <tr><td class="k">CLIP ViT-B/32<br><small>openai/clip-vit-base-patch32</small></td><td>The previous generation of the same job. Its 2,721 vectors stay in the table as the rollback.</td><td class="n">512-d</td><td class="n">1.2 GB on disk; 1.26 GB resident</td><td><span class="pill mig">kept for rollback</span></td></tr>
+      <tr><td class="k">InsightFace buffalo_l<br><small>RetinaFace det_10g + ArcFace w600k_r50</small></td><td>Face detection and a face embedding per detection. Only two of its five networks are used.</td><td class="n">512-d</td><td class="n">326 MB on disk; ~1.4 GB peak, reloaded every job</td><td><span class="pill live">live</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <aside class="note"><span class="who">Field note</span><p>Captioning every photo with a local vision-language model through Ollama was measured and rejected: 7.7 to 10 tokens per second at 534% CPU, a backlog of 10 to 24 hours, and a 7.6× slowdown of the API while it ran. The plan says “do not reintroduce”. It is the only mention of an LLM in the repository.</p></aside>
+  <p>What is missing is as deliberate as what is present. There is no OCR, no captioning, no aesthetic scoring, and no chat. Each would cost memory this box does not have, and none of them makes a family photo easier to find than “the one with the monkey” already does.</p>
+
+  <h3>One copy of the model, please</h3>
+  <p>At the end of August the API was being killed by the kernel’s memory limiter, six times in two days, against a 4 GB ceiling. The mechanism was ordinary: each of four uvicorn workers imported PyTorch to compute a 12.7 millisecond text embedding, and PyTorch alone is about 550 MB per process before a model is loaded, 1.1 GB after. Four workers, four copies. Two of the six kills also named ffmpeg decoding threads that the upload handler had spawned inside the API’s memory group. Fig. 5 shows the before and after.</p>
+
+  <figure class="fig wide">
+  <svg viewBox="0 0 980 300" role="img" aria-label="Before: four uvicorn workers each holding PyTorch and CLIP at about 1.1 GB, and every RQ job loading CLIP for 58 seconds. After: four workers at about 80 MB with no PyTorch, one embedding sidecar holding the only model copy, and RQ jobs taking about 113 milliseconds through it.">
+    <defs><marker id="arr5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+    <text class="svg-h" x="16" y="24">Before, 1 September</text>
+    <rect class="svg-box" x="16" y="40" width="214" height="38" rx="3"/><text class="svg-t" x="26" y="57">uvicorn worker 1</text><text class="svg-m" x="26" y="71">torch + CLIP ≈ 1.1 GB</text>
+    <rect class="svg-box" x="16" y="86" width="214" height="38" rx="3"/><text class="svg-t" x="26" y="103">uvicorn worker 2</text><text class="svg-m" x="26" y="117">torch + CLIP ≈ 1.1 GB</text>
+    <rect class="svg-box" x="16" y="132" width="214" height="38" rx="3"/><text class="svg-t" x="26" y="149">uvicorn worker 3</text><text class="svg-m" x="26" y="163">torch + CLIP ≈ 1.1 GB</text>
+    <rect class="svg-box" x="16" y="178" width="214" height="38" rx="3"/><text class="svg-t" x="26" y="195">uvicorn worker 4</text><text class="svg-m" x="26" y="209">torch + CLIP ≈ 1.1 GB</text>
+    <rect class="svg-box" x="246" y="40" width="232" height="52" rx="3"/><text class="svg-t" x="256" y="60">RQ job, fresh fork</text><text class="svg-m" x="256" y="76">loads CLIP again: 58 s per photo</text>
+    <rect class="svg-wax" x="246" y="132" width="232" height="52" rx="3"/><text class="svg-t" x="256" y="152">Six OOM kills in two days</text><text class="svg-m" x="256" y="168">peak 4,296 MB against a 4 GB cap</text>
+    <path class="svg-edge-dash" d="M490 20 V280"/>
+    <text class="svg-h" x="520" y="24">After, 2 September</text>
+    <rect class="svg-box" x="520" y="40" width="190" height="38" rx="3"/><text class="svg-t" x="530" y="57">uvicorn worker 1</text><text class="svg-m" x="530" y="71">no torch, ≈ 80 MB</text>
+    <rect class="svg-box" x="520" y="86" width="190" height="38" rx="3"/><text class="svg-t" x="530" y="103">uvicorn worker 2</text><text class="svg-m" x="530" y="117">no torch, ≈ 80 MB</text>
+    <rect class="svg-box" x="520" y="132" width="190" height="38" rx="3"/><text class="svg-t" x="530" y="149">uvicorn worker 3</text><text class="svg-m" x="530" y="163">no torch, ≈ 80 MB</text>
+    <rect class="svg-box" x="520" y="178" width="190" height="38" rx="3"/><text class="svg-t" x="530" y="195">uvicorn worker 4</text><text class="svg-m" x="530" y="209">no torch, ≈ 80 MB</text>
+    <rect class="svg-box" x="520" y="236" width="190" height="44" rx="3"/><text class="svg-t" x="530" y="254">RQ job, fresh fork</text><text class="svg-m" x="530" y="270">≈ 113 ms through the sidecar</text>
+    <path class="svg-edge" d="M710 59 H740 V258 H710"/>
+    <path class="svg-edge" d="M710 105 H740"/>
+    <path class="svg-edge" d="M710 151 H740"/>
+    <path class="svg-edge" d="M710 197 H740"/>
+    <path class="svg-edge-blue" d="M740 132 H752" marker-end="url(#arr5)"/>
+    <rect class="svg-blue" x="752" y="96" width="212" height="72" rx="3"/>
+    <text class="svg-h" x="764" y="119">Embedding sidecar</text>
+    <text class="svg-m" x="764" y="136">the only model copy on the box</text>
+    <text class="svg-m" x="764" y="152">loopback :5101, three threads</text>
+  </svg>
+  <figcaption><b>Fig. 5</b>The same work, one model copy instead of five. The sidecar is a second FastAPI app with three endpoints and a hard-coded single worker, because a second worker would load a second copy, which is precisely the bug it exists to fix.</figcaption>
+  </figure>
+
+  <aside class="note"><span class="who">Field note</span><p>The sidecar answers the API in 5 seconds or not at all, because a person is waiting. It answers a worker within 60 seconds, because a cold sidecar takes ten seconds to load its model and a job that timed out during a restart would fail for no reason.</p></aside>
+  <p>The sidecar owns the model. It serialises requests through a single executor thread so the three-thread cap is the real degree of parallelism, and it speaks base64-encoded float32 to both callers. The API talks to it asynchronously; jobs talk to it synchronously through a client that shares the decoder so the wire format cannot drift. Nothing falls back to loading a model in-process, and a test starts a job in a fresh interpreter to prove PyTorch never enters it. Embedding jobs went from 58.5 seconds, 90% of which was loading CLIP into a fresh fork, to about 113 milliseconds of forward pass plus a download. Face jobs still pay the fork tax: 326 MB of ONNX weights reloaded per job, roughly 37 seconds each, and moving them into the sidecar is the next step on that road.</p>
+
+  <h3>Search is a matrix multiply</h3>
+  <p>A query is tokenised (0.19 ms), pushed through the text tower (66.7 ms with SigLIP, 12.4 ms with CLIP), and comes back as one vector. The API then reads every vector for the active model out of SQLite (5.4 ms), stacks them, normalises, and does a single matrix-vector product (8.4 ms for 7 MB). Scores above the threshold are sorted and the top results hydrated. The bars are the measured end-to-end cost on an idle box.</p>
+
+  <div class="bars">
+    <div class="bar"><span class="lab">CLIP, until this morning</span><span class="track"><span class="fill" style="width:33%"></span></span><span class="val">~27 ms</span></div>
+    <div class="bar"><span class="lab">SigLIP 2, now</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="val">~82 ms</span></div>
+  </div>
+  <p><small>End-to-end latency of a text search, sidecar hop included, measured against 2,276 embeddings. The plan had predicted a 15× regression; the measurement is 5.4× on the embed step and 3.1× end to end, and it is genuine compute, not memory paging: a wider tower and a fixed 64-token padding explain 5.5× between them.</small></p>
+
+  <aside class="note"><span class="who">Field note</span><p>Why filter by model in SQL rather than in Python? Because once, a single 768-dimensional row landed in a table of 512s, the stacking call raised, and every search for every user returned 500. One foreign row. The query now names the model it wants.</p></aside>
+  <p>There is no vector database and no approximate index for photos, and the code says why in one sentence: at this scale there is no case for one. Two thousand seven hundred vectors of 768 floats is 8 MB, and brute force over 8 MB costs single-digit milliseconds. The entire cost of a search is the text embedding. A cache for query vectors was evaluated and not built, for three honest reasons: nobody logs queries so the hit rate is a guess, the web client already de-duplicates repeats for thirty seconds, and neither client searches as you type, which is the one thing that would have made 66 milliseconds painful.</p>
+
+  <h3>Teaching it 345 words</h3>
+  <p>Tagging is zero-shot: no training, no labelled data. Each label is embedded once as the sentence “a photo of {label}”, and a photo’s tags are the labels whose vectors point most nearly the same way as the photo’s. The vocabulary grew from 17 labels to 345 across nine facets: scene (52), place (57), activity (53), object (71), people (27), occasion (30), photo style (32), time of day (12) and season (11). The label matrix is cached on disk under a fingerprint of the vocabulary, so that adding or reordering a label invalidates the cache instead of silently misaligning every tag.</p>
+
+  <aside class="note"><span class="who">Field note</span><p>Before calibration, “travel” was on 81% of the library and every photo got exactly six tags. After: 1.8%, a median of three tags, and a photo of a monkey is tagged bird, monkey, wildlife instead of family, food, friends, outdoors, portrait, travel.</p></aside>
+  <p>The hard part is that CLIP’s scores are not comparable across photos. Measured over eleven thousand stored rows, every raw score, good or bad, fell between 0.158 and 0.278, with the gap between a photo’s best and worst label around 0.03. There is no absolute threshold to pick. The workaround is corpus-relative calibration: for each label, the 90th percentile of its scores across the whole library maps to 0 and the 98.5th maps to 1; labels at or above 1 are kept, capped at eight, backfilled to three only from the band just below, and a photo that is below every label’s 90th percentile gets no tags at all. Re-tagging the library reads no images: it is one matrix product over 3.7 MB of vectors already in SQLite, and a test replaces the storage client with a stub that raises on every attribute to keep it that way.</p>
+  <p>The honest caveat is written into the code: a tag now means “unusually beach-like for this library”, not “depicts a beach”, and no label can cover more than about a tenth of the collection. That bound is the mechanism that stops another “travel”. SigLIP’s sigmoid training objective scores each image-and-text pair independently, which is exactly what makes an absolute threshold meaningful, and re-tagging under it is the step that retires the workaround. Until then, new uploads still get the old six-label path at job time, because calibration needs the whole corpus and a per-photo job does not have it.</p>
+
+  <h3>Faces</h3>
+  <p>Detection runs RetinaFace at 640×640 and keeps detections with confidence of at least 0.5; there is no minimum face size. Each face gets an ArcFace embedding of 512 numbers, already normalised, and a 160-pixel crop uploaded for the People page. ONNX Runtime ignores the usual thread environment variables, so the session class is patched inside a context manager to cap it at three threads, and the curve below is why three and not more.</p>
+
+  <div class="bars">
+    <div class="bar"><span class="lab">Uncapped (25+ threads)</span><span class="track"><span class="fill dim" style="width:82%"></span></span><span class="val">249 ms</span></div>
+    <div class="bar"><span class="lab">2 threads</span><span class="track"><span class="fill dim" style="width:47%"></span></span><span class="val">143 ms</span></div>
+    <div class="bar"><span class="lab">3 threads</span><span class="track"><span class="fill" style="width:34%"></span></span><span class="val">104 ms</span></div>
+    <div class="bar"><span class="lab">4 threads</span><span class="track"><span class="fill dim" style="width:100%"></span></span><span class="val">302 ms</span></div>
+  </div>
+  <p><small>Face detection latency per photo by ONNX intra-op thread count, median of 15 on an idle box. Four threads is worse than no cap at all. This is not a knob to nudge.</small></p>
+
+  <p>Matching runs in two phases. First, each new face looks up its five nearest neighbours among already-assigned faces in the HNSW index, and takes the person if the best cosine similarity clears 0.60. Second, whatever is left goes through HDBSCAN with a small minimum cluster size and an acceptance gate: a proposed cluster is kept only if its average pairwise similarity also clears 0.60, and it becomes a numbered person for a human to name. The threshold used to exist as four disagreeing constants (0.6, 0.75, 0.78). It was unified after measuring 549 labelled faces: different people never exceed 0.366, the same person averages 0.629, recall is 98.2% at 0.60 and 94.7% at 0.75, and a gate at 0.75 would have rejected five of the eight known people in the house.</p>
+
+  <aside class="note"><span class="who">Field note</span><p>The face index once mis-attributed 715 of 1,044 positions while passing a count check, because position <i>i</i> was assumed to be row <i>i</i>. Four workers appending forty vectors each once left eighty of one hundred and sixty in the file. Twelve rewrites once failed 387 concurrent reads. It is now id-mapped, written atomically, and locked.</p></aside>
+  <p>Today the table holds 3,289 faces across 19 persons, 43% assigned, up from 26% before the clustering trigger was fixed. Faces are never detected on videos; the embedding path reads the poster frame, but the face path was deliberately not generalised without a measurement first.</p>
+
+  <h3>Changing the film mid-roll</h3>
+  <p>The migration from CLIP to SigLIP 2 was designed to be boring, and the design fits in Fig. 6. Two environment variables: one tells the sidecar what to compute with, the other tells every ranking read which rows to filter to. They are read by different processes and the sidecar is forbidden from reading the second one, because a single variable driving both would flip the read side before a single photo was converted and search would quietly lose everything not yet re-embedded.</p>
+
+  <figure class="fig wide">
+  <svg viewBox="0 0 980 300" role="img" aria-label="The embeddings table holds one row per photo per model, unique on photo id and model. The sidecar writes rows for the model named by CHITRA_EMBED_MODEL; search reads only rows whose model matches CHITRA_ACTIVE_EMBED_MODEL. Flip the write side, re-embed, check coverage, then flip the read side; rollback is flipping the read side back.">
+    <defs><marker id="arr6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+    <rect class="svg-box" x="16" y="110" width="230" height="76" rx="3"/>
+    <text class="svg-h" x="28" y="133">Sidecar writes</text>
+    <text class="svg-m" x="28" y="151">model = CHITRA_EMBED_MODEL</text>
+    <text class="svg-m" x="28" y="167">flipped first, then re-embed</text>
+    <path class="svg-edge-blue" d="M246 148 H330" marker-end="url(#arr6)"/>
+    <text class="svg-m" x="288" y="140" text-anchor="middle">write side</text>
+    <rect class="svg-box-2" x="330" y="40" width="320" height="220" rx="3"/>
+    <text class="svg-h" x="346" y="64">embeddings</text>
+    <text class="svg-m" x="346" y="92">photo_id   model            dim</text>
+    <text class="svg-m" x="346" y="118">1          clip-vit-b32     512</text>
+    <rect class="svg-blue" x="338" y="126" width="304" height="22" rx="2"/>
+    <text class="svg-m" x="346" y="141">1          siglip2-base     768</text>
+    <text class="svg-m" x="346" y="167">2          clip-vit-b32     512</text>
+    <rect class="svg-blue" x="338" y="175" width="304" height="22" rx="2"/>
+    <text class="svg-m" x="346" y="190">2          siglip2-base     768</text>
+    <text class="svg-m" x="346" y="216">…          2,721 rows under each</text>
+    <text class="svg-t" x="346" y="246">UNIQUE (photo_id, model)</text>
+    <path class="svg-edge-blue" d="M650 148 H740" marker-end="url(#arr6)"/>
+    <text class="svg-m" x="695" y="140" text-anchor="middle">read side</text>
+    <rect class="svg-box" x="740" y="110" width="224" height="76" rx="3"/>
+    <text class="svg-h" x="752" y="133">Search reads</text>
+    <text class="svg-m" x="752" y="151">WHERE model = ACTIVE_EMBED_MODEL</text>
+    <text class="svg-m" x="752" y="167">flipped last; rollback = flip back</text>
+  </svg>
+  <figcaption><b>Fig. 6</b>Two generations in one table, two switches on two sides of it. The order is: flip the write side, re-embed, confirm every CLIP row has a SigLIP twin, flip the read side. Rollback is one line and no re-embed.</figcaption>
+  </figure>
+
+  <aside class="note"><span class="who">Field note</span><p>The re-embed script is dry-run by default, journals one line per photo with an fsync before the next read, never retries a failed photo on its own because bad sectors do not heal, and aborts when the kernel’s medium-error counter climbs by more than a hundred. The deployment notes say: do not raise that threshold to get past it. An abort is data.</p></aside>
+  <p>The re-embed read thumbnails, not originals: 396 MB off the failing disk instead of 7,959 MB, and the vectors agree with original-derived ones at a median cosine of 0.999. The full pass covered 2,670 items in 68.8 minutes of wall clock against roughly ten minutes of predicted compute, so about 86% of the run was the disk. Four items failed, three of them zero-byte posters. The coverage gate then passed with 2,721 rows under each model, and both switches were flipped at 11:47 on 2 September with a fresh database snapshot beside them. The CLIP rows stay for a week as the rollback and then get deleted.</p>
+
+  <div class="bars">
+    <div class="bar"><span class="lab">Model compute, predicted</span><span class="track"><span class="fill" style="width:14%"></span></span><span class="val">~10 min</span></div>
+    <div class="bar"><span class="lab">Waiting on the disk</span><span class="track"><span class="fill hot" style="width:86%"></span></span><span class="val">~59 min</span></div>
+  </div>
+  <p><small>Where the 69-minute SigLIP re-embed went. On this machine the model is never the bottleneck; the USB disk is.</small></p>
+
+  <p>Three things are still open after the cutover. The search threshold of 0.2 was tuned for CLIP’s narrow score band and nothing adjusts it for SigLIP, whose scores live elsewhere; the failure would be silent, either everything passes or nothing does, so it is the first thing to re-measure. Eleven videos have no SigLIP row, eight because they have no poster at all. And tags are still CLIP-derived under the calibration workaround until the re-tag under sigmoid scoring runs.</p>
+
+  <h3>Video is one frame</h3>
+  <p>A video is embedded from its poster, never from the original, and a video with no poster is skipped rather than opened. The reasoning in the code is blunt: the original is a multi-gigabyte file on a disk with thousands of unrecovered read errors, and the model consumes a 224-pixel square of a single frame regardless, so reading the original costs four orders of magnitude more for a worse vector. The poster job itself runs on the default queue and touches nothing in the transcode’s state column, because two jobs writing one column is how a video ends up marked ready before it is.</p>
+</div></div></section>
+<!-- ============ 9 OPS ============ -->
+<section class="sec" id="ops"><div class="frame"><div class="col">
+  <div class="kicker">9 / Ops</div>
+  <h2>Keeping it alive</h2>
+  <p class="intro">Two systemd units, a handful of shell scripts, a health endpoint that tells the truth, and a test suite that is honest about not being green.</p>
+
+  <div class="scroll wide"><table class="tbl">
+    <thead><tr><th>Unit</th><th>Runs</th><th>Memory cap</th><th>CPU quota</th><th>On failure</th></tr></thead>
+    <tbody>
+      <tr><td class="k">chitra-api</td><td>uvicorn with 4 workers, port 5000</td><td class="n">4 GB</td><td class="n">200% (2 cores)</td><td>restart after 10 s, always</td></tr>
+      <tr><td class="k">chitra-workers</td><td>4 default RQ workers, 2 video RQ workers, and the embedding sidecar</td><td class="n">8 GB</td><td class="n">400% (4 cores)</td><td>restart after 10 s, always</td></tr>
+      <tr><td class="k">minio, redis, nginx, cloudflared, dnsmasq</td><td>Shared infrastructure, each its own unit</td><td class="n">none</td><td class="n">none</td><td>restart, always</td></tr>
+    </tbody>
+  </table></div>
+
+  <aside class="note"><span class="who">Field note</span><p>Twelve gigabytes of caps on a 15.8 GB box that also runs other things. Caps are ceilings, not reservations. The notes admit there is no headroom for everything to peak at once.</p></aside>
+  <p>The sidecar lives inside the workers unit only because creating a unit file needs sudo, and the operational rule for agents is that sudo, systemctl and deploy scripts are human decisions. The intended end state is its own unit with a 2 GB cap and a switch that tells the workers not to launch it.</p>
+
+  <h3>Threads, and why the answer is three</h3>
+  <p>Both launchers source one script that sets every BLAS and OpenMP thread variable before Python starts, because by the time Python could call a function to set them the thread pools already exist. The value is three, and it is not a “lower is safer” guess. The default of six threads on six cores made CLIP image embedding 1.7× slower than three, SigLIP 4.1× slower, and the workers spent 81% of their time throttled against their CPU quota.</p>
+
+  <div class="bars">
+    <div class="bar"><span class="lab">1 thread</span><span class="track"><span class="fill dim" style="width:79%"></span></span><span class="val">164 ms</span></div>
+    <div class="bar"><span class="lab">2 threads</span><span class="track"><span class="fill dim" style="width:58%"></span></span><span class="val">120 ms</span></div>
+    <div class="bar"><span class="lab">3 threads</span><span class="track"><span class="fill" style="width:55%"></span></span><span class="val">113 ms</span></div>
+    <div class="bar"><span class="lab">4 threads</span><span class="track"><span class="fill dim" style="width:90%"></span></span><span class="val">187 ms</span></div>
+    <div class="bar"><span class="lab">6 threads (the old default)</span><span class="track"><span class="fill dim" style="width:100%"></span></span><span class="val">~207 ms</span></div>
+  </div>
+  <p><small>CLIP image embedding latency by thread count on the six-core box, median of 15. The curve is sharply non-monotonic because the box is shared and the model’s matrices are small enough that coordination costs more than it saves.</small></p>
+
+  <h3>Restarting without breaking a transcode</h3>
+  <p>The stop script sends two SIGTERMs, which cold-kills a running ffmpeg. The transcode job marks its row <code>processing</code> on entry and only leaves that state from inside its own error handling, which a signal never reaches, so a killed transcode is stranded as “in progress” forever and playback answers 409 until someone notices. The safe-restart script therefore refuses to run while the video queue has work or any ffmpeg process exists, restarts workers before the API so the sidecar is warm, and warns that search will answer 503 for about twenty seconds while the model loads. A repair script finds stranded rows and distinguishes “the output already exists, fix the status” from “the original is gone, mark it failed” from “re-encode”.</p>
+
+  <h3>Knowing when it is broken</h3>
+  <aside class="note"><span class="who">Field note</span><p>MinIO’s liveness and readiness endpoints return 200 with zero drives online. Only the cluster-health endpoint reports the disk. Every monitor that ever told the truth about this system watches that one.</p></aside>
+  <p>The API’s health endpoint reports the database, object storage, the sidecar’s status and model, and the thumbnail cache’s counters: entries, bytes, both bounds, evictions, hits and misses. The counters exist so that the next memory investigation reads a number instead of inferring from kernel logs. An Uptime Kuma instance on the same box watches the public hostnames and MinIO’s cluster health. Restart-on-failure is set everywhere, which is what turned the network incident in section 10 into a self-healing one the second time it happened.</p>
+
+  <h3>Tests and the honest baseline</h3>
+  <p>The Python suite has 618 tests and is deliberately documented as not green: 7 failures and 5 errors have been the stable baseline since the auth layer landed, because a set of endpoint tests predate it, and the number that matters is whether a change moves those two counts. Continuous integration gates only on the five modules known to be green and runs the rest without failing the build, on the stated reasoning that a permanently red pipeline is an ignored one. Every test run must set the database path explicitly; the default is the live production file, and the suite writes.</p>
+
+  <h3>Working with agents</h3>
+  <p>All three repositories carry an <code>AGENTS.md</code> with the commands that actually work, the measured baseline, and a gotchas list that reads like a scar map: the API must never spawn ffmpeg, the thumbnail cache is per-worker, never run the stop script during a transcode, the sync copy of the schema has no users table. Path-scoped rules files cover the ML pipeline and the HTTP layer. The permission settings pre-approve the test loop and deny sudo, service restarts, the deploy scripts, force-push, and reading the production secrets file. Most of the constants in the code carry the measurement that justified them, so that the next reader, human or otherwise, does not “fix” them.</p>
+</div></div></section>
+
+<!-- ============ 10 INCIDENTS ============ -->
+<section class="sec" id="incidents"><div class="frame"><div class="col">
+  <div class="kicker">10 / Incidents</div>
+  <h2>Things that broke, and what each one built</h2>
+  <p class="intro">No photos were lost in any of these. Several architectural decisions were.</p>
+
+  <div class="inc"><div class="stamp">2 May 2026, noticed 7 May. Five days and eight hours, silent.</div><h4>The disk that left for one second</h4><p>The USB drive under MinIO dropped off the bus and came back a second later as a new device. Linux does not remount a returned device, so MinIO kept running on an empty mount point, logging “drives online: 0” every minute while its liveness and readiness endpoints returned 200. Every thumbnail, upload and original failed for five days until someone opened the app.</p><p class="lesson"><b>What it built.</b> Automount and udev rules so the disk comes back on its own; a monitor on the only MinIO endpoint that reflects disk state; the habit of asking every health check “what exactly do you check?”</p></div>
+
+  <div class="inc"><div class="stamp">31 May to 3 June 2026. Three and a half days.</div><h4>The box that forgot its own address</h4><p>An ISP-side link flap dropped the NIC to 10 Mbps half duplex, the DHCP client failed 225 times in a row, and then NetworkManager marked the interface as externally managed and stopped trying. The link recovered within two hours; the box sat with no IP address for three days, and the tunnel client logged eight thousand “network unreachable” errors a day into the void.</p><p class="lesson"><b>What it built.</b> The understanding that the network is part of the system, retry loops that never give up, and the second flap a week later healed itself in 15 seconds.</p></div>
+
+  <div class="inc"><div class="stamp">4 June 2026. Seventy minutes.</div><h4>Lights out</h4><p>A power cut with no graceful shutdown. On boot, the media filesystem replayed its journal and the SQLite write-ahead log did what it is for. Nothing was lost.</p><p class="lesson"><b>What it built.</b> Confidence in the two journaling layers, and a note that a UPS is cheaper than the confidence.</p></div>
+
+  <div class="inc"><div class="stamp">31 August to 1 September 2026. Six kills in two days.</div><h4>The API that ate its own memory</h4><p>Three causes stacked. Four API workers each imported PyTorch to compute a 12 millisecond embedding. The thumbnail cache was bounded to a thousand entries with no byte budget, and thumbnails are 150 to 400 KB, so four workers held 959, 908, 805 and 839 MB a few hours after starting at 80. And the upload handler spawned ffmpeg to extract video posters inside the API’s memory group, whose HEVC decode threads appeared by name in two of the six kills.</p><p class="lesson"><b>What it built.</b> The embedding sidecar, a byte-bounded LRU cache with counters on the health endpoint, a rule that the API never runs ffmpeg, and a test that fails if importing the app ever costs more than 200 MB.</p></div>
+
+  <div class="inc"><div class="stamp">7 December 2025 to 1 September 2026. Nine months.</div><h4>The queue that never drained</h4><p>Face clustering was scheduled to run thirty seconds after each upload with a delayed enqueue. The worker was never started with a scheduler, so delayed jobs went into a “scheduled” set that nothing read. 1,485 of them accumulated while 73% of detected faces sat unassigned to anyone, and every job in the queue reported success.</p><p class="lesson"><b>What it built.</b> Clustering as a dependency of the batch’s face jobs, with failure allowed so a crash cannot strand the batch, and a rule that new jobs re-raise after logging so the queue can see them fail.</p></div>
+
+  <div class="inc"><div class="stamp">1 September 2026. Caught in staging.</div><h4>The one row that broke search for everyone</h4><p>During the migration a single 768-dimensional vector landed in a table of 512s. The search handler stacked whatever came back, the stacking call raised on the shape mismatch, and every search request from every user returned 500 because of one foreign row.</p><p class="lesson"><b>What it built.</b> The read side now names its model in SQL, a test proves that both dimensions can coexist and search still answers, and an empty result set is a valid answer rather than an error.</p></div>
+
+  <div class="inc"><div class="stamp">7 December 2025 to 1 September 2026. Nine months.</div><h4>The open door</h4><p>The delete endpoint had no authentication dependency. Anyone who could reach the tunnel could remove a photo’s row, its original, its thumbnail, its transcode and its face crops with one request. Nobody did.</p><p class="lesson"><b>What it built.</b> A regression test that walks every registered route and asserts an auth dependency on all but five named public ones, and an explicit allowlist of those five in the rules file.</p></div>
+
+  <div class="inc"><div class="stamp">Found during the September campaign.</div><h4>The index that lied about positions</h4><p>The face index stored vectors without ids, so position <i>i</i> was assumed to be row <i>i</i> of a later query. It was mis-attributing 715 of 1,044 positions while passing a count check. Separately, four workers appending forty vectors each left eighty of one hundred and sixty in the file, and a dozen rewrites failed 387 concurrent reads because the write was not atomic.</p><p class="lesson"><b>What it built.</b> An id-mapped index, writes to a temp file followed by an atomic rename, a file lock around every mutation, and the lesson that a count check is not a correctness check.</p></div>
+
+  <p>Smaller entries in the same ledger: foreign keys were never enabled so cascades were no-ops and 259 orphan rows accumulated; sixty-three JPEG files arrived named <code>.arw</code> and were treated as RAW; and a fast image processor that would have moved every stored vector by ten times the test tolerance was pinned off before it could.</p>
+</div></div></section>
+
+<!-- ============ 11 LESSONS ============ -->
+<section class="sec" id="lessons"><div class="frame"><div class="col">
+  <div class="kicker">11 / Lessons</div>
+  <h2>What the system taught</h2>
+  <p class="intro">These are the things I would tell someone starting the same project, in roughly the order the system forced me to learn them.</p>
+
+  <ol class="lessons">
+    <li><b>Process boundaries are memory boundaries.</b><p>On a 16 GB box the biggest architectural decision was which process is allowed to import PyTorch. Once that was one process, most of the memory problems became one problem.</p></li>
+    <li><b>A health check must fail when the thing fails.</b><p>Liveness and readiness were green for five days with no disk. A check that cannot go red under the failure you fear is decoration.</p></li>
+    <li><b>Two switches, not one.</b><p>Separating what the writer computes from what the reader filters turned a risky model migration into a config flip, and its rollback into another one.</p></li>
+    <li><b>Design for the disk you have.</b><p>Every batch job reads the smallest artefact that answers the question: the thumbnail, not the original; the vector table, not the image. The model was never the bottleneck. The disk always was.</p></li>
+    <li><b>Coexistence beats cutover.</b><p>One unique index let two generations of embeddings live in the same table. Everything else about the migration followed from being able to keep both.</p></li>
+    <li><b>Queues hide failures unless jobs raise.</b><p>A job that catches everything and returns false is reported as a success. The queue looked healthy for nine months while nothing it promised happened.</p></li>
+    <li><b>Measure before believing.</b><p>“Fifteen times slower” was 5.4. “A minute and a half per photo” was 90% model loading. The thread optimum is three and the curve turns back up at four. Every one of those was a plausible story until someone timed it.</p></li>
+    <li><b>Browsers set the API’s shape.</b><p>Blob fetches, single-purpose media tokens and range streaming exist because an image tag and a video player cannot send a header. Half the read path is a workaround for a rule you do not get to change.</p></li>
+    <li><b>Bound caches by what costs.</b><p>Entries were free. Bytes were not. A thousand of anything is a meaningless limit until you know how big each one is.</p></li>
+    <li><b>The network is part of the system.</b><p>Split-horizon DNS made uploads eighty times faster, which immediately required a backpressure governor. A change at one layer is a change at every layer.</p></li>
+    <li><b>Write the measurement next to the constant.</b><p>A threshold with its derivation beside it survives the next reader. A bare 0.6 gets “fixed” to 0.75 by someone acting in good faith, and the codebase had four of them.</p></li>
+  </ol>
+</div></div></section>
+
+<!-- ============ 12 NEXT ============ -->
+<section class="sec" id="next"><div class="frame"><div class="col">
+  <div class="kicker">12 / Next</div>
+  <h2>What comes next</h2>
+  <p class="intro">In the order I expect to do them, which is the order the system is currently complaining in.</p>
+  <ul>
+    <li><b>Re-measure the search threshold under SigLIP</b>, then re-tag the library with sigmoid scores and retire the calibration workaround, and wire the new vocabulary into upload-time tagging.</li>
+    <li><b>Give the face model the sidecar treatment.</b> It still reloads 326 MB per job; the design exists on paper as a second endpoint on the same process.</li>
+    <li><b>Posters for the eight videos without one</b>, so all 359 are searchable, and then a measured decision about faces in video.</li>
+    <li><b>A background upload session on iOS</b>, so a suspended app does not kill the transfer, and a persisted failure set so a broken file is retried once rather than every run.</li>
+    <li><b>Virtualise the web gallery.</b> The library is already installed.</li>
+    <li><b>The sidecar as its own unit</b>, with its own memory ceiling.</li>
+    <li><b>Per-user scoping</b>, before anyone outside the family gets an account.</li>
+    <li><b>Albums and similar-photos in the interface.</b> The endpoints exist; the clustering code has been CLI-only since November.</li>
+    <li><b>A better disk.</b> Every constraint in section 2 gets easier the day this one goes away.</li>
+  </ul>
+</div></div></section>
+
+<footer class="foot"><div class="frame">
+  <p>Sources: the chitra, chitra_ui and chitra_ios repositories, their AGENTS.md files and rules, the plan documents under docs/plans, the three incident write-ups, and the running system on the morning of 2 September 2026. Counts were read from photo.db and the health endpoint that morning.</p>
+  <p>Terms, for readers from outside: an <em>embedding</em> is a list of numbers a model produces so that similar pictures, or a picture and a matching sentence, end up close together. <em>Zero-shot</em> tagging labels images with words the model was never explicitly trained on. A <em>sidecar</em> is a helper process that sits beside the main one and does one job. <em>RQ</em> is a small Redis-backed job queue for Python. <em>WAL</em> is SQLite’s write-ahead log. <em>HNSW</em> is a graph index for finding nearest neighbours quickly. <em>VA-API</em> is Linux’s interface to hardware video encoders. <em>Split-horizon DNS</em> answers the same name differently depending on who is asking.</p>
+</div></footer>
+
+</body>
+</html>
