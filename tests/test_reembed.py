@@ -673,6 +673,290 @@ class TestContentSniffing(unittest.TestCase):
                 os.unlink(journal)
 
 
+# ----------------------------------------------------------------------
+# videos  (Phase 7 — poster embedding, behind --include-videos)
+# ----------------------------------------------------------------------
+class TestVideoDecisions(unittest.TestCase):
+    """A video is embedded from its poster or not at all.
+
+    `core/jobs.py:_embed_source_key` settled the semantics for the job path in
+    2b1b052: `thumb_path` for a video, `file_path` for everything else, and
+    `None` — read nothing — for a video with no poster. This mirrors it. There
+    is no second convention: the original is a multi-gigabyte MOV on a disk
+    with 3,000+ unrecovered read errors, and CLIP consumes 224x224 of one frame
+    either way.
+    """
+
+    def _decide(self, row, *, include_videos=False, source_mode=reembed.SOURCE_AUTO,
+                force=False, has_embedding=False, done_ids=(), failed_ids=()):
+        conn, path = make_db([row])
+        try:
+            r = conn.execute("SELECT * FROM photos WHERE id=?", (row["id"],)).fetchone()
+            return reembed.classify_row(
+                r, source_mode=source_mode, force=force, done_ids=set(done_ids),
+                failed_ids=set(failed_ids), model=FakeEmbedder.name,
+                has_embedding=has_embedding, include_videos=include_videos,
+            )
+        finally:
+            conn.close()
+            os.unlink(path)
+
+    def test_a_video_is_skipped_without_the_flag(self):
+        """Default off, like `scripts/retag.py --include-videos`: the cutover
+        stays an explicit decision rather than a side effect of a normal pass."""
+        d = self._decide(photo(1, media_type="video", ext="mov"))
+        self.assertEqual(d.action, reembed.ACTION_SKIP)
+        self.assertIn("--include-videos", d.reason)
+
+    def test_a_video_with_a_poster_is_embedded_from_thumb_path(self):
+        d = self._decide(photo(1, media_type="video", ext="mov"), include_videos=True)
+        self.assertEqual(d.action, reembed.ACTION_EMBED)
+        self.assertEqual(d.key, "thumbnails/photos/1.jpg")
+        self.assertEqual(d.source, reembed.SOURCE_THUMB)
+        self.assertEqual(d.media_type, "video")
+
+    def test_a_video_with_no_poster_is_skipped_with_its_own_reason(self):
+        """Distinct from every other skip, so a dry run says how many videos
+        need `generate_video_poster_job` before a run would cover them."""
+        d = self._decide(photo(2, thumb=False, media_type="video", ext="mov"),
+                         include_videos=True)
+        self.assertEqual(d.action, reembed.ACTION_SKIP)
+        self.assertIsNone(d.key)
+        self.assertEqual(d.reason, reembed.REASON_VIDEO_NO_POSTER)
+        self.assertNotEqual(d.reason, reembed.REASON_VIDEO_EXCLUDED)
+
+    def test_source_original_does_not_make_a_video_read_file_path(self):
+        """The whole point. `--source original` governs photos; a video read
+        from `file_path` is gigabytes instead of ~250 KB, for a worse vector."""
+        d = self._decide(photo(3, media_type="video", ext="mov"),
+                         include_videos=True, source_mode=reembed.SOURCE_ORIGINAL)
+        self.assertEqual(d.action, reembed.ACTION_EMBED)
+        self.assertEqual(d.source, reembed.SOURCE_THUMB)
+        self.assertEqual(d.key, "thumbnails/photos/3.jpg")
+        self.assertNotEqual(d.key, "photos/2026/01/p3.mov")
+
+    def test_source_original_does_not_resurrect_a_posterless_video(self):
+        d = self._decide(photo(4, thumb=False, media_type="video", ext="mov"),
+                         include_videos=True, source_mode=reembed.SOURCE_ORIGINAL)
+        self.assertEqual(d.action, reembed.ACTION_SKIP)
+        self.assertEqual(d.reason, reembed.REASON_VIDEO_NO_POSTER)
+
+    def test_source_thumb_leaves_a_video_on_its_poster(self):
+        d = self._decide(photo(5, media_type="video", ext="mov"),
+                         include_videos=True, source_mode=reembed.SOURCE_THUMB)
+        self.assertEqual(d.source, reembed.SOURCE_THUMB)
+        self.assertEqual(d.key, "thumbnails/photos/5.jpg")
+
+    def test_a_video_already_carrying_this_model_is_skipped(self):
+        d = self._decide(photo(6, media_type="video", ext="mov"),
+                         include_videos=True, has_embedding=True)
+        self.assertEqual(d.action, reembed.ACTION_SKIP)
+        self.assertIn("embedding", d.reason)
+
+    def test_the_journal_still_governs_a_video(self):
+        """Resumability is not a photo-only property."""
+        d = self._decide(photo(7, media_type="video", ext="mov"),
+                         include_videos=True, force=True, done_ids=[7])
+        self.assertEqual(d.action, reembed.ACTION_SKIP)
+        self.assertIn("already", d.reason)
+
+    def test_a_photo_is_unaffected_by_the_flag(self):
+        for source_mode, expect_source, expect_key in (
+            (reembed.SOURCE_AUTO, reembed.SOURCE_THUMB, "thumbnails/photos/8.jpg"),
+            (reembed.SOURCE_ORIGINAL, reembed.SOURCE_ORIGINAL, "photos/2026/01/p8.heic"),
+        ):
+            for include_videos in (False, True):
+                with self.subTest(source_mode=source_mode, include_videos=include_videos):
+                    d = self._decide(photo(8), include_videos=include_videos,
+                                     source_mode=source_mode)
+                    self.assertEqual(d.action, reembed.ACTION_EMBED)
+                    self.assertEqual(d.source, expect_source)
+                    self.assertEqual(d.key, expect_key)
+                    self.assertEqual(d.media_type, "photo")
+
+    def test_a_null_media_type_is_a_photo(self):
+        """766 of the 2,040 production rows have media_type NULL."""
+        d = self._decide(photo(9, media_type=None), include_videos=True,
+                         source_mode=reembed.SOURCE_ORIGINAL)
+        self.assertEqual(d.source, reembed.SOURCE_ORIGINAL)
+        self.assertEqual(d.key, "photos/2026/01/p9.heic")
+
+
+class TestVideoPlan(unittest.TestCase):
+    def setUp(self):
+        rows = [
+            photo(1),                                                    # photo, thumb
+            photo(2, thumb=False),                                       # photo, no thumb
+            photo(3, media_type="video", ext="mov"),                     # video + poster
+            photo(4, thumb=False, media_type="video", ext="mov"),        # video, no poster
+        ]
+        self.conn, self.path = make_db(rows)
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.path)
+
+    def _plan(self, **kw):
+        kw.setdefault("source_mode", reembed.SOURCE_AUTO)
+        kw.setdefault("force", False)
+        kw.setdefault("done_ids", set())
+        kw.setdefault("failed_ids", set())
+        kw.setdefault("model", FakeEmbedder.name)
+        return reembed.plan(self.conn, **kw)
+
+    def test_videos_stay_out_by_default(self):
+        ids = [d.photo_id for d in self._plan() if d.action == reembed.ACTION_EMBED]
+        self.assertEqual(ids, [1, 2])
+
+    def test_the_flag_adds_only_the_video_that_has_a_poster(self):
+        decisions = self._plan(include_videos=True)
+        ids = [d.photo_id for d in decisions if d.action == reembed.ACTION_EMBED]
+        self.assertEqual(ids, [1, 2, 3])
+        posterless = [d for d in decisions if d.reason == reembed.REASON_VIDEO_NO_POSTER]
+        self.assertEqual([d.photo_id for d in posterless], [4])
+
+    def test_limit_counts_a_video_read_like_any_other(self):
+        decisions = self._plan(include_videos=True, limit=3)
+        ids = [d.photo_id for d in decisions if d.action == reembed.ACTION_EMBED]
+        self.assertEqual(ids, [1, 2, 3])
+
+
+class TestVideoRun(unittest.TestCase):
+    """End to end through `run()`, with the storage boundary stubbed."""
+
+    def setUp(self):
+        rows = [
+            photo(1),
+            photo(3, media_type="video", ext="mov"),
+            photo(4, thumb=False, media_type="video", ext="mov"),
+        ]
+        self.conn, self.path = make_db(rows)
+        self.storage = FakeStorage({
+            "thumbnails/photos/1.jpg": b"thumb-one",
+            "thumbnails/photos/3.jpg": b"\xff\xd8\xff\xe0" + b"poster-three",
+            # The originals are present on purpose: if the script ever reads a
+            # video's `file_path` the test must fail on the assertion below,
+            # not incidentally on a missing object.
+            "photos/2026/01/p1.heic": b"original-one",
+            "photos/2026/01/p3.mov": b"a-multi-gigabyte-mov",
+            "photos/2026/01/p4.mov": b"another-multi-gigabyte-mov",
+        })
+        self.embedder = FakeEmbedder()
+        fd, self.journal_path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        os.unlink(self.journal_path)
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.path)
+        if os.path.exists(self.journal_path):
+            os.unlink(self.journal_path)
+
+    def _run(self, **kw):
+        kw.setdefault("apply", True)
+        kw.setdefault("source_mode", reembed.SOURCE_AUTO)
+        kw.setdefault("force", False)
+        kw.setdefault("delay", 0.0)
+        kw.setdefault("tags", False)
+        kw.setdefault("journal_path", self.journal_path)
+        kw.setdefault("guard", reembed.DiskGuard(threshold=10, reader=lambda: {"kern": 0, "ioerr": 0}))
+        return reembed.run(self.conn, self.storage, self.embedder, **kw)
+
+    def test_a_run_without_the_flag_touches_no_video_object(self):
+        result = self._run()
+        self.assertEqual(self.storage.reads, ["thumbnails/photos/1.jpg"])
+        self.assertEqual(result.embedded, 1)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM embeddings e JOIN photos p ON p.id = e.photo_id "
+                "WHERE p.media_type = 'video'").fetchone()[0],
+            0,
+        )
+
+    def test_the_flag_embeds_a_video_from_its_poster_and_never_the_original(self):
+        result = self._run(include_videos=True)
+        self.assertEqual(self.storage.reads,
+                         ["thumbnails/photos/1.jpg", "thumbnails/photos/3.jpg"])
+        self.assertNotIn("photos/2026/01/p3.mov", self.storage.reads)
+        self.assertNotIn("photos/2026/01/p4.mov", self.storage.reads)
+        self.assertEqual(result.embedded, 2)
+        self.assertEqual(result.failed, [])
+        row = self.conn.execute(
+            "SELECT model, dim FROM embeddings WHERE photo_id = 3").fetchone()
+        self.assertEqual(row["model"], FakeEmbedder.name)
+        self.assertEqual(row["dim"], FakeEmbedder.dim)
+
+    def test_source_original_still_reads_only_the_poster_for_a_video(self):
+        self._run(include_videos=True, source_mode=reembed.SOURCE_ORIGINAL)
+        self.assertEqual(self.storage.reads,
+                         ["photos/2026/01/p1.heic", "thumbnails/photos/3.jpg"])
+
+    def test_a_posterless_video_is_recorded_as_a_skip_not_a_failure(self):
+        result = self._run(include_videos=True)
+        self.assertEqual(result.failed, [])
+        reasons = [d.reason for d in result.decisions if d.photo_id == 4]
+        self.assertEqual(reasons, [reembed.REASON_VIDEO_NO_POSTER])
+
+    def test_a_video_is_journalled_and_not_re_read_on_the_next_pass(self):
+        self._run(include_videos=True)
+        self.storage.reads.clear()
+        second = self._run(include_videos=True, force=True)
+        self.assertEqual(self.storage.reads, [])
+        self.assertEqual(second.embedded, 0)
+
+    def test_a_dry_run_with_the_flag_reads_nothing(self):
+        result = self._run(apply=False, include_videos=True)
+        self.assertEqual(self.storage.reads, [])
+        self.assertEqual(self.embedder.calls, [])
+        self.assertEqual(result.planned, 2)
+
+
+class TestVideoSummary(unittest.TestCase):
+    """The dry-run summary has to tell the operator what a run would cover."""
+
+    def _summary(self, decisions):
+        import contextlib
+        import io as _io
+
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            reembed._summarise_plan(decisions)
+        return buf.getvalue()
+
+    def test_it_separates_would_embed_from_no_poster_from_excluded(self):
+        rows = [
+            photo(1),
+            photo(3, media_type="video", ext="mov"),
+            photo(4, thumb=False, media_type="video", ext="mov"),
+        ]
+        conn, path = make_db(rows)
+        try:
+            decisions = reembed.plan(
+                conn, source_mode=reembed.SOURCE_AUTO, force=False, done_ids=set(),
+                failed_ids=set(), model=FakeEmbedder.name, include_videos=True,
+            )
+            out = self._summary(decisions)
+        finally:
+            conn.close()
+            os.unlink(path)
+        self.assertIn("1 video poster", out)
+        self.assertIn(reembed.REASON_VIDEO_NO_POSTER, out)
+
+    def test_the_default_run_says_why_the_videos_are_missing(self):
+        rows = [photo(1), photo(3, media_type="video", ext="mov")]
+        conn, path = make_db(rows)
+        try:
+            decisions = reembed.plan(
+                conn, source_mode=reembed.SOURCE_AUTO, force=False, done_ids=set(),
+                failed_ids=set(), model=FakeEmbedder.name,
+            )
+            out = self._summary(decisions)
+        finally:
+            conn.close()
+            os.unlink(path)
+        self.assertIn(reembed.REASON_VIDEO_EXCLUDED, out)
+
+
 class TestArgParsing(unittest.TestCase):
     def test_dry_run_is_the_default(self):
         args = reembed.build_parser().parse_args([])
@@ -697,6 +981,24 @@ class TestArgParsing(unittest.TestCase):
     def test_source_is_restricted_to_the_three_modes(self):
         with self.assertRaises(SystemExit):
             reembed.build_parser().parse_args(["--source", "raw"])
+
+
+    def test_include_videos_is_off_by_default(self):
+        self.assertFalse(reembed.build_parser().parse_args([]).include_videos)
+
+    def test_include_videos_is_accepted(self):
+        args = reembed.build_parser().parse_args(["--include-videos"])
+        self.assertTrue(args.include_videos)
+
+    def test_the_source_help_documents_the_video_interaction(self):
+        """`--source original` on a video would read gigabytes; the help text
+        is where an operator finds out that it does not."""
+        help_text = reembed.build_parser().format_help()
+        self.assertIn("--include-videos", help_text)
+        source_help = [a for a in reembed.build_parser()._actions
+                       if a.dest == "source"][0].help
+        self.assertIn("video", source_help)
+        self.assertIn("poster", source_help)
 
 
 if __name__ == "__main__":

@@ -129,6 +129,20 @@ consumes 224x224 of one frame regardless, so the poster is not a compromise —
 reading the original would cost four orders of magnitude more for a worse
 vector.
 
+**The bulk runner for that is `scripts/reembed.py --include-videos`, and it is
+off by default.** `classify_row` applies the same rule as `_embed_source_key`
+rather than a second convention: poster or nothing, never `file_path`. Two
+consequences worth knowing before touching it. **`--source` does not govern
+videos** — `--source original` on a video would mean a multi-gigabyte MOV
+instead of a ~250 KB JPEG for a worse vector, so it silently applies to photos
+only and the flag's help text says so; rejecting the combination instead would
+block the one pass that legitimately wants photos from originals and videos
+from posters. And the default-off matches `scripts/retag.py --include-videos`
+for the same reason: photos and videos are cut over separately, so including
+them is an explicit decision, and a dry run reports "video with no poster"
+separately from "video (--include-videos ...)" so the operator can see which is
+which.
+
 **Face detection still skips videos entirely.** `_is_video()` remains the gate
 there, and it has no poster path. Do not generalise the embedding change into
 it without measuring; `tests/test_video_embedding.py` pins the distinction.

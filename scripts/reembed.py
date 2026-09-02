@@ -51,6 +51,18 @@ Design
   `/sys/block/sda/device/ioerr_cnt` are sampled at the start and every
   `--check-every` photos. If either climbs by more than `--max-new-errors`
   the pass aborts cleanly, keeping everything already committed.
+* **Videos, behind `--include-videos` (default off).** A video is embedded from
+  the ~250 KB poster JPEG in `thumb_path` and **never** from `file_path` — the
+  same rule `core.jobs._embed_source_key` applies on the job path, not a second
+  convention. The original is a multi-gigabyte MOV and CLIP consumes 224x224 of
+  one frame regardless, so reading it would cost four orders of magnitude more
+  for a worse vector. A video with no poster (16 of the 356 videos as of
+  2026-09-02) is skipped and reported as its own reason;
+  `generate_video_poster_job` is the fix, and it is the only thing that should
+  ever open a video original. **`--source` does not apply to videos** for
+  exactly that reason. The flag is off by default to match
+  `scripts/retag.py`: photos and videos are being cut over separately, so
+  including videos stays an explicit decision.
 * **Model-aware.** `--model` sets the identifier written to
   `embeddings.model`, which is half that table's unique key
   `(photo_id, model)`. That is what lets a SigLIP row land *alongside* the CLIP
@@ -71,6 +83,10 @@ Usage
 
     # a cautious first batch
     .venv/bin/python scripts/reembed.py --apply --limit 10 --delay 1.0
+
+    # the video cutover: 340 posters, ~91 MB, nothing else re-read
+    .venv/bin/python scripts/reembed.py --include-videos            # dry run
+    .venv/bin/python scripts/reembed.py --apply --include-videos
 
     # after a model change: write a second generation alongside the first
     .venv/bin/python scripts/reembed.py --apply --model google/siglip2-base
@@ -115,6 +131,12 @@ SOURCE_MODES = (SOURCE_AUTO, SOURCE_THUMB, SOURCE_ORIGINAL)
 ACTION_EMBED = "embed"
 ACTION_SKIP = "skip"
 
+# The two video skip reasons, named so the dry-run summary can tell them apart
+# and so a test can assert on the distinction rather than on prose. One means
+# "you did not ask for videos"; the other means "this one cannot be done yet".
+REASON_VIDEO_EXCLUDED = "video (--include-videos to embed it from its poster)"
+REASON_VIDEO_NO_POSTER = "video with no poster (generate_video_poster_job first)"
+
 BACKEND_SIDECAR = "sidecar"
 BACKEND_INPROCESS = "inprocess"
 BACKEND_AUTO = "auto"
@@ -144,6 +166,10 @@ class Decision(NamedTuple):
     key: Optional[str] = None
     file_path: Optional[str] = None
     size: Optional[int] = None
+    # "photo" or "video", with NULL read as "photo" (766 of the 2,697 rows).
+    # Carried so the summary can separate video posters from photo thumbnails
+    # without re-querying — both are `thumb_path`, and both are `SOURCE_THUMB`.
+    media_type: str = "photo"
 
 
 def _row_get(row: Any, name: str, default=None):
@@ -164,6 +190,7 @@ def classify_row(
     failed_ids: Set[int],
     model: str,
     has_embedding: bool,
+    include_videos: bool = False,
 ) -> Decision:
     """Decide what happens to one photo.
 
@@ -171,29 +198,58 @@ def classify_row(
     point of `--force` is a full pass that must still survive a Ctrl-C: a
     restart that ignored the journal would re-read everything it had already
     paid for. `--reset-state` is the deliberate way to start over.
+
+    Videos are the one media type `--source` does not govern. See the block
+    below for why.
     """
     photo_id = row["id"]
     file_path = _row_get(row, "file_path")
     thumb_path = _row_get(row, "thumb_path")
     media_type = _row_get(row, "media_type", "photo")
     size = _row_get(row, "size")
+    is_video = media_type == "video"
 
-    if media_type == "video":
-        # Videos get no ML anywhere else in the pipeline; a bulk pass must not
-        # quietly disagree with the jobs.
-        return Decision(photo_id, ACTION_SKIP, "video", None, None, file_path, size)
+    if is_video and not include_videos:
+        # Off by default, matching `scripts/retag.py --include-videos`: photos
+        # and videos are being cut over separately on purpose, and a flag keeps
+        # that an explicit decision rather than a side effect of a normal pass.
+        return Decision(photo_id, ACTION_SKIP, REASON_VIDEO_EXCLUDED,
+                        None, None, file_path, size, media_type)
 
     if photo_id in done_ids:
         return Decision(photo_id, ACTION_SKIP, "already done in this journal",
-                        None, None, file_path, size)
+                        None, None, file_path, size, media_type)
 
     if photo_id in failed_ids:
         return Decision(photo_id, ACTION_SKIP, "failed on a previous run (--retry-failed to re-read)",
-                        None, None, file_path, size)
+                        None, None, file_path, size, media_type)
 
     if has_embedding and not force:
         return Decision(photo_id, ACTION_SKIP, f"has a {model} embedding already",
-                        None, None, file_path, size)
+                        None, None, file_path, size, media_type)
+
+    if is_video:
+        # Mirrors `core.jobs._embed_source_key` exactly — `thumb_path` for a
+        # video, never `file_path`, and nothing at all when there is no poster.
+        #
+        # **`--source` deliberately does not apply here.** It chooses between a
+        # photo's 512 px thumbnail and its original; for a video the "original"
+        # is a multi-gigabyte MOV on a disk with 3,000+ unrecovered read errors,
+        # against a ~250 KB poster JPEG, and CLIP consumes 224x224 of one frame
+        # either way — so `--source original` would cost four orders of
+        # magnitude more for a *worse* vector. Rejecting the combination
+        # outright would be worse still: it would block the one legitimate pass
+        # that wants photos from their originals and videos from their posters.
+        # So `--source` governs photos, videos are poster-only, and the help
+        # text and this decision's reason both say so.
+        if not thumb_path:
+            # 16 of the 356 videos on 2026-09-02. `generate_video_poster_job`
+            # is the fix, and it is the only thing that should ever open a
+            # video original.
+            return Decision(photo_id, ACTION_SKIP, REASON_VIDEO_NO_POSTER,
+                            None, None, file_path, size, media_type)
+        return Decision(photo_id, ACTION_EMBED, f"read from {SOURCE_THUMB} (video poster)",
+                        SOURCE_THUMB, thumb_path, file_path, size, media_type)
 
     if source_mode == SOURCE_ORIGINAL:
         source, key = SOURCE_ORIGINAL, file_path
@@ -201,15 +257,16 @@ def classify_row(
         source, key = SOURCE_THUMB, thumb_path
     elif source_mode == SOURCE_THUMB:
         return Decision(photo_id, ACTION_SKIP, "no thumbnail and --source thumb",
-                        None, None, file_path, size)
+                        None, None, file_path, size, media_type)
     else:
         source, key = SOURCE_ORIGINAL, file_path
 
     if not key:
         return Decision(photo_id, ACTION_SKIP, "no object key on the row",
-                        None, None, file_path, size)
+                        None, None, file_path, size, media_type)
 
-    return Decision(photo_id, ACTION_EMBED, f"read from {source}", source, key, file_path, size)
+    return Decision(photo_id, ACTION_EMBED, f"read from {source}", source, key,
+                    file_path, size, media_type)
 
 
 def _has_model_column(conn: sqlite3.Connection) -> bool:
@@ -230,6 +287,7 @@ def plan(
     model: str,
     ids: Optional[Sequence[int]] = None,
     limit: Optional[int] = None,
+    include_videos: bool = False,
 ) -> List[Decision]:
     """Classify every candidate row.
 
@@ -274,6 +332,7 @@ def plan(
             failed_ids=failed_ids,
             model=model,
             has_embedding=bool(row["emb_count"]),
+            include_videos=include_videos,
         )
         if d.action == ACTION_EMBED:
             if limit is not None and embeds >= limit:
@@ -715,6 +774,7 @@ def run(
     reset_state: bool = False,
     concurrency: int = 1,
     model: Optional[str] = None,
+    include_videos: bool = False,
     progress: Optional[Callable[[str], None]] = None,
 ) -> Result:
     """Run one pass. Reads and writes nothing unless `apply` is true."""
@@ -735,6 +795,7 @@ def run(
     decisions = plan(
         conn, source_mode=source_mode, force=force, done_ids=done_ids,
         failed_ids=failed_ids, model=model, ids=ids, limit=limit,
+        include_videos=include_videos,
     )
     todo = [d for d in decisions if d.action == ACTION_EMBED]
     skipped = len(decisions) - len(todo)
@@ -757,7 +818,7 @@ def run(
 
     journal = Journal(journal_path, model=model, source_mode=source_mode, force=force)
     journal.record_run(planned=len(todo), disk_baseline=guard.baseline,
-                       tags=tags, limit=limit)
+                       tags=tags, limit=limit, include_videos=include_videos)
 
     embedded = 0
     failures: List[Tuple[int, str]] = []
@@ -852,8 +913,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true",
                    help="re-embed photos that already have a vector (what a model change needs)")
     p.add_argument("--source", choices=SOURCE_MODES, default=SOURCE_AUTO,
-                   help="thumb: 512px JPEG only. original: always the full file. "
-                        "auto (default): thumbnail when there is one, original otherwise.")
+                   help="which object a PHOTO is read from. thumb: 512px JPEG only. "
+                        "original: always the full file. auto (default): thumbnail "
+                        "when there is one, original otherwise. "
+                        "VIDEOS IGNORE THIS: a video is always read from its poster "
+                        "in thumb_path and skipped if it has none, because 'original' "
+                        "on a video means a multi-GB file instead of a ~250 KB JPEG "
+                        "for a worse vector. See --include-videos.")
+    p.add_argument("--include-videos", action="store_true",
+                   help="also embed videos, from the ~250 KB poster in thumb_path — "
+                        "never the original (same rule as core.jobs._embed_source_key). "
+                        "A video with no poster is skipped and counted separately; "
+                        "generate_video_poster_job is the fix for those. Off by "
+                        "default, like scripts/retag.py: photos and videos are cut "
+                        "over separately, so this stays an explicit decision.")
     p.add_argument("--tags", dest="tags", action="store_true", default=True,
                    help="also refresh the CLIP auto-tags (default)")
     p.add_argument("--no-tags", dest="tags", action="store_false",
@@ -895,15 +968,22 @@ def _summarise_plan(decisions: List[Decision]) -> None:
     todo = [d for d in decisions if d.action == ACTION_EMBED]
     skips = Counter(d.reason for d in decisions if d.action == ACTION_SKIP)
     by_source = Counter(d.source for d in todo)
+    videos = [d for d in todo if d.media_type == "video"]
 
-    print("\nWould embed %d photo(s):" % len(todo))
+    print("\nWould embed %d item(s):" % len(todo))
     for source, n in by_source.most_common():
         print(f"    {n:5d} from {source}")
+    if videos:
+        # Broken out because a video poster and a photo thumbnail are both
+        # `thumb_path` and both `SOURCE_THUMB` — without this line the operator
+        # cannot see how much of a pass is the video cutover.
+        print(f"    {len(videos):5d} video poster(s) among them "
+              f"(always thumb_path; --source never sends a video to its original)")
     thumb_bytes = sum(1 for d in todo if d.source == SOURCE_THUMB) * 237 * 1024
     orig_bytes = sum((d.size or 0) for d in todo if d.source == SOURCE_ORIGINAL)
     print(f"    est. read volume: {(thumb_bytes + orig_bytes) / 1024 / 1024:.0f} MB "
-          f"({thumb_bytes / 1024 / 1024:.0f} MB thumbnails at the measured 237 KB mean, "
-          f"{orig_bytes / 1024 / 1024:.0f} MB originals)")
+          f"({thumb_bytes / 1024 / 1024:.0f} MB thumbnails and posters at the "
+          f"measured 237 KB mean, {orig_bytes / 1024 / 1024:.0f} MB originals)")
     print("Would skip %d:" % sum(skips.values()))
     for reason, n in skips.most_common():
         print(f"    {n:5d} {reason}")
@@ -932,7 +1012,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[reembed] db={args.db} model={model} "
               f"dim={getattr(embedder, 'dim', '?')} backend={type(embedder).__name__} "
               f"source={args.source} force={args.force} tags={args.tags} "
-              f"apply={args.apply}")
+              f"include_videos={args.include_videos} apply={args.apply}")
 
         guard = DiskGuard(
             threshold=args.max_new_errors,
@@ -948,6 +1028,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             journal_path=args.state, guard=guard, check_every=args.check_every,
             retry_failed=args.retry_failed, reset_state=args.reset_state,
             concurrency=args.concurrency, model=model,
+            include_videos=args.include_videos,
         )
 
         if not args.apply:

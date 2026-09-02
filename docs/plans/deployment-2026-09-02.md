@@ -80,10 +80,61 @@ is a deliberate follow-up.
 
 ## Stage 3 — Embed video posters (additive, reverts by deleting rows)
 
-**0 of 262 videos are currently searchable.** 258 already have a poster; the code
-to embed them landed in Stage 1 but no bulk run has happened.
+**0 of 356 videos are currently searchable.** 340 already have a poster; the job
+path learned to embed them in Stage 1, and `scripts/reembed.py --include-videos`
+is now the bulk runner for the ones already uploaded.
 
-Run it after Stage 1 is confirmed healthy. Roughly 258 objects at ~250 KB.
+Run it after Stage 1 is confirmed healthy. Roughly 340 objects at ~250 KB
+(~91 MB), against the ~64 MB / 258 videos this plan was written for — the
+library has grown since.
+
+```bash
+cd ~/services/chitra
+set -a; . ./.env.production; set +a
+cp photo.db photo.db.bak-$(date +%F)
+
+# what it would do — reads nothing, writes nothing
+.venv/bin/python scripts/reembed.py --include-videos
+
+# the run itself
+.venv/bin/python scripts/reembed.py --apply --include-videos
+```
+
+Measured on a copy (`cp photo.db /tmp/vid_test.db`) on 2026-09-02:
+
+```
+Would embed 397 item(s):
+      394 from thumb
+        3 from original
+      340 video poster(s) among them
+Would skip 2300:
+     2176 has a openai/clip-vit-base-patch32 embedding already
+      108 already done in this journal
+       16 video with no poster (generate_video_poster_job first)
+```
+
+Note the run covers the 57 outstanding *photos* as well; `--include-videos` adds
+videos to the pass rather than restricting it to them. Use `--limit` for a
+cautious first batch.
+
+**`--source` does not apply to videos.** A video is always read from its poster
+in `thumb_path`, never from `file_path` — `--source original --include-videos`
+sends the 57 photos to their originals and still leaves all 340 videos on their
+posters. That is deliberate: the "original" of a video is a multi-gigabyte MOV,
+and CLIP consumes 224x224 of one frame either way.
+
+**The 16 posterless videos are out of scope for this stage** — they need
+`generate_video_poster_job`, which is the only thing that should ever open a
+video original. They are reported as their own skip reason so the count is
+visible rather than inferred.
+
+**The disk-health guard may abort this run, and that is working as intended.**
+On 2026-09-02 `/dev/sda` was emitting a fresh medium error roughly every 3 s on
+sectors 1532291976/1532291984, independent of any read this script makes. At
+that rate the default `--max-new-errors 100` trips within ~5 minutes. The pass
+is resumable from its journal, so an abort costs progress, not correctness —
+re-run it. **Do not raise the threshold to get past it**; find out what is
+retrying that sector first.
 
 **Rollback:** `DELETE FROM embeddings WHERE photo_id IN (SELECT id FROM photos WHERE media_type='video');`
 
