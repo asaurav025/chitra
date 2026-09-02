@@ -378,6 +378,89 @@ class TestRoundTripAndAccounting(CacheTestCase):
         self.assertEqual(cache.get_cache_stats()["entries"], len(cache._thumbnail_cache))
 
 
+class TestLeastRecentlyUsedEviction(CacheTestCase):
+    """Eviction is LRU: a read protects an entry, an insert does not protect it.
+
+    This is a **policy** change, landed separately from the byte bound. It
+    matters *because* of the byte bound: the budget is 64 MiB, ~268 thumbnails
+    at 250 KB, where the old entry cap allowed 1,000. A cache four times
+    smaller evicts constantly, so which entry goes stops being academic.
+
+    Under FIFO an entry aged out N inserts after it arrived no matter how often
+    it was being served — so the tiles a user is actually looking at were
+    evicted on the same schedule as the ones they scrolled past once.
+    """
+
+    def test_reading_an_entry_saves_it_from_byte_eviction(self):
+        cache.configure_cache(max_bytes=1000, max_entries=1000)
+        cache.cache_thumbnail("a", self.payload(400))
+        cache.cache_thumbnail("b", self.payload(400))
+
+        cache.get_cached_thumbnail("a")  # 'a' is now the most recently used
+        cache.cache_thumbnail("c", self.payload(400))
+
+        self.assertIsNotNone(
+            cache.get_cached_thumbnail("a"), "a read must protect an entry"
+        )
+        self.assertIsNone(
+            cache.get_cached_thumbnail("b"), "'b' was the least recently used"
+        )
+
+    def test_reading_an_entry_saves_it_from_the_entry_cap(self):
+        cache.configure_cache(max_bytes=64 * MIB, max_entries=2)
+        cache.cache_thumbnail("a", self.payload(10))
+        cache.cache_thumbnail("b", self.payload(10))
+
+        cache.get_cached_thumbnail("a")
+        cache.cache_thumbnail("c", self.payload(10))
+
+        self.assertIsNotNone(cache.get_cached_thumbnail("a"))
+        self.assertIsNone(cache.get_cached_thumbnail("b"))
+
+    def test_a_hot_entry_survives_an_unbounded_scroll(self):
+        """The case FIFO gets wrong: one tile re-read on every render."""
+        cache.configure_cache(max_bytes=300, max_entries=1000)
+        cache.cache_thumbnail("hot", self.payload(100))
+
+        for i in range(50):
+            self.assertIsNotNone(
+                cache.get_cached_thumbnail("hot"),
+                f"'hot' was evicted at round {i} despite being read every round",
+            )
+            cache.cache_thumbnail(f"scrolled/{i}.jpg", self.payload(100))
+
+        self.assertIsNotNone(cache.get_cached_thumbnail("hot"))
+        self.assertEqual(cache.get_cache_stats()["entries"], 3)
+
+    def test_a_miss_does_not_reorder_anything(self):
+        cache.configure_cache(max_bytes=1000, max_entries=1000)
+        cache.cache_thumbnail("a", self.payload(400))
+        cache.cache_thumbnail("b", self.payload(400))
+
+        cache.get_cached_thumbnail("absent")
+        cache.cache_thumbnail("c", self.payload(400))
+
+        self.assertIsNone(cache.get_cached_thumbnail("a"))
+        self.assertIsNotNone(cache.get_cached_thumbnail("b"))
+
+    def test_ttl_is_measured_from_insertion_not_from_last_read(self):
+        """Recency drives *eviction*; it must not also drive expiry.
+
+        Refreshing the TTL on every read would let a hot key live forever,
+        which is a second policy change and not this one.
+        """
+        cache.configure_cache(max_bytes=64 * MIB, max_entries=10)
+        cache.cache_thumbnail("a", self.payload(10))
+        cache._cache_timestamps["a"] -= cache._cache_ttl - 1  # 1s of TTL left
+
+        for _ in range(5):
+            self.assertIsNotNone(cache.get_cached_thumbnail("a"))
+        cache._cache_timestamps["a"] -= 2  # now past the TTL
+
+        self.assertIsNone(cache.get_cached_thumbnail("a"))
+        self.assertEqual(cache.get_cache_stats()["expirations"], 1)
+
+
 class TestHealthExposesCacheStats(CacheTestCase):
     """The counters have to reach an operator, not just a unit test.
 

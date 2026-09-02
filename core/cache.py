@@ -28,9 +28,17 @@ storage each time. This is also what makes `CHITRA_THUMB_CACHE_BYTES=0` a valid
 way to switch the cache off — every insert is oversized, and eviction
 terminates rather than spinning on an empty cache.
 
-Eviction is **FIFO** — oldest insertion first, not least-recently-used. The
-module used to claim LRU in its docstring while implementing FIFO; it now says
-what it does.
+Eviction is **LRU** — least recently *used*, where a read counts as a use. It
+was FIFO (while the docstring claimed LRU), which the entry cap made mostly
+academic: at 1,000 entries the cache rarely evicted anything. The byte budget
+is roughly 268 thumbnails at 250 KB, four times smaller, so eviction is now
+constant and the choice of victim matters. Under FIFO a tile aged out a fixed
+number of inserts after it arrived however often it was being served, so the
+thumbnails a user was actually looking at were evicted on the same schedule as
+the ones they scrolled past once.
+
+Recency governs eviction only. The TTL still runs from insertion, so a hot key
+expires on schedule rather than living forever.
 
 `get_cache_stats()` reports entries, bytes, both bounds and the counters, and
 is surfaced on `/api/health` as `thumb_cache`. That is deliberate: the incident
@@ -46,9 +54,11 @@ from typing import Optional
 DEFAULT_MAX_BYTES = 64 * 1024 * 1024  # 64 MiB per uvicorn worker
 DEFAULT_MAX_ENTRIES = 1000
 
-# Insertion-ordered so eviction is popitem(last=False) — O(1). The previous
+# LRU order, so the eviction victim is next(iter(...)) — O(1). The original
 # implementation scanned every timestamp with min() to find one victim, which a
 # byte budget makes O(n) per *evicted entry* rather than per insert.
+# `_cache_timestamps` keeps insertion order and insertion times; only
+# `_thumbnail_cache` is reordered on read.
 _thumbnail_cache: "OrderedDict[str, bytes]" = OrderedDict()
 _cache_timestamps: "OrderedDict[str, float]" = OrderedDict()
 _cache_bytes = 0
@@ -127,7 +137,7 @@ def _drop(thumb_path: str) -> int:
 
 
 def _evict_until_fits(incoming_bytes: int = 0, reserve_slot: bool = False):
-    """Evict oldest-first until `incoming_bytes` more would still be in budget.
+    """Evict least-recently-used first until `incoming_bytes` would fit.
 
     `reserve_slot` also makes room for one more *entry*, which is how the entry
     cap is enforced on insert. It is a separate argument from `incoming_bytes`
@@ -140,8 +150,8 @@ def _evict_until_fits(incoming_bytes: int = 0, reserve_slot: bool = False):
         _cache_bytes + incoming_bytes > _cache_max_bytes
         or len(_thumbnail_cache) + (1 if reserve_slot else 0) > _cache_max_entries
     ):
-        oldest_path = next(iter(_thumbnail_cache))
-        freed = _drop(oldest_path)
+        lru_path = next(iter(_thumbnail_cache))
+        freed = _drop(lru_path)
         _stats["evictions"] += 1
         _stats["evicted_bytes"] += freed
 
@@ -170,13 +180,17 @@ def get_cached_thumbnail(thumb_path: str) -> Optional[bytes]:
             _stats["misses"] += 1
             return None
 
+        # Recency, for eviction only. `_cache_timestamps` is deliberately left
+        # alone: the TTL runs from insertion, so a hot key still expires on
+        # schedule instead of living forever.
+        _thumbnail_cache.move_to_end(thumb_path)
         _stats["hits"] += 1
         return _thumbnail_cache[thumb_path]
 
 
 def cache_thumbnail(thumb_path: str, thumb_data: bytes):
     """
-    Cache thumbnail data, evicting oldest-first to stay inside the byte budget.
+    Cache thumbnail data, evicting least-recently-used to stay inside the budget.
 
     An object larger than the whole budget is refused outright and no existing
     entry is evicted for it — see the module docstring.

@@ -43,7 +43,7 @@ core/
   gallery.py          Thumbnail generation (PIL).
   raw_loader.py       RAW format decoding.
   cache.py            In-process thumbnail cache. Byte-bounded (64 MiB per
-                      worker by default), FIFO eviction, 1h TTL.
+                      worker by default), LRU eviction, 1h TTL from insertion.
   worker.py           Redis connection + queue definitions.
 
 cli/                  Typer CLI + Textual TUI. Separate entrypoint from the
