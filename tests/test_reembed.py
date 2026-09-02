@@ -1001,5 +1001,131 @@ class TestArgParsing(unittest.TestCase):
         self.assertIn("poster", source_help)
 
 
+# ----------------------------------------------------------------------
+# BACKEND SELECTION
+# ----------------------------------------------------------------------
+class TestBackendMatchesTheModelItWritesUnder(unittest.TestCase):
+    """The backend must actually be the model whose name gets written down.
+
+    `embeddings.model` is half the table's unique key and the value every
+    ranking read filters on, so a row is only meaningful if the vector in it
+    was produced by the model the row claims. The sidecar is a *separate
+    process with its own resident model*: during the SigLIP migration it is
+    still holding CLIP while this script is asked to write 768-d SigLIP rows.
+    Handing back that sidecar anyway writes 512-d CLIP vectors under
+    `google/siglip2-base-patch16-224` -- rows that lie about their own
+    provenance, pass a coverage check by count, and take search down at the
+    cutover.
+    """
+
+    def setUp(self):
+        self._real_sidecar = reembed.SidecarEmbedder
+        self._real_inprocess = reembed.InProcessEmbedder
+        self.built = []
+
+        outer = self
+
+        class FakeSidecar:
+            def __init__(self, *a, **kw):
+                self.name = outer.sidecar_model
+                self.dim = 512
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FakeInProcess:
+            def __init__(self, model_name=reembed.DEFAULT_MODEL,
+                         threads=reembed.DEFAULT_THREADS):
+                self.name = model_name
+                self.threads = threads
+                self.dim = 768 if "siglip" in model_name else 512
+                outer.built.append(model_name)
+
+        self.sidecar_model = "openai/clip-vit-base-patch32"
+        reembed.SidecarEmbedder = FakeSidecar
+        reembed.InProcessEmbedder = FakeInProcess
+
+    def tearDown(self):
+        reembed.SidecarEmbedder = self._real_sidecar
+        reembed.InProcessEmbedder = self._real_inprocess
+
+    def test_auto_uses_the_sidecar_when_it_holds_the_requested_model(self):
+        em = reembed.build_embedder(reembed.BACKEND_AUTO,
+                                    "openai/clip-vit-base-patch32")
+        self.assertEqual(em.name, "openai/clip-vit-base-patch32")
+        self.assertEqual(self.built, [])
+
+    def test_auto_still_adopts_the_sidecars_model_when_none_is_requested(self):
+        """`--model` defaults to whatever the backend reports; that contract
+        must survive the mismatch check."""
+        self.sidecar_model = "google/siglip2-base-patch16-224"
+        em = reembed.build_embedder(reembed.BACKEND_AUTO, None)
+        self.assertEqual(em.name, "google/siglip2-base-patch16-224")
+        self.assertEqual(self.built, [])
+
+    def test_auto_refuses_a_sidecar_loaded_with_a_different_model(self):
+        em = reembed.build_embedder(reembed.BACKEND_AUTO,
+                                    "google/siglip2-base-patch16-224")
+        self.assertEqual(em.name, "google/siglip2-base-patch16-224")
+        self.assertEqual(em.dim, 768)
+        self.assertEqual(self.built, ["google/siglip2-base-patch16-224"])
+
+    def test_an_explicit_sidecar_request_raises_rather_than_lying(self):
+        """`--backend sidecar` asked for that process specifically. Silently
+        loading 1.5 GB of weights in-process instead would be a surprise; so
+        would writing CLIP vectors under a SigLIP name."""
+        with self.assertRaises(RuntimeError) as ctx:
+            reembed.build_embedder(reembed.BACKEND_SIDECAR,
+                                   "google/siglip2-base-patch16-224")
+        self.assertIn("google/siglip2-base-patch16-224", str(ctx.exception))
+        self.assertIn("openai/clip-vit-base-patch32", str(ctx.exception))
+
+
+class TestInProcessBackendHonoursTheModelName(unittest.TestCase):
+    """`--backend inprocess --model <siglip>` must build a SigLIP embedder.
+
+    It hardcoded `ClipEmbedder(model_name)`, so a SigLIP identifier meant
+    `CLIPModel.from_pretrained` on a SigLIP checkpoint: transformers warns
+    "using a model of type siglip to instantiate a model of type clip" and
+    then dies on a `[64, 768]` vs `[77, 512]` state-dict mismatch. The
+    registry in `core.embedder.build_embedder` is the one place that knows
+    which class an identifier means, and it raises on an unknown one rather
+    than falling back to CLIP.
+    """
+
+    def test_it_dispatches_through_the_core_registry(self):
+        import core.embedder as core_embedder
+
+        seen = []
+
+        class FakeModelEmbedder:
+            def text_embedding(self, text):
+                import numpy as np
+
+                return np.zeros(768, dtype="float32")
+
+        real = core_embedder.build_embedder
+
+        def fake_build(model_name=None):
+            seen.append(model_name)
+            return FakeModelEmbedder()
+
+        core_embedder.build_embedder = fake_build
+        try:
+            em = reembed.InProcessEmbedder("google/siglip2-base-patch16-224",
+                                           threads=1)
+        finally:
+            core_embedder.build_embedder = real
+
+        self.assertEqual(seen, ["google/siglip2-base-patch16-224"])
+        self.assertEqual(em.name, "google/siglip2-base-patch16-224")
+        self.assertEqual(em.dim, 768)
+
+    def test_an_unknown_identifier_raises_instead_of_becoming_clip(self):
+        with self.assertRaises(ValueError):
+            reembed.InProcessEmbedder("nobody/nothing-v9", threads=1)
+
+
 if __name__ == "__main__":
     unittest.main()

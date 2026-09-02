@@ -592,21 +592,32 @@ class SidecarEmbedder:
 
 
 class InProcessEmbedder:
-    """Fallback when the sidecar is down: one CLIP load for the whole run.
+    """Fallback when the sidecar cannot serve this pass: one model load for it.
 
     Still a single load — not the per-job reload the RQ path pays — but it
-    costs ~1.1 GB of RSS on a box with a history of OOM kills, so the sidecar
-    is preferred whenever it answers.
+    costs ~1.1 GB of RSS (~1.5 GB for SigLIP) on a box with a history of OOM
+    kills, so the sidecar is preferred whenever it answers *with the right
+    model*.
+
+    The class is chosen by `core.embedder.build_embedder`, not hardcoded. It
+    used to construct `ClipEmbedder(model_name)` unconditionally, so
+    `--backend inprocess --model google/siglip2-base-patch16-224` meant
+    `CLIPModel.from_pretrained` on a SigLIP checkpoint: transformers warns
+    "using a model of type siglip to instantiate a model of type clip" and
+    then dies on a `[64, 768]` vs `[77, 512]` state-dict mismatch. The registry
+    is the single place that knows which class an identifier means, and it
+    raises on an unknown one rather than quietly falling back to CLIP and
+    writing 512-d rows under a name claiming otherwise.
     """
 
     def __init__(self, model_name: str = DEFAULT_MODEL, threads: int = DEFAULT_THREADS):
         import torch
 
         torch.set_num_threads(threads)
-        from core.embedder import ClipEmbedder
+        from core.embedder import build_embedder as build_model_embedder
 
         self.name = model_name
-        self._embedder = ClipEmbedder(model_name)
+        self._embedder = build_model_embedder(model_name)
         self.dim = int(self._embedder.text_embedding("dimension probe").shape[0])
 
     def _with_temp(self, filename: str, data: bytes, fn):
@@ -638,16 +649,53 @@ class InProcessEmbedder:
         self._embedder = None
 
 
-def build_embedder(backend: str, model_name: str = DEFAULT_MODEL, threads: int = DEFAULT_THREADS):
-    """Pick a backend. `auto` prefers the sidecar and says why if it cannot."""
+def build_embedder(backend: str, model_name: Optional[str] = None,
+                   threads: int = DEFAULT_THREADS):
+    """Pick a backend. `auto` prefers the sidecar and says why if it cannot.
+
+    `model_name` is the identifier this pass will write into
+    `embeddings.model`, or None to adopt whatever the backend reports — the
+    documented default for `--model`.
+
+    **The sidecar is only usable when it already holds that model.** It is a
+    separate process with its own resident weights: during the SigLIP
+    migration it is still serving CLIP to live search while this script is
+    asked to write 768-d SigLIP rows. Returning it anyway computed 512-d CLIP
+    vectors and stored them under `google/siglip2-base-patch16-224` — rows
+    that lie about their own provenance, satisfy a coverage check by count,
+    and break search at the cutover. That was a printed WARNING in `main` and
+    nothing else.
+
+    A mismatch under `auto` falls back to an in-process load, which is the
+    only way to run a model the resident sidecar is not serving without
+    restarting it. Under an explicit `--backend sidecar` it raises instead:
+    that flag asked for that process specifically, and silently loading 1.5 GB
+    of weights here would be its own surprise.
+    """
     if backend in (BACKEND_AUTO, BACKEND_SIDECAR):
+        sidecar = None
         try:
-            return SidecarEmbedder()
+            sidecar = SidecarEmbedder()
         except Exception as exc:
             if backend == BACKEND_SIDECAR:
                 raise
-            print(f"[reembed] sidecar unavailable ({exc}); loading CLIP in-process", flush=True)
-    return InProcessEmbedder(model_name, threads)
+            print(f"[reembed] sidecar unavailable ({exc}); loading "
+                  f"{model_name or DEFAULT_MODEL} in-process", flush=True)
+        if sidecar is not None:
+            loaded = getattr(sidecar, "name", None)
+            if model_name is None or loaded == model_name:
+                return sidecar
+            message = (f"the sidecar has {loaded!r} loaded but this pass writes rows "
+                       f"under {model_name!r}; vectors and their model column would "
+                       f"disagree")
+            close = getattr(sidecar, "close", None)
+            if close is not None:
+                close()
+            if backend == BACKEND_SIDECAR:
+                raise RuntimeError(message)
+            print(f"[reembed] {message} — loading {model_name} in-process instead",
+                  flush=True)
+    return InProcessEmbedder(model_name or DEFAULT_MODEL, threads)
 
 
 # ----------------------------------------------------------------------
@@ -1000,7 +1048,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     conn = db.connect(args.db)
     embedder = None
     try:
-        embedder = build_embedder(args.backend, args.model or DEFAULT_MODEL, args.threads)
+        # `args.model` is passed through as None when unset, not defaulted here:
+        # None is what tells `build_embedder` to adopt the backend's own model
+        # rather than to check the backend against a requested one.
+        embedder = build_embedder(args.backend, args.model, args.threads)
         backend_model = getattr(embedder, "name", DEFAULT_MODEL)
         model = args.model or backend_model
         if args.model and args.model != backend_model:
