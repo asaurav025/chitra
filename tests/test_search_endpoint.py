@@ -95,7 +95,9 @@ class TestSearchEndpoint(unittest.TestCase):
         client = self.client_with(AsyncMock(text_embedding=AsyncMock(
             return_value=unit([1.0, 0.0, 0.0, 0.0]))))
 
-        resp = client.get("/api/search/photos", params={"query": "a thing", "min_score": 0.0})
+        # Rank everything: the floor is server config, so lower it there.
+        with unittest.mock.patch.dict(os.environ, {"CHITRA_SEARCH_MIN_SCORE": "0"}):
+            resp = client.get("/api/search/photos", params={"query": "a thing"})
 
         self.assertEqual(200, resp.status_code, resp.text)
         body = resp.json()
@@ -127,12 +129,15 @@ class TestSearchEndpoint(unittest.TestCase):
             "the handler called the client but never awaited it",
         )
 
-    def test_min_score_filters(self):
+    def test_a_client_supplied_min_score_is_ignored(self):
+        """The floor is server configuration. A client asking for 0.99 gets
+        the same answer as one asking for nothing: everything over the model's
+        own floor (CLIP's 0.2 here), so `mid.jpg` at 0.6 stays in."""
         client = self.client_with(AsyncMock(text_embedding=AsyncMock(
             return_value=unit([1.0, 0.0, 0.0, 0.0]))))
 
         body = client.get(
-            "/api/search/photos", params={"query": "q", "min_score": 0.5}
+            "/api/search/photos", params={"query": "q", "min_score": 0.99}
         ).json()
 
         self.assertEqual(
@@ -430,9 +435,10 @@ class TestDefaultMinScoreFollowsTheActiveModel(unittest.TestCase):
     the health check stayed green because nothing was erroring.
 
     The floor is a property of the model that produced the vectors, so it now
-    lives beside the model name and follows `CHITRA_ACTIVE_EMBED_MODEL`. Clients
-    that send nothing get the right floor for whatever is active; an explicit
-    `min_score` still wins, so the query parameter's contract is unchanged.
+    lives beside the model name and follows `CHITRA_ACTIVE_EMBED_MODEL`, with
+    `CHITRA_SEARCH_MIN_SCORE` in `.env.production` as the operator override.
+    Client input is ignored entirely: three copies of one model-specific number
+    in three model-agnostic places is how this happened.
     """
 
     CLIP_MODEL = "openai/clip-vit-base-patch32"
@@ -505,19 +511,64 @@ class TestDefaultMinScoreFollowsTheActiveModel(unittest.TestCase):
 
     # ------------------------------------------------------------------
     def test_the_floor_is_tuned_per_model(self):
-        self.assertEqual(0.2, db_async.default_search_min_score(self.CLIP_MODEL))
-        self.assertEqual(0.09, db_async.default_search_min_score(self.SIGLIP_MODEL))
+        self.assertEqual(0.2, db_async.search_min_score(self.CLIP_MODEL))
+        self.assertEqual(0.09, db_async.search_min_score(self.SIGLIP_MODEL))
 
     def test_an_unknown_model_ranks_everything_rather_than_borrowing_a_floor(self):
         """A threshold from a different model is exactly the bug this fixes.
         With no tuned floor, an unfamiliar model degrades to a ranked list."""
-        self.assertEqual(0.0, db_async.default_search_min_score("nobody/nothing"))
+        self.assertEqual(0.0, db_async.search_min_score("nobody/nothing"))
 
     def test_unset_means_the_active_models_floor(self):
         with unittest.mock.patch.dict(
             os.environ, {"CHITRA_ACTIVE_EMBED_MODEL": self.SIGLIP_MODEL}
         ):
-            self.assertEqual(0.09, db_async.default_search_min_score())
+            self.assertEqual(0.09, db_async.search_min_score())
+
+    def test_the_env_override_beats_the_model_table(self):
+        """Tuning is a config change, not a deploy: `CHITRA_SEARCH_MIN_SCORE`
+        in `.env.production` wins over the per-model table, for any model."""
+        with unittest.mock.patch.dict(os.environ, {
+            "CHITRA_ACTIVE_EMBED_MODEL": self.SIGLIP_MODEL,
+            "CHITRA_SEARCH_MIN_SCORE": "0.12",
+        }):
+            self.assertEqual(0.12, db_async.search_min_score())
+            self.assertEqual(0.12, db_async.search_min_score(self.CLIP_MODEL))
+
+            client = self.client_with(self.SIGLIP_DIM)
+            still_a_hit = client.get("/api/search/photos", params={"query": "q"}).json()
+        with unittest.mock.patch.dict(os.environ, {
+            "CHITRA_ACTIVE_EMBED_MODEL": self.SIGLIP_MODEL,
+            "CHITRA_SEARCH_MIN_SCORE": "0.14",
+        }):
+            client = self.client_with(self.SIGLIP_DIM)
+            too_strict = client.get("/api/search/photos", params={"query": "q"}).json()
+
+        self.assertEqual(["hit.jpg"], self.names(still_a_hit))
+        self.assertEqual([], self.names(too_strict))
+
+    def test_a_blank_override_means_unset(self):
+        with unittest.mock.patch.dict(os.environ, {
+            "CHITRA_ACTIVE_EMBED_MODEL": self.SIGLIP_MODEL,
+            "CHITRA_SEARCH_MIN_SCORE": "",
+        }):
+            self.assertEqual(0.09, db_async.search_min_score())
+
+    def test_a_malformed_override_falls_back_rather_than_500ing_every_search(self):
+        """A typo in `.env.production` must not take search down; it is logged
+        and the model's own floor is used."""
+        with unittest.mock.patch.dict(os.environ, {
+            "CHITRA_ACTIVE_EMBED_MODEL": self.SIGLIP_MODEL,
+            "CHITRA_SEARCH_MIN_SCORE": "point two",
+        }):
+            with self.assertLogs("core.db", level="WARNING") as logs:
+                self.assertEqual(0.09, db_async.search_min_score())
+            client = self.client_with(self.SIGLIP_DIM)
+            resp = client.get("/api/search/photos", params={"query": "q"})
+
+        self.assertIn("CHITRA_SEARCH_MIN_SCORE", "\n".join(logs.output))
+        self.assertEqual(200, resp.status_code, resp.text)
+        self.assertEqual(["hit.jpg"], self.names(resp.json()))
 
     def test_no_min_score_under_siglip_returns_the_hit_and_drops_the_noise(self):
         """The production request, as both clients now send it: no min_score."""
@@ -544,17 +595,19 @@ class TestDefaultMinScoreFollowsTheActiveModel(unittest.TestCase):
         self.assertEqual([], self.names(resp.json()))
         self.assertEqual("temple", resp.json()["query"])
 
-    def test_an_explicit_min_score_still_wins(self):
+    def test_a_client_supplied_min_score_is_ignored(self):
+        """Whatever the client sends, the server's floor decides. `0.2` is
+        what every pre-fix iOS build still sends; ignoring it is what lets
+        those installs recover without a release."""
         with unittest.mock.patch.dict(
             os.environ, {"CHITRA_ACTIVE_EMBED_MODEL": self.SIGLIP_MODEL}
         ):
             client = self.client_with(self.SIGLIP_DIM)
-            everything = client.get(
-                "/api/search/photos", params={"query": "q", "min_score": 0.0}
-            ).json()
-            nothing = client.get(
-                "/api/search/photos", params={"query": "q", "min_score": 0.5}
-            ).json()
+            answers = {
+                sent: self.names(client.get(
+                    "/api/search/photos", params={"query": "q", "min_score": sent}
+                ).json())
+                for sent in (0.0, 0.2, 0.5)
+            }
 
-        self.assertEqual(["hit.jpg", "noise.jpg"], self.names(everything))
-        self.assertEqual([], self.names(nothing))
+        self.assertEqual({0.0: ["hit.jpg"], 0.2: ["hit.jpg"], 0.5: ["hit.jpg"]}, answers)

@@ -27,7 +27,7 @@ DEFAULT_TAG_SOURCE = db.DEFAULT_TAG_SOURCE
 # `core.db_async.active_embed_model` stays the spelling the API and the scoped
 # rules use, and it is the same function object.
 active_embed_model = db.active_embed_model
-default_search_min_score = db.default_search_min_score
+search_min_score = db.search_min_score
 
 
 # ----------------------------------------------------------------------

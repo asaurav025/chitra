@@ -2197,19 +2197,20 @@ async def get_job_status(
 async def search_photos(
     q: Optional[str] = Query(None, alias="query"),
     limit: int = Query(20, ge=1, le=100),
-    min_score: Optional[float] = Query(
-        None, ge=0.0, le=1.0,
-        description=(
-            "Minimum similarity score (0.0-1.0). Leave unset to get the floor "
-            "tuned for the active embedding model; raw cosines are not "
-            "comparable across models, so a fixed number is wrong for one of them."
-        ),
-    ),
     current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async),
     embed_client: EmbeddingClient = Depends(get_embedding_client)
 ):
-    """Search photos by text query using embeddings."""
+    """Search photos by text query using embeddings.
+
+    There is deliberately no `min_score` parameter. The floor below which a
+    photo is not a result depends on which embedding model produced the
+    vectors, and only the server knows that: `CHITRA_SEARCH_MIN_SCORE` in
+    `.env.production`, else the active model's entry in
+    `core.db.SEARCH_MIN_SCORE_BY_MODEL`. A `min_score` query string, which
+    every client used to send with CLIP's 0.2 baked in, is accepted and
+    ignored — that is what let pre-fix iOS builds recover without a release.
+    """
     query = q
     if not query:
         raise HTTPException(status_code=400, detail="missing_query")
@@ -2229,11 +2230,10 @@ async def search_photos(
     # foreign row. Even where the shapes agreed the merge would be wrong —
     # scores from two models are not comparable.
     active_model = db_async.active_embed_model()
-    # The floor belongs to the model, not to the client. Both clients used to
-    # hardcode CLIP's 0.2; under SigLIP no photo ever reached it, and every
+    # The floor is server configuration, never client input. Both clients used
+    # to hardcode CLIP's 0.2; under SigLIP no photo ever reached it, and every
     # search answered `200 []` for the whole afternoon of the cutover.
-    if min_score is None:
-        min_score = db_async.default_search_min_score(active_model)
+    min_score = db_async.search_min_score(active_model)
     rows = await db_async.get_embeddings_async(conn, model=active_model)
     if not rows:
         # No rows yet for the active model — mid-cutover, or a fresh library.

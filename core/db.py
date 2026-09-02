@@ -1,8 +1,11 @@
 from __future__ import annotations
+import logging
 import os
 import sqlite3
 from pathlib import Path
 from typing import Iterable, List, Tuple, Dict, Optional, Any
+
+_log = logging.getLogger(__name__)
 
 
 DB_DEFAULT_PATH = "photo.db"
@@ -469,14 +472,36 @@ SEARCH_MIN_SCORE_BY_MODEL = {
     "google/siglip2-base-patch16-224": 0.09,
 }
 
+#: Operator override for the search floor, in `.env.production`. Tuning is
+#: then a config change plus a restart, exactly like the model switch.
+SEARCH_MIN_SCORE_ENV = "CHITRA_SEARCH_MIN_SCORE"
 
-def default_search_min_score(model: Optional[str] = None) -> float:
-    """The search floor for `model`, or for the active model when unset.
 
-    A model with no tuned floor gets 0.0 — a ranked list of everything —
-    rather than borrowing another model's number, which is precisely the
-    failure this exists to prevent.
+def search_min_score(model: Optional[str] = None) -> float:
+    """The floor below which a photo is not a search result. Server-owned.
+
+    `CHITRA_SEARCH_MIN_SCORE` wins when set. Otherwise the entry for `model`
+    (the active model when unset) in `SEARCH_MIN_SCORE_BY_MODEL`; a model with
+    no tuned floor gets 0.0 — a ranked list of everything — rather than
+    borrowing another model's number, which is precisely the failure this
+    exists to prevent.
+
+    Clients get no say. Every client used to send CLIP's 0.2 and the SigLIP
+    cutover answered `200 []` for an afternoon. A malformed or out-of-range
+    override is logged and ignored rather than turning every search into a
+    500 — or, worse, into a silent empty list.
     """
+    raw = os.environ.get(SEARCH_MIN_SCORE_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if 0.0 <= value <= 1.0:
+                return value
+            _log.warning("%s=%r is outside 0.0-1.0; using the model floor instead",
+                         SEARCH_MIN_SCORE_ENV, raw)
+        except ValueError:
+            _log.warning("%s=%r is not a number; using the model floor instead",
+                         SEARCH_MIN_SCORE_ENV, raw)
     return SEARCH_MIN_SCORE_BY_MODEL.get(model or active_embed_model(), 0.0)
 
 
