@@ -416,3 +416,145 @@ class TestGetEmbeddingsAsyncModelFilter(unittest.TestCase):
         self.assertEqual([4], [dim for _, dim, _ in only_a])
         self.assertEqual({4, 6}, {dim for _, dim, _ in everything},
                          "model=None must stay an unfiltered read")
+
+
+class TestDefaultMinScoreFollowsTheActiveModel(unittest.TestCase):
+    """The silent outage after the 2026-09-02 SigLIP cutover.
+
+    Every search returned `200 {"results": []}`. The web and iOS clients both
+    hardcoded `min_score=0.2`, and the handler's own default was 0.2 — a number
+    tuned on CLIP, whose raw cosines live in 0.16-0.28. SigLIP 2's sigmoid
+    objective puts text-image cosines an order of magnitude lower: measured over
+    the 2,721 stored vectors, the *best* hit for any query was 0.135 and the
+    library median ~0.05. Nothing cleared 0.2, so nothing was ever returned, and
+    the health check stayed green because nothing was erroring.
+
+    The floor is a property of the model that produced the vectors, so it now
+    lives beside the model name and follows `CHITRA_ACTIVE_EMBED_MODEL`. Clients
+    that send nothing get the right floor for whatever is active; an explicit
+    `min_score` still wins, so the query parameter's contract is unchanged.
+    """
+
+    CLIP_MODEL = "openai/clip-vit-base-patch32"
+    SIGLIP_MODEL = "google/siglip2-base-patch16-224"
+    CLIP_DIM = 512
+    SIGLIP_DIM = 768
+    # Live SigLIP numbers: a real hit, and a photo at the library median.
+    ROWS = {"hit.jpg": 0.13, "noise.jpg": 0.05}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db_path = tempfile.mktemp(suffix=".db")
+        asyncio.run(cls._seed())
+
+    @classmethod
+    def tearDownClass(cls):
+        if os.path.exists(cls.db_path):
+            os.unlink(cls.db_path)
+
+    @staticmethod
+    def at_cosine(dim, cos):
+        """A unit vector whose cosine against the dim-0 basis vector is `cos`."""
+        v = np.zeros(dim, dtype="float32")
+        v[0] = cos
+        v[1] = float(np.sqrt(1.0 - cos * cos))
+        return unit(v)
+
+    @classmethod
+    async def _seed(cls):
+        """The same two photos under both models, at the same cosines, so the
+        only thing that differs between the cases is which model is active."""
+        await db_async.init_db_async(cls.db_path)
+        async with db_async.connect_async(cls.db_path) as conn:
+            for name, cos in cls.ROWS.items():
+                await db_async.upsert_photo_async(
+                    conn, file_path=name, size=1, created_at="2026-01-01T00:00:00",
+                    checksum=name, phash=None, exif_datetime=None,
+                    latitude=None, longitude=None, media_type="photo",
+                )
+                cur = await conn.execute("SELECT id FROM photos WHERE file_path=?", (name,))
+                photo_id = (await cur.fetchone())[0]
+                for model, dim in ((cls.CLIP_MODEL, cls.CLIP_DIM),
+                                   (cls.SIGLIP_MODEL, cls.SIGLIP_DIM)):
+                    await db_async.put_embedding_async(
+                        conn, photo_id, cls.at_cosine(dim, cos).tobytes(), dim, model=model
+                    )
+            await conn.commit()
+
+    def client_with(self, dim):
+        app = app_fastapi.app
+        query_vec = self.at_cosine(dim, 1.0)
+
+        async def fake_db():
+            async with db_async.connect_async(self.db_path) as conn:
+                yield conn
+
+        app.dependency_overrides[app_fastapi.get_db_async] = fake_db
+        app.dependency_overrides[app_fastapi.get_current_active_user] = lambda: FakeUser(
+            id=1, username="tester", role="user", is_active=1, is_whitelisted=1
+        )
+        app.dependency_overrides[app_fastapi.get_embedding_client] = lambda: AsyncMock(
+            text_embedding=AsyncMock(return_value=query_vec)
+        )
+        self.addCleanup(app.dependency_overrides.clear)
+        return TestClient(app)
+
+    @staticmethod
+    def names(body):
+        return [os.path.basename(r["file_path"]) for r in body["results"]]
+
+    # ------------------------------------------------------------------
+    def test_the_floor_is_tuned_per_model(self):
+        self.assertEqual(0.2, db_async.default_search_min_score(self.CLIP_MODEL))
+        self.assertEqual(0.09, db_async.default_search_min_score(self.SIGLIP_MODEL))
+
+    def test_an_unknown_model_ranks_everything_rather_than_borrowing_a_floor(self):
+        """A threshold from a different model is exactly the bug this fixes.
+        With no tuned floor, an unfamiliar model degrades to a ranked list."""
+        self.assertEqual(0.0, db_async.default_search_min_score("nobody/nothing"))
+
+    def test_unset_means_the_active_models_floor(self):
+        with unittest.mock.patch.dict(
+            os.environ, {"CHITRA_ACTIVE_EMBED_MODEL": self.SIGLIP_MODEL}
+        ):
+            self.assertEqual(0.09, db_async.default_search_min_score())
+
+    def test_no_min_score_under_siglip_returns_the_hit_and_drops_the_noise(self):
+        """The production request, as both clients now send it: no min_score."""
+        with unittest.mock.patch.dict(
+            os.environ, {"CHITRA_ACTIVE_EMBED_MODEL": self.SIGLIP_MODEL}
+        ):
+            client = self.client_with(self.SIGLIP_DIM)
+            resp = client.get("/api/search/photos", params={"query": "temple"})
+
+        self.assertEqual(200, resp.status_code, resp.text)
+        self.assertEqual(["hit.jpg"], self.names(resp.json()))
+
+    def test_no_min_score_under_clip_keeps_the_old_floor(self):
+        """Rollback is a config flip; the CLIP behaviour must be exactly what it
+        was. 0.13 was never a CLIP hit, and the empty answer still names the
+        query — the old early return leaked a bare `{"results": []}`."""
+        with unittest.mock.patch.dict(
+            os.environ, {"CHITRA_ACTIVE_EMBED_MODEL": self.CLIP_MODEL}
+        ):
+            client = self.client_with(self.CLIP_DIM)
+            resp = client.get("/api/search/photos", params={"query": "temple"})
+
+        self.assertEqual(200, resp.status_code, resp.text)
+        self.assertEqual([], self.names(resp.json()))
+        self.assertEqual("temple", resp.json()["query"])
+
+    def test_an_explicit_min_score_still_wins(self):
+        with unittest.mock.patch.dict(
+            os.environ, {"CHITRA_ACTIVE_EMBED_MODEL": self.SIGLIP_MODEL}
+        ):
+            client = self.client_with(self.SIGLIP_DIM)
+            everything = client.get(
+                "/api/search/photos", params={"query": "q", "min_score": 0.0}
+            ).json()
+            nothing = client.get(
+                "/api/search/photos", params={"query": "q", "min_score": 0.5}
+            ).json()
+
+        self.assertEqual(["hit.jpg", "noise.jpg"], self.names(everything))
+        self.assertEqual([], self.names(nothing))

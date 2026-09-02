@@ -450,6 +450,36 @@ def active_embed_model() -> str:
     return os.environ.get("CHITRA_ACTIVE_EMBED_MODEL", DEFAULT_EMBED_MODEL)
 
 
+#: Default `min_score` for `/api/search/photos`, per embedding model.
+#:
+#: A raw text-image cosine is not comparable across models, so neither is a
+#: floor on it. CLIP's cosines sit in 0.16-0.28 on this library and 0.2 was a
+#: sensible cut. SigLIP 2's sigmoid objective puts the *best* hit for any query
+#: near 0.135 (measured 2026-09-02 over 2,721 vectors; library median ~0.05),
+#: so the same 0.2 returned nothing for every query, with a 200 and a green
+#: health check. 0.09 was chosen from that probe: nonsense queries clear it 0-1
+#: times, real ones 5-140 times, and 0.08 lets ~25 junk rows through while
+#: 0.10 starves rare-but-real subjects to a single hit.
+#:
+#: Keyed on the model that produced the vectors, so a cutover or rollback of
+#: `CHITRA_ACTIVE_EMBED_MODEL` carries the right floor with it and clients
+#: never need to know which model is live.
+SEARCH_MIN_SCORE_BY_MODEL = {
+    "openai/clip-vit-base-patch32": 0.2,
+    "google/siglip2-base-patch16-224": 0.09,
+}
+
+
+def default_search_min_score(model: Optional[str] = None) -> float:
+    """The search floor for `model`, or for the active model when unset.
+
+    A model with no tuned floor gets 0.0 — a ranked list of everything —
+    rather than borrowing another model's number, which is precisely the
+    failure this exists to prevent.
+    """
+    return SEARCH_MIN_SCORE_BY_MODEL.get(model or active_embed_model(), 0.0)
+
+
 # ----------------------------------------------------------------------
 # TAGS
 # ----------------------------------------------------------------------

@@ -2197,7 +2197,14 @@ async def get_job_status(
 async def search_photos(
     q: Optional[str] = Query(None, alias="query"),
     limit: int = Query(20, ge=1, le=100),
-    min_score: float = Query(0.2, ge=0.0, le=1.0, description="Minimum similarity score (0.0-1.0)"),
+    min_score: Optional[float] = Query(
+        None, ge=0.0, le=1.0,
+        description=(
+            "Minimum similarity score (0.0-1.0). Leave unset to get the floor "
+            "tuned for the active embedding model; raw cosines are not "
+            "comparable across models, so a fixed number is wrong for one of them."
+        ),
+    ),
     current_user: aiosqlite.Row = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_async),
     embed_client: EmbeddingClient = Depends(get_embedding_client)
@@ -2222,6 +2229,11 @@ async def search_photos(
     # foreign row. Even where the shapes agreed the merge would be wrong —
     # scores from two models are not comparable.
     active_model = db_async.active_embed_model()
+    # The floor belongs to the model, not to the client. Both clients used to
+    # hardcode CLIP's 0.2; under SigLIP no photo ever reached it, and every
+    # search answered `200 []` for the whole afternoon of the cutover.
+    if min_score is None:
+        min_score = db_async.default_search_min_score(active_model)
     rows = await db_async.get_embeddings_async(conn, model=active_model)
     if not rows:
         # No rows yet for the active model — mid-cutover, or a fresh library.
@@ -2251,7 +2263,7 @@ async def search_photos(
     # Filter by minimum score and get top results
     valid_indices = np.where(sims >= min_score)[0]
     if len(valid_indices) == 0:
-        return {"results": []}
+        return SearchResultsResponse(query=query, results=[])
     
     # Sort valid results by similarity (descending)
     sorted_valid = valid_indices[np.argsort(-sims[valid_indices])]
