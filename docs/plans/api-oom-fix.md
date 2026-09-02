@@ -1189,3 +1189,130 @@ FAILED (failures=7, errors=4, skipped=2)
 `AGENTS.md` updated: the test-baseline count 66 -> 168 (failures and errors
 unchanged at 7/4), the ffmpeg gotcha now says workers-only, and two new
 gotchas record the ML-free API and `thread_limits.sh`.
+
+### Phase 5 — Bound the thumbnail cache
+
+**Task 5.1 — the thumbnail cache is bounded by bytes.** Landed as two commits:
+the correctness fix (`d27d377`) and, separately, the eviction-policy change
+(`2c3bbfb`).
+
+**Why it could not wait.** The plan called this "arithmetic, not measured RSS".
+It is measured RSS now. 2026-09-02, the API tier ~2.6 h after a restart that
+began at ~80 MB per worker:
+
+```
+uvicorn workers (pids 504615-8):  959 MB  908 MB  805 MB  839 MB
+chitra-api cgroup memory.current  3,352 MiB
+                  memory.peak     4,100 MiB   (MemoryMax is 4,096 MiB)
+                  memory.events   max 7025   oom_kill 0
+```
+
+`memory.peak` is *above* `MemoryMax`; 7,025 reclaim events and no kill yet.
+
+**The old bound, measured rather than estimated.** 1,000 entries of 150-400 KB
+(the size distribution `core.gallery.ensure_thumb` actually produces — the
+concurrent SigLIP re-embed log records 2,670 thumbnails at 106-286 KB,
+averaging ~245 KB):
+
+```
+old   entries= 1000  cache_bytes=   270.9 MiB   RSS 11.7 ->  285.1 MiB  (delta 273.4 MiB)  evictions=0
+new   entries=  231  cache_bytes=    63.8 MiB   RSS 11.7 ->   77.0 MiB  (delta  65.3 MiB)  evictions=769
+```
+
+**273.4 MiB -> 65.3 MiB per worker, ~1,094 MiB -> ~261 MiB across four.** Note
+`evictions=0` in the old row: the entry cap never fired even once at 271 MiB
+resident, which is exactly the defect. The 1.5 MiB gap between `cache_bytes`
+and RSS delta in the new row is per-object and dict overhead at 231 entries.
+
+**Policy.** Byte budget `CHITRA_THUMB_CACHE_BYTES` (default 64 MiB **per
+uvicorn worker**), evicting oldest-first until the incoming entry fits; the
+1,000-entry cap kept as a secondary bound via `CHITRA_THUMB_CACHE_ENTRIES`;
+TTL unchanged at 1 h from insertion. Both env vars fall back to their defaults
+on anything unparseable or negative, so a typo in `.env.production` cannot
+leave the cache unbounded.
+
+**Oversized items — the decision the task asked to be explicit about.** An
+object strictly larger than the entire budget is **not cached**, and no
+existing entry is evicted for it. Caching it is impossible by definition, and
+emptying the cache for something that still will not fit trades every useful
+entry for one about to be evicted anyway. Refusals increment
+`oversize_rejections`; the caller re-reads that object from storage every time.
+This is also what makes `CHITRA_THUMB_CACHE_BYTES=0` a valid off switch:
+eviction terminates on an empty cache instead of spinning.
+
+**Observability, which is half the point.** `get_cache_stats()` reports
+`entries`, `bytes`, `max_bytes`, `max_entries`, `ttl`, `evictions`,
+`evicted_bytes`, `expirations`, `oversize_rejections`, `hits`, `misses`, and
+`/api/health` carries it as `thumb_cache` (three lines in `app_fastapi.py`, one
+field in `core/schemas.py`). The incident above had to be diagnosed from cgroup
+totals and arithmetic because the process could not say what it was holding.
+After the restart, a worker at 900 MB whose `thumb_cache.bytes` reads 64 MiB
+**exonerates the cache** and moves the hunt on — which is worth more than the
+208 MiB.
+
+**Red first.** `configure_cache` did not exist, so all 25 tests errored in
+`setUp` and no assertion ran. Re-run against a shim supplying the *old*
+semantics (entry cap honoured, byte budget absent) so each test failed on its
+own substance:
+
+```
+KeyError: 'bytes'        (x5)     KeyError: 'entries'   (x4)
+KeyError: 'max_bytes'    (x4)     KeyError: 'evictions' (x2)
+KeyError: 'hits'         KeyError: 'max_entries'
+FAIL: test_insert_past_byte_budget_evicts_oldest
+  AssertionError: b'xxx...' is not None : 'a' was the oldest and should have
+  been evicted to fit 'c'
+FAIL: test_item_larger_than_budget_is_not_cached
+FAIL: test_item_exactly_at_budget_is_cached
+FAIL: test_zero_budget_disables_caching_without_looping
+Ran 25 tests — FAILED (failures=4, errors=17)
+```
+
+Four tests passed under the shim — entry-cap ordering, exact-bytes round trip,
+miss-returns-None, JSON-safe stats — which is the point: they pin behaviour the
+change had to preserve.
+
+**`/api/health` exposure watched red separately**, with the implementation
+reverted: `AssertionError: 'thumb_cache' not found in {...}`.
+
+**FIFO -> LRU, deliberately a second commit.** The module had always been
+*documented* as LRU and *implemented* as FIFO — its own comment said so. That
+was near-harmless while the only bound was 1,000 entries, because a cache that
+rarely evicts has no eviction policy worth arguing about (`evictions=0` above).
+The byte budget is ~231 entries, four times smaller, so eviction is now the
+common case: under FIFO a tile aged out a fixed number of inserts after it
+arrived however often it was being served, evicting what the user was looking
+at on the same schedule as what they scrolled past once. Recency governs
+eviction only — the TTL still runs from insertion, so a hot key expires on
+schedule rather than living forever, and a test pins that rather than leaving
+it to the next reader. Watched red: `'hot' was evicted at round 3 despite being
+read every round`.
+
+**Known trade-off, stated rather than discovered later.** 64 MiB holds ~231 of
+the library's ~2,670 thumbnails (~640 MB in total), where the old cap held
+~1,000. Hit rate will fall and thumbnail GETs will reach MinIO more often —
+which matters because that disk is failing. `hits`/`misses` in `thumb_cache`
+are exactly how to tune `CHITRA_THUMB_CACHE_BYTES` from evidence after the
+restart, instead of guessing again.
+
+**Storage is an `OrderedDict`**, so each eviction is `next(iter(...))` + pop,
+O(1). The original scanned every timestamp with `min()` per victim, which a
+byte budget can trigger many times in one insert. The byte counter is guarded
+by a lock: a lost update there is silent and permanent in both directions —
+drift up and the cache stops caching, drift down and it stops bounding.
+
+Suite, clean checkout (`git worktree add --detach`), before and after:
+
+```
+before  587 tests   FAILED (failures=7, errors=5, skipped=13)
+after   618 tests   FAILED (failures=7, errors=5, skipped=13)
+```
+
+31 tests added, all green; the failure and error sets are identical member for
+member (7 `test_endpoints` auth 401s, 3 `test_db_async`, 1 `test_search`, 1
+`test_endpoints.test_health_check`).
+
+**Not changed, on purpose.** `read_thumbnail_async` in `app_fastapi.py` is
+untouched beyond the health-stats line — the cache's call shape did not need to
+change. Tasks 5.2 and 5.3 (upload returning `thumbnail: null` and
+`generate_photo_thumb_job`) are not part of 5.1 and were left alone.

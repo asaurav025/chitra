@@ -34,10 +34,10 @@ carries a ruff config for when it is installed; nothing runs it automatically.
 ## Test baseline
 
 The suite is **not green**. Measured 2026-09-02 on a clean checkout of `main`
-(no uncommitted work), twice, stable:
+(no uncommitted work):
 
 ```
-581 tests, 7 failures, 5 errors, 13 skipped
+618 tests, 7 failures, 5 errors, 13 skipped
 ```
 
 **Measure it the same way before trusting it.** `git worktree add --detach <path>
